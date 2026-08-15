@@ -1,0 +1,16 @@
+# ---- 依赖与构建产物（不提交；锚定根目录，避免误伤 src/media 等源码目录）----
+node_modules/
+/dist/
+/media/
+/release/
+*.vsix
+*.log
+
+# ---- 系统/编辑器 ----
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# ---- 误创建目录 ----
+--dry-run/

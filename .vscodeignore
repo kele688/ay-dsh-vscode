@@ -1,0 +1,122 @@
+# 构建产物 / 运行时
+dist/**
+media/**
+release/**
+*.vsix
+vsce.log
+*.log
+
+# 源码与开发产物（node_modules 保留：DSH 内核依赖必须打包进 VSIX）
+src/**
+scripts/**
+tsconfig.json
+out/**
+*.tsbuildinfo
+.vscode/**
+.git/**
+.gitignore
+.github/**
+docs/**
+EXPERIENCE-REVIEW.md
+THIRD-PARTY-NOTICES.md
+**/*.map
+**/*.d.ts
+
+# 保留项
+!dist/extension.js
+!host/**
+!media/chat.js
+!media/chat.css
+!media/icon.svg
+!media/icon.png
+!package.json
+!README.md
+!LICENSE
+
+# ── 依赖裁剪：以下包仅被已禁用的插件引用（llm-pi-ai 多提供商网关 / 遥测），
+#    插件固定使用 deepseek-official 路由且不启用遥测，故从 VSIX 剔除以瘦身。
+#    npm install 仍完整安装（保证可重装），打包时剔除。
+node_modules/@earendil-works/**
+node_modules/@anthropic-ai/**
+node_modules/@mistralai/**
+node_modules/@google/**
+node_modules/@aws-sdk/**
+node_modules/@smithy/**
+node_modules/openai/**
+node_modules/typebox/**
+node_modules/@opentelemetry/**
+node_modules/web-streams-polyfill/**
+node_modules/formdata-polyfill/**
+node_modules/fetch-blob/**
+node_modules/node-domexception/**
+node_modules/node-fetch/**
+node_modules/google-auth-library/**
+node_modules/gaxios/**
+node_modules/protobufjs/**
+node_modules/@deepseek-ai/dsh-llm-pi-ai/**
+node_modules/@deepseek-ai/dsh-session-telemetry-otel/**
+node_modules/@deepseek-ai/dsh-session-telemetry/**
+
+# ── 依赖内部裁剪（agent-host 已 esbuild bundle 成单文件，运行时不再解析
+#    这些源文件；保留 lib/ 编译产物与 package.json / patch 资源即可）：
+node_modules/@deepseek-ai/*/src/**
+node_modules/@deepseek-ai/*/types/**
+node_modules/@deepseek-ai/*/test/**
+node_modules/@deepseek-ai/*/tests/**
+node_modules/@deepseek-ai/*/lib/**/*.d.ts
+node_modules/@deepseek-ai/*/lib/**/*.map
+node_modules/@deepseek-ai/*/README.md
+node_modules/@deepseek-ai/*/readme.md
+node_modules/@deepseek-ai/*/CHANGELOG.md
+node_modules/@deepseek-ai/*/LICENSE*
+node_modules/cordis/src/**
+node_modules/cordis/lib/**/*.d.ts
+node_modules/cordis/lib/**/*.map
+node_modules/schemastery/src/**
+node_modules/schemastery/lib/**/*.d.ts
+node_modules/schemastery/lib/**/*.map
+node_modules/cosmokit/src/**
+node_modules/cosmokit/lib/**/*.d.ts
+node_modules/cosmokit/lib/**/*.map
+node_modules/zod/src/**
+node_modules/zod/lib/**/*.d.ts
+node_modules/zod/lib/**/*.map
+# 注意：不能通用裁剪 node_modules/*/src/** —— 部分包（如 koffi、debug、node-fetch）
+# 的 main 直接指向 src/，裁掉会导致运行时 ERR_MODULE_NOT_FOUND、宿主启动失败。
+# 只裁确认 main 在 lib/ 的包：
+node_modules/cordis/src/**
+node_modules/cordis/lib/**/*.d.ts
+node_modules/cordis/lib/**/*.map
+node_modules/schemastery/src/**
+node_modules/schemastery/lib/**/*.d.ts
+node_modules/schemastery/lib/**/*.map
+node_modules/cosmokit/src/**
+node_modules/cosmokit/lib/**/*.d.ts
+node_modules/cosmokit/lib/**/*.map
+node_modules/@deepseek-ai/*/src/**
+node_modules/@deepseek-ai/*/test/**
+node_modules/@deepseek-ai/*/tests/**
+node_modules/@deepseek-ai/*/lib/**/*.d.ts
+node_modules/@deepseek-ai/*/lib/**/*.map
+node_modules/@deepseek-ai/*/README.md
+node_modules/@deepseek-ai/*/readme.md
+node_modules/@deepseek-ai/*/CHANGELOG.md
+node_modules/@deepseek-ai/*/LICENSE*
+# 非 scoped 包的文档/测试裁剪（保留 src/：main 可能指向它）
+node_modules/*/test/**
+node_modules/*/tests/**
+node_modules/*/README.md
+node_modules/*/readme.md
+node_modules/*/CHANGELOG.md
+node_modules/*/tsconfig.json
+node_modules/*/.npmignore
+node_modules/*/.gitignore
+# scoped 包（@scope/name 两层路径）：只裁文档/测试/声明文件，不裁 src/
+node_modules/@*/*/test/**
+node_modules/@*/*/tests/**
+node_modules/@*/*/README.md
+node_modules/@*/*/readme.md
+node_modules/@*/*/CHANGELOG.md
+node_modules/@*/*/tsconfig.json
+node_modules/@*/*/lib/**/*.d.ts
+node_modules/@*/*/lib/**/*.map

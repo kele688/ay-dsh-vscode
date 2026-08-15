@@ -1,0 +1,204 @@
+{
+  "name": "ay-dsh-vscode",
+  "displayName": "ay-dsh-vscode",
+  "description": "Kilo Code 风格的 AI 编码智能体，内核由 DeepSeek Harness (DSH) 驱动：多智能体编排、长时目标任务、工具透明化、沙箱审批。",
+  "version": "0.2.0",
+  "publisher": "deepseek-harness",
+  "license": "MIT",
+  "icon": "media/icon.png",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/kele688/ay-dsh-vscode"
+  },
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "AI",
+    "Machine Learning",
+    "Other"
+  ],
+  "keywords": [
+    "deepseek",
+    "harness",
+    "agent",
+    "ai",
+    "coding",
+    "kilocode",
+    "claude-code"
+  ],
+  "main": "./dist/extension.js",
+  "activationEvents": [
+    "onView:dshVscode.chatView",
+    "onCommand:dshVscode.explainSelection",
+    "onCommand:dshVscode.runOnSelection",
+    "onCommand:dshVscode.fixDiagnostics",
+    "onCommand:dshVscode.configure",
+    "onCommand:dshVscode.openWorkspace",
+    "onCommand:dshVscode.focus",
+    "onCommand:dshVscode.newSession",
+    "onCommand:dshVscode.stop"
+  ],
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "dshVscode",
+          "title": "ay-dsh-vscode",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "dshVscode": [
+        {
+          "id": "dshVscode.chatView",
+          "name": "ay-dsh-vscode",
+          "type": "webview",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "dshVscode.focus",
+        "title": "DSH: Open Agent Chat",
+        "icon": "$(comment-discussion)"
+      },
+      {
+        "command": "dshVscode.newSession",
+        "title": "DSH: New Session",
+        "icon": "$(add)"
+      },
+      {
+        "command": "dshVscode.stop",
+        "title": "DSH: Stop Agent",
+        "icon": "$(debug-stop)"
+      },
+      {
+        "command": "dshVscode.configure",
+        "title": "DSH: Configure (API Key / Model / Permissions)",
+        "icon": "$(gear)"
+      },
+      {
+        "command": "dshVscode.explainSelection",
+        "title": "DSH: Explain Selection"
+      },
+      {
+        "command": "dshVscode.runOnSelection",
+        "title": "DSH: Run Agent on Selection"
+      },
+      {
+        "command": "dshVscode.fixDiagnostics",
+        "title": "DSH: Fix Problems in File"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "dshVscode.newSession",
+          "when": "view == dshVscode.chatView",
+          "group": "navigation@1"
+        },
+        {
+          "command": "dshVscode.stop",
+          "when": "view == dshVscode.chatView",
+          "group": "navigation@2"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "dshVscode.explainSelection",
+          "when": "editorHasSelection",
+          "group": "dsh@1"
+        },
+        {
+          "command": "dshVscode.runOnSelection",
+          "when": "editorHasSelection",
+          "group": "dsh@2"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "dshVscode.explainSelection",
+          "when": "editorHasSelection"
+        },
+        {
+          "command": "dshVscode.runOnSelection",
+          "when": "editorHasSelection"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "ay-dsh-vscode",
+      "properties": {
+        "dshVscode.apiKey": {
+          "type": "string",
+          "markdownDescription": "DeepSeek API Key。留空时读取环境变量 `DEEPSEEK_API_KEY`。存储在 VS Code 密钥库中。",
+          "secure": true
+        },
+        "dshVscode.model": {
+          "type": "string",
+          "default": "deepseek-v4-flash",
+          "markdownDescription": "默认模型 id（DeepSeek 官方路由）。可填 `deepseek-v4-pro` 等。"
+        },
+        "dshVscode.baseUrl": {
+          "type": "string",
+          "markdownDescription": "可选：自定义 OpenAI 兼容 Base URL（等价于环境变量 `DEEPSEEK_BASE_URL`）。留空使用官方 API。"
+        },
+        "dshVscode.permissionMode": {
+          "type": "string",
+          "enum": [
+            "workspace-write",
+            "read-only",
+            "danger-full-access"
+          ],
+          "default": "workspace-write",
+          "markdownDescription": "文件沙箱模式：`workspace-write` 仅允许写工作区（越界操作弹审批）；`read-only` 只读；`danger-full-access` 完全访问且不再审批。"
+        },
+        "dshVscode.nodePath": {
+          "type": "string",
+          "markdownDescription": "可选：agent 宿主进程使用的 Node 可执行文件路径。留空时使用 VS Code 内置 Node（`ELECTRON_RUN_AS_NODE`）。",
+          "default": ""
+        },
+        "dshVscode.defaultWorkspace": {
+          "type": "string",
+          "markdownDescription": "未打开工作区文件夹时，Agent 使用的默认工作目录（生成的文件保存位置）。留空使用 `~/ay-dsh-workspace`。",
+          "default": ""
+        },
+        "dshVscode.maxOutputChars": {
+          "type": "number",
+          "default": 40000,
+          "markdownDescription": "UI 中单个工具结果/消息的最大渲染字符数（超出折叠）。"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "watch": "node scripts/build.mjs --watch",
+    "package": "node scripts/package.mjs",
+    "deploy": "powershell -ExecutionPolicy Bypass -File scripts/deploy.ps1"
+  },
+  "dependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/cordis-plugin-loader": "^1.0.2",
+    "@deepseek-ai/dsh-agent": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-agent-default-model": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-app-boot": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-base": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-headless": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-home-paths": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-invariants": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-launch-environment": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-llm": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-session": "^0.1.0-rc.6"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "@types/vscode": "^1.90.0",
+    "@vscode/vsce": "^3.2.1",
+    "esbuild": "^0.25.0",
+    "typescript": "^5.5.4"
+  }
+}

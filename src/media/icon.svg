@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+  <!--
+    ay-dsh-vscode 活动栏图标："D S H" 三字母（纯 path 绘制，确定性渲染，任何环境不重叠）。
+    VS Code 以 mask 模式渲染活动栏图标（忽略填充色、取 alpha 形状），
+    因此只画形状、不留背景色块，任何主题下均清晰可见。
+  -->
+  <g fill="none" stroke="#000000" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    <!-- D：左竖 + 上横 + 右扁弧（椭圆弧 rx3/ry5，压缩宽度）+ 下横 -->
+    <path d="M2.7 7 V17 M2.7 7 H5 A3 5 0 0 1 5 17 H2.7"/>
+    <!-- S：上横 + 右上弧 + 中横 + 左下弧 + 下横 -->
+    <path d="M11.5 8 H15.2 A2 2 0 0 1 15.2 12 H13 A2.25 2.25 0 0 0 13 16.5 H16.4"/>
+    <!-- H：双竖 + 中横 -->
+    <path d="M20 7 V17 M22.4 7 V17 M20 12 H22.4"/>
+  </g>
+</svg>
