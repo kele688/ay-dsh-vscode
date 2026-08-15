@@ -13,6 +13,7 @@ import * as os from "node:os";
 import * as fs from "node:fs";
 import { AgentHost } from "./host";
 import { ChatViewProvider } from "./webviewPanel";
+import { openConfigPanel } from "./configPanel";
 
 let provider: ChatViewProvider | undefined;
 let host: AgentHost | undefined;
@@ -233,134 +234,24 @@ async function deliverTask(context: vscode.ExtensionContext, text: string): Prom
 }
 
 /* ------------------------------------------------------------------ */
-/* 配置向导                                                             */
+/* 配置：完整配置面板（src/configPanel.ts）                              */
 /* ------------------------------------------------------------------ */
 
-async function pickModel(): Promise<string | undefined> {
-  const current = readConfig().model;
-  const pick = await vscode.window.showQuickPick(
-    [
-      { label: "deepseek-v4-flash", description: "默认：快速、低成本，适合日常编码", picked: current === "deepseek-v4-flash" },
-      { label: "deepseek-v4-pro", description: "更强推理能力，适合复杂任务", picked: current === "deepseek-v4-pro" },
-      { label: "$(symbol-key) 自定义模型 id…", description: "输入任意模型 id" },
-    ],
-    { title: "DSH — 选择模型", placeHolder: `当前: ${current}` }
-  );
-  if (!pick) return undefined;
-  if (pick.label.startsWith("$")) {
-    const custom = await vscode.window.showInputBox({
-      title: "DSH — 自定义模型 id",
-      prompt: "输入模型 id（如 deepseek-v4-pro）",
-      value: current,
-      validateInput: (v) => (v.trim() === "" ? "模型 id 不能为空" : undefined),
-    });
-    return custom?.trim();
-  }
-  return pick.label;
-}
-
-async function pickPermissionMode(): Promise<string | undefined> {
-  const current = readConfig().permissionMode;
-  const pick = await vscode.window.showQuickPick(
-    [
-      {
-        label: "workspace-write",
-        description: "可写工作区；越界操作弹出审批（推荐）",
-        picked: current === "workspace-write",
-      },
-      { label: "read-only", description: "只读模式，Agent 不能修改任何文件", picked: current === "read-only" },
-      {
-        label: "danger-full-access",
-        description: "完全访问，不再审批（谨慎）",
-        picked: current === "danger-full-access",
-      },
-    ],
-    { title: "DSH — 权限模式", placeHolder: `当前: ${current}` }
-  );
-  return pick?.label;
-}
-
-/** 配置向导：API Key / 模型 / Base URL / 权限模式，循环编辑直到完成。 */
-async function runConfigWizard(context: vscode.ExtensionContext): Promise<void> {
-  const existing = await context.secrets.get(SECRET_KEY);
-  const envKey = process.env.DEEPSEEK_API_KEY;
-  const hasKey = Boolean(existing ?? envKey ?? readConfig().apiKey);
-
-  const items = [
-    {
-      label: hasKey ? "$(key) 修改 API Key" : "$(key) 设置 API Key",
-      description: hasKey ? "已配置（存于 VS Code 密钥库）" : "当前未配置",
-    },
-    { label: "$(symbol-key) 修改模型", description: `当前: ${readConfig().model}` },
-    { label: "$(server) 修改 Base URL", description: readConfig().baseUrl || "官方 API（留空）" },
-    { label: "$(shield) 修改权限模式", description: `当前: ${readConfig().permissionMode}` },
-    { label: "$(trash) 清除 API Key", description: hasKey ? "移除已保存的密钥" : "无密钥可清除" },
-    { label: "$(check) 保存并应用", description: "保存所有修改并应用" },
-  ];
-
-  while (true) {
-    const pick = await vscode.window.showQuickPick(items, {
-      title: "DSH — 配置",
-      placeHolder: "选择要配置的项",
-    });
-    if (!pick) break; // Esc 退出
-
-    if (pick.label.includes("API Key")) {
-      const key = await vscode.window.showInputBox({
-        title: "DSH — DeepSeek API Key",
-        prompt: "粘贴你的 DeepSeek API Key（platform.deepseek.com）",
-        password: true,
-        ignoreFocusOut: true,
-        validateInput: (v) => (v.trim() === "" ? "API Key 不能为空" : undefined),
-      });
-      if (key !== undefined) {
-        await context.secrets.store(SECRET_KEY, key.trim());
-        await setConfigValue("apiKey", ""); // 优先使用密钥库
-        vscode.window.showInformationMessage("✅ API Key 已保存到 VS Code 密钥库");
-        provider?.pushConfigToView?.(); // 写入成功立即刷新提示栏状态
-        disposeHost(); // 下次使用时按新密钥启动
-      }
-    } else if (pick.label.includes("模型")) {
-      const model = await pickModel();
-      if (model !== undefined) {
-        await setConfigValue("model", model);
-        vscode.window.showInformationMessage(`✅ 模型已设为 ${model}`);
-        provider?.pushConfigToView?.();
-        disposeHost();
-      }
-    } else if (pick.label.includes("Base URL")) {
-      const baseUrl = await vscode.window.showInputBox({
-        title: "DSH — Base URL",
-        prompt: "OpenAI 兼容端点（留空使用 DeepSeek 官方 API）",
-        value: readConfig().baseUrl ?? "",
-        ignoreFocusOut: true,
-        placeHolder: "https://api.deepseek.com",
-      });
-      if (baseUrl !== undefined) {
-        await setConfigValue("baseUrl", baseUrl.trim() || "");
-        vscode.window.showInformationMessage(baseUrl.trim() ? `✅ Base URL 已设为 ${baseUrl.trim()}` : "✅ 已恢复官方 API");
-        provider?.pushConfigToView?.();
-        disposeHost();
-      }
-    } else if (pick.label.includes("权限模式")) {
-      const mode = await pickPermissionMode();
-      if (mode !== undefined) {
-        await setConfigValue("permissionMode", mode);
-        vscode.window.showInformationMessage(`✅ 权限模式已设为 ${mode}`);
-        provider?.pushConfigToView?.();
-        disposeHost();
-      }
-    } else if (pick.label.includes("清除")) {
-      await context.secrets.delete(SECRET_KEY);
-      vscode.window.showInformationMessage("已清除 API Key（环境变量 DEEPSEEK_API_KEY 仍可能生效）");
+/** 打开统一配置面板；保存成功后解绑宿主（下次使用按新配置拉起）并刷新聊天视图。 */
+function openSettings(context: vscode.ExtensionContext): void {
+  openConfigPanel(context, {
+    readConfig,
+    workspaceRoot,
+    onSaved: () => {
       disposeHost();
-    } else {
-      // 完成
       provider?.pushConfigToView?.();
-      break;
-    }
-  }
-  provider?.pushConfigToView?.();
+      vscode.window.showInformationMessage(
+        vscode.env.language.startsWith("zh")
+          ? "✅ 配置已保存并应用，将在下次使用时生效"
+          : "✅ Settings saved and applied; effective on next use"
+      );
+    },
+  });
 }
 
 /* ------------------------------------------------------------------ */
@@ -396,7 +287,7 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("dshVscode.stop", () => {
       host?.stop();
     }),
-    vscode.commands.registerCommand("dshVscode.configure", () => runConfigWizard(context)),
+    vscode.commands.registerCommand("dshVscode.configure", () => openSettings(context)),
     vscode.commands.registerCommand("dshVscode.openWorkspace", () => openWorkspaceFolder()),
     vscode.commands.registerCommand("dshVscode.explainSelection", () => {
       const editor = vscode.window.activeTextEditor;

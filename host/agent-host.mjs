@@ -179,7 +179,9 @@ async function bootTree() {
   return ctx;
 }
 
-/** 可发送的事件队列：高频 chunk 攒批，降低 stdio 压力。 */
+/** 可发送的事件队列：高频 chunk 攒批，降低 stdio 压力。
+ *  16ms（< 1 帧）足够合并高频事件，同时端到端感知延迟不可察觉；
+ *  配合 UI 侧节流渲染，输出呈现链式流畅。 */
 class EventPump {
   constructor() {
     this.queue = [];
@@ -188,7 +190,7 @@ class EventPump {
   push(event) {
     this.queue.push(event);
     if (this.timer === undefined) {
-      this.timer = setTimeout(() => this.flush(), 40);
+      this.timer = setTimeout(() => this.flush(), 16);
     }
   }
   flush() {
@@ -1076,7 +1078,13 @@ async function main() {
         }
       } catch (error) {
         log("error", "frame handling failed", error instanceof Error ? error.stack ?? error.message : String(error));
-        if (msg.id !== undefined) post({ t: "chatDone", id: msg.id, ok: false, error: error instanceof Error ? error.message : String(error) });
+        const message = error instanceof Error ? error.message : String(error);
+        // 按帧类型补发失败响应（否则扩展/UI 会永久等待，如 resume 卡在"正在恢复会话…"）
+        if (msg.t === "resumeSession") {
+          post({ t: "sessionResumed", id: msg.id, ok: false, error: message });
+        } else if (msg.id !== undefined) {
+          post({ t: "chatDone", id: msg.id, ok: false, error: message });
+        }
       }
     })();
   });

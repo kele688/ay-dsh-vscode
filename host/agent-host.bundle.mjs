@@ -7131,7 +7131,7 @@ var EventPump = class {
   push(event) {
     this.queue.push(event);
     if (this.timer === void 0) {
-      this.timer = setTimeout(() => this.flush(), 40);
+      this.timer = setTimeout(() => this.flush(), 16);
     }
   }
   flush() {
@@ -7882,7 +7882,12 @@ async function main() {
         }
       } catch (error) {
         log("error", "frame handling failed", error instanceof Error ? error.stack ?? error.message : String(error));
-        if (msg.id !== void 0) post({ t: "chatDone", id: msg.id, ok: false, error: error instanceof Error ? error.message : String(error) });
+        const message = error instanceof Error ? error.message : String(error);
+        if (msg.t === "resumeSession") {
+          post({ t: "sessionResumed", id: msg.id, ok: false, error: message });
+        } else if (msg.id !== void 0) {
+          post({ t: "chatDone", id: msg.id, ok: false, error: message });
+        }
       }
     })();
   });

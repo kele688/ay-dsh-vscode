@@ -1,4 +1,4 @@
-# publish.ps1 — 一键初始化发布：git 初始化 + 首次提交 + （可选）推送到 GitHub
+﻿# publish.ps1 — 一键初始化发布：git 初始化 + 首次提交 + （可选）推送到 GitHub
 #
 # 用法：
 #   1) 仅本地初始化并提交：
@@ -66,8 +66,10 @@ if (-not $SkipCommitCheck) {
         if ($c -match 'C:\\Users\\[^\\]+|D:\\projects|C:\\Program Files\\Microsoft VS Code|github_pat_|ghp_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9]{20,}|AI maintainer|start-maintainer|stop-maintainer|launch-maintainer|maintainer\.mjs|docs[\\/]MAINTAINER') { $_ }
     }
     if ($leak) {
-        Write-Host "⚠ 以下文件包含本地绝对路径（建议清理后再提交）：" -ForegroundColor Yellow
+        Write-Host "✗ 检测到敏感内容（本地绝对路径 / 密钥 / 内部运维关键词），已中止提交：" -ForegroundColor Red
         $leak | ForEach-Object { Write-Host "  - $_" }
+        Write-Host "  请清理后再提交（本地敏感信息绝不外传）。" -ForegroundColor Yellow
+        exit 1
     }
 }
 & git commit -m "Initial release: ay-dsh-vscode (DSH-powered VS Code agent)" 2>&1 | Out-String | Write-Host

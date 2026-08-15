@@ -33,6 +33,17 @@ jobs:
       - name: Build (esbuild + media)
         run: node scripts/build.mjs
 
+      - name: Verify committed host bundle is in sync with source
+        # build.mjs regenerates host/agent-host.bundle.mjs; a diff here means the
+        # committed bundle drifted from host/agent-host.mjs (dev-mode installs and
+        # reviews would run a stale/different bundle than the source).
+        run: |
+          git diff --exit-code -- host/agent-host.bundle.mjs \
+            || { echo "host/agent-host.bundle.mjs is out of sync — run 'npm run build' and commit the regenerated bundle"; exit 1; }
+
+      - name: Host boot smoke test (isolated DSH home)
+        run: node scripts/verify-host-boot.mjs
+
       - name: Package VSIX
         run: node scripts/package.mjs
 

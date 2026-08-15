@@ -18,7 +18,6 @@ out/**
 .github/**
 docs/**
 EXPERIENCE-REVIEW.md
-THIRD-PARTY-NOTICES.md
 **/*.map
 **/*.d.ts
 
@@ -27,11 +26,16 @@ THIRD-PARTY-NOTICES.md
 !host/**
 !media/chat.js
 !media/chat.css
+!media/config-panel.js
+!media/config-panel.css
 !media/icon.svg
 !media/icon.png
 !package.json
 !README.md
 !LICENSE
+# 第三方声明必须随 VSIX 分发（MIT 再分发需保留版权声明；node_modules 内各包
+# LICENSE 已被下方裁剪规则排除，本文件是唯一的合规载体）
+!THIRD-PARTY-NOTICES.md
 
 # ── 依赖裁剪：以下包仅被已禁用的插件引用（llm-pi-ai 多提供商网关 / 遥测），
 #    插件固定使用 deepseek-official 路由且不启用遥测，故从 VSIX 剔除以瘦身。

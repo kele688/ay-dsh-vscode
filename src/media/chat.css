@@ -110,10 +110,11 @@ body {
   width: 62px;
 }
 
-/* Agent 模式：固定适配"单 Agent 串行 / 多 Agent 并发"的宽度 */
+/* Agent 模式：固定适配"单 Agent 串行 / 多 Agent 并发"的宽度。
+   注意：不要用 --muted 强制文字色——会让人误以为下拉被禁用（置灰） */
 .tool-select.workmode {
   width: 92px;
-  color: var(--muted);
+  color: var(--fg);
 }
 
 /* ---- header ---- */

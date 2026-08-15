@@ -50,6 +50,7 @@
     suppressSelectorEvents: false, // 填充下拉时抑制 change 事件
     historyMore: null, // {hasMore, nextSeq} 分页状态
     historyLoadingMore: false, // 正在加载更早历史（防重入）
+    streamText: "", // 当前流式气泡的累积纯文本（供节流 markdown 渲染使用）
   };
 
   /* ---------------- 国际化（跟随 VS Code 语言） ---------------- */
@@ -567,22 +568,78 @@
     return state.currentAssistant;
   }
 
+  /**
+   * 流式渲染调度器（核心性能优化）。
+   *
+   * 旧的实现：每个 delta 都执行一次 `innerHTML = renderMarkdown(全部文本)`——
+   * 模型高速输出（100+ tok/s）时每秒触发上百次 O(n) 全量 markdown 解析与 DOM
+   * 重建，UI 线程被占满，事件积压，观感就是"一顿一顿分批输出"。
+   *
+   * 新的实现：
+   * - delta 文本先以文本节点**即时廉价追加**（O(delta)，不阻塞 UI），
+   *   保证"文字先出来"，链式流畅；
+   * - markdown 全量格式化交给 rAF（与浏览器帧同步，~16ms 一次）节流执行，
+   *   定时器兜底（webview 不可见时 rAF 暂停，保证不积压过久）。
+   */
+  let streamRenderRaf = null;
+  let streamRenderTimer = null;
+
+  function scheduleStreamRender() {
+    if (streamRenderTimer !== null) return; // 已调度
+    const render = () => {
+      streamRenderRaf = null;
+      streamRenderTimer = null;
+      flushStreamRender();
+    };
+    if (typeof requestAnimationFrame === "function") {
+      streamRenderRaf = requestAnimationFrame(render);
+      streamRenderTimer = setTimeout(render, 60); // rAF 兜底（视图隐藏时）
+    } else {
+      streamRenderTimer = setTimeout(render, 33);
+    }
+  }
+
+  /** 立即执行一次全量 markdown 渲染（finalize / 切换气泡前调用，防丢尾部）。 */
+  function flushStreamRender() {
+    if (streamRenderRaf !== null && typeof cancelAnimationFrame === "function") {
+      cancelAnimationFrame(streamRenderRaf);
+      streamRenderRaf = null;
+    }
+    if (streamRenderTimer !== null) {
+      clearTimeout(streamRenderTimer);
+      streamRenderTimer = null;
+    }
+    const a = state.currentAssistant;
+    if (!a || !state.streamText) return;
+    a.textBody.innerHTML = renderMarkdown(state.streamText);
+    a.streamNode = null; // 渲染后旧文本节点已销毁；后续 delta 会重建
+    scrollToBottom();
+  }
+
   function appendAssistantDelta(text, reasoning) {
     const a = ensureAssistant(false);
     if (reasoning) {
-      // 思考过程：出现内容即显示并自动展开，同时智能跟随其内部滚动
+      // 思考链：纯文本追加（无 markdown 解析，本身廉价），即时显示
       a.reasoning.classList.remove("hidden");
       a.reasoning.open = true;
       a.reasoningBody.textContent += reasoning;
       a.stickReasoning();
     }
     if (text) {
-      a.textBody.innerHTML = renderMarkdown(a.textBody.textContent + text);
+      state.streamText += text;
+      if (!a.streamNode) {
+        a.streamNode = document.createTextNode("");
+        a.textBody.appendChild(a.streamNode);
+      }
+      a.streamNode.textContent += text; // O(delta) 即时追加
+      scheduleStreamRender(); // 节流执行全量 markdown 格式化
     }
     scrollToBottom();
   }
 
   function finalizeAssistant(text, reasoning, foldReasoning) {
+    // 先冲刷未决的流式渲染（防止节流未触发时丢尾部），再进入最终态
+    flushStreamRender();
     // 实时流中文本/思考已通过 delta 渲染；assistant/message 事件在 needFull=false
     // 时 text/reasoning 均为空，此时绝不能移除气泡。只有气泡确实无任何内容
     // （纯工具调用回合从未渲染）才移除。
@@ -595,6 +652,7 @@
         state.currentAssistant.wrap.remove();
       }
       state.currentAssistant = null;
+      state.streamText = "";
       return;
     }
     const a = ensureAssistant(foldReasoning);
@@ -617,6 +675,7 @@
       a.textBody.classList.add("hidden");
     }
     state.currentAssistant = null;
+    state.streamText = "";
     scrollToBottom();
   }
 
@@ -743,9 +802,19 @@
       const btnResume = el("button", "hbtn resume", t("resume"));
       btnResume.title = t("resumeTitle");
       btnResume.addEventListener("click", () => {
+        // 切换会话：点击瞬间立即清空旧会话消息区（不等 history 帧到达），
+        // 建立明确的"切换会话"观感；history 帧到达后再渲染选定会话的历史。
+        // （history 帧处理里还会幂等地再清一次，双保险）
+        flushStreamRender();
+        messagesEl.innerHTML = "";
+        state.currentAssistant = null;
+        state.streamText = "";
+        state.historyMore = null;
+        state.historyLoadingMore = false;
         vscode.postMessage({ t: "resumeSession", id: s.id });
         historyPanel.classList.add("hidden");
         hintEl.textContent = t("restoring");
+        updateEmptyState();
       });
       const btnDelete = el("button", "hbtn delete", t("del"));
       btnDelete.title = t("delTitle");
@@ -852,6 +921,11 @@
         resolveToolCard(e.callId, e.ok, e.text);
         break;
       case "turn":
+        // 新一轮开始：冲刷上一轮未决的流式渲染，重置累积文本，防止串轮
+        if (e.status === "start") {
+          flushStreamRender();
+          state.streamText = "";
+        }
         break;
     }
   }
@@ -863,7 +937,16 @@
         L = msg.locale === "en" ? I18N.en : I18N.zh;
         const isNewEmpty = !msg.sessionId && Boolean(state.sessionId);
         if (isNewEmpty) {
-          // 切到"新会话"（无 session）：清空顶部统计（host 已重置，这里同步 UI）
+          // 切到"新会话"（有旧会话 -> 空会话）：清空消息区与顶部统计，
+          // 重建"新会话"观感（后续新对话从空白开始追加）。
+          // 注意 resume 方向（空 -> 有 id）不能清：history 帧先渲染历史，
+          // ready/bootstrap 后到，此时清空会抹掉刚加载的历史。
+          flushStreamRender();
+          state.currentAssistant = null;
+          state.streamText = "";
+          state.historyMore = null;
+          state.historyLoadingMore = false;
+          messagesEl.innerHTML = "";
           state.stats = null;
           sessionTitleEl.textContent = "";
           costStatsEl.textContent = "—";
@@ -944,6 +1027,7 @@
         // 分页：hasMore 时向上滚动加载更早消息。
         messagesEl.innerHTML = "";
         state.currentAssistant = null;
+        state.streamText = "";
         state.historyMore = msg.hasMore ? { hasMore: true, nextSeq: msg.nextSeq } : null;
         state.historyLoadingMore = false;
         for (const e of msg.events) handleViewEvent(e, { foldReasoning: true });
