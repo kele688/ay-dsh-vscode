@@ -17,6 +17,12 @@ import { openConfigPanel } from "./configPanel";
 
 let provider: ChatViewProvider | undefined;
 let host: AgentHost | undefined;
+/** 配置面板保存事务标志（保存期间忽略逐项配置变更事件，由 onSaved 统一重启）。 */
+let configSaveTransaction = false;
+/** 配置变更后的宿主重启防抖定时器（settings.json 直接编辑等非面板场景）。 */
+let configRestartTimer: NodeJS.Timeout | undefined;
+/** 最近一次因配置保存而重启宿主的时间戳（抑制面板保存的延迟配置事件）。 */
+let lastConfigRestartAt = 0;
 
 const SECRET_KEY = "dshVscode.apiKey";
 const CONFIG_NS = "dshVscode";
@@ -118,6 +124,9 @@ function readConfig(): {
   model: string;
   permissionMode: string;
   nodePath: string;
+  maxSteps: number;
+  subagentMaxDepth: number;
+  maxParallelSubagents: number;
 } {
   const cfg = vscode.workspace.getConfiguration(CONFIG_NS);
   const apiKeySetting = cfg.get<string>("apiKey");
@@ -128,7 +137,11 @@ function readConfig(): {
   const model = cfg.get<string>("model") || DEFAULT_MODEL;
   const permissionMode = cfg.get<string>("permissionMode") || "workspace-write";
   const nodePath = cfg.get<string>("nodePath") || "";
-  return { apiKey, baseUrl, model, permissionMode, nodePath };
+  // 借鉴 dsh web：思考轮次上限（0 = 不限制）、子代理递归深度、并行子代理数
+  const maxSteps = Math.max(0, Number(cfg.get<number>("maxSteps") ?? 100) || 0);
+  const subagentMaxDepth = Math.max(1, Number(cfg.get<number>("subagentMaxDepth") ?? 3) || 3);
+  const maxParallelSubagents = Math.max(1, Number(cfg.get<number>("maxParallelSubagents") ?? 5) || 5);
+  return { apiKey, baseUrl, model, permissionMode, nodePath, maxSteps, subagentMaxDepth, maxParallelSubagents };
 }
 
 /** 配置摘要（推送给 UI 展示）。SecretStorage 密钥库是 API Key 的主存储，必须纳入判断。 */
@@ -210,6 +223,9 @@ async function ensureHost(context: vscode.ExtensionContext): Promise<AgentHost> 
       model: cfg.model,
       permissionMode: cfg.permissionMode,
       nodePath: cfg.nodePath,
+      maxSteps: cfg.maxSteps,
+      subagentMaxDepth: cfg.subagentMaxDepth,
+      maxParallelSubagents: cfg.maxParallelSubagents,
       dshHome: pluginDshHome(context),
       legacyDshHome: legacyDshHome(),
     },
@@ -262,19 +278,39 @@ function buildSelectionRef(editor: vscode.TextEditor): string {
 /* 配置：完整配置面板（src/configPanel.ts）                              */
 /* ------------------------------------------------------------------ */
 
-/** 打开统一配置面板；保存成功后解绑宿主（下次使用按新配置拉起）并刷新聊天视图。 */
+/**
+ * 打开统一配置面板。
+ *
+ * 配置保存视为**一个整体事务**：面板保存期间（onConfigSaveStart → onConfigSaveEnd）
+ * 逐项 cfg.update 触发的 onDidChangeConfiguration 一律忽略；保存成功（onSaved）后
+ * 一次性判断并重启宿主——不依赖单个配置项的事件，避免"半套配置重启"与
+ * "多次触发互相覆盖"。
+ */
 function openSettings(context: vscode.ExtensionContext): void {
   openConfigPanel(context, {
     readConfig,
     workspaceRoot,
+    onConfigSaveStart: () => {
+      configSaveTransaction = true;
+    },
+    onConfigSaveEnd: () => {
+      configSaveTransaction = false;
+    },
     onSaved: () => {
+      configSaveTransaction = false;
+      // 记录本次重启时间：抑制 onDidChangeConfiguration 的延迟事件（面板保存
+      // 的配置事件可能在事务结束后才到达），避免宿主被重复重启
+      lastConfigRestartAt = Date.now();
+      if (configRestartTimer) clearTimeout(configRestartTimer);
+      configRestartTimer = undefined;
+      // 会话 id 已在会话存续期间持久化（storedSessionId），此处只需锁定 UI +
+      // 按新配置重启宿主；重启就绪后自动恢复原会话。
+      // 保存结果提示统一走 VS Code 状态栏（configPanel.ts setStatusBarMessage），
+      // 不弹任何通知/弹框。
+      provider?.noteHostRestart();
       disposeHost();
+      provider?.restartHost();
       provider?.pushConfigToView?.();
-      vscode.window.showInformationMessage(
-        vscode.env.language.startsWith("zh")
-          ? "✅ 配置已保存并应用，将在下次使用时生效"
-          : "✅ Settings saved and applied; effective on next use"
-      );
     },
   });
 }
@@ -289,6 +325,12 @@ export function activate(context: vscode.ExtensionContext): void {
     getModel: () => readConfig().model,
     getConfigSummary: () => getConfigSummary(context),
     ensureHost: () => ensureHost(context),
+    // 当前会话 id 跨 Reload 持久化（workspaceState）：Reload 窗口后自动恢复原会话，
+    // 不默认停在"新会话"
+    getStoredSessionId: () => context.workspaceState.get<string>("currentSessionId"),
+    setStoredSessionId: (id) => {
+      void context.workspaceState.update("currentSessionId", id ?? undefined);
+    },
   });
 
   context.subscriptions.push(
@@ -367,13 +409,23 @@ export function activate(context: vscode.ExtensionContext): void {
     })
   );
 
-  // 配置变更 → 解绑并关闭宿主（下次使用时以新配置拉起）
+  // 配置变更（非配置面板保存路径，如直接编辑 settings.json）→ 解绑并重启宿主。
+  // 面板保存事务期间（configSaveTransaction）本事件由 onSaved 统一处理，此处忽略；
+  // 面板保存刚重启过（时间戳窗口内）的延迟事件同样忽略，避免重复重启。
+  // 重启前先锁定 UI（noteHostRestart），就绪后自动恢复原会话（storedSessionId）。
   context.subscriptions.push(
     vscode.workspace.onDidChangeConfiguration((e) => {
-      if (e.affectsConfiguration(CONFIG_NS)) {
-        disposeHost();
-        provider?.pushConfigToView?.();
-      }
+      if (!e.affectsConfiguration(CONFIG_NS)) return;
+      if (configSaveTransaction) return; // 面板保存事务中：onSaved 统一处理
+      if (Date.now() - lastConfigRestartAt < 1500) return; // 面板保存刚重启过：忽略延迟事件
+      provider?.noteHostRestart();
+      disposeHost();
+      if (configRestartTimer) clearTimeout(configRestartTimer);
+      configRestartTimer = setTimeout(() => {
+        configRestartTimer = undefined;
+        provider?.restartHost();
+      }, 400);
+      provider?.pushConfigToView?.();
     })
   );
 
@@ -394,6 +446,8 @@ export function activate(context: vscode.ExtensionContext): void {
 }
 
 export function deactivate(): void {
+  if (configRestartTimer) clearTimeout(configRestartTimer);
+  configRestartTimer = undefined;
   void host?.dispose();
   host = undefined;
 }

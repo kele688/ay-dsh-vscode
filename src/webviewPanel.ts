@@ -20,6 +20,9 @@ export interface ChatViewDeps {
     cwd: string;
   }>;
   ensureHost: () => Promise<AgentHost>;
+  /** 读取/保存"当前会话 id"（workspaceState 持久化，跨 VS Code Reload 窗口保持）。 */
+  getStoredSessionId: () => string | undefined;
+  setStoredSessionId: (id: string | undefined) => void;
 }
 
 /** 扩展侧错误消息的国际化（zh/en 双语，跟随 VS Code 界面语言）。 */
@@ -46,8 +49,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private pendingApprovals = new Map<number, { toolName: string; reason?: string; callId?: string; agentId?: string }>();
   /** 待审批时显示的状态栏项（点击聚焦面板）。 */
   private approvalStatusItem: vscode.StatusBarItem | undefined;
+  /** 提示信息状态栏项（webview 内 hint 图标 + hover 之外，同步到 VS Code 状态栏）。 */
+  private hintStatusItem: vscode.StatusBarItem | undefined;
   /** 最近一次会话统计（webview ready 时补发，避免就绪前的事件丢失）。 */
   private lastStats: (ExtensionToWebview & { t: "stats" }) | undefined;
+  /**
+   * "当前会话 id"的唯一真相源：会话创建/恢复（宿主 ready 有会话）、newSession、
+   * 删除当前会话时更新（persistSessionId）；会话存续期间保持不变。
+   * 同时持久化到 workspaceState——配置变更重启宿主、VS Code Reload 后，
+   * 宿主 ready（空会话）时据此自动恢复原会话（resume），不新建会话。
+   */
+  private storedSessionId: string | undefined;
   /** webview 创建时间戳（性能诊断）。 */
   private viewCreatedAt: number | undefined;
   /** 诊断日志（输出通道 "ay-dsh-vscode Host" 可见）。 */
@@ -65,6 +77,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   constructor(private readonly deps: ChatViewDeps) {
     this.approvalStatusItem = undefined;
+    // 读取跨 Reload 持久化的会话 id（Reload 后自动恢复原会话，而非停在"新会话"）
+    this.storedSessionId = this.deps.getStoredSessionId();
+  }
+
+  /** 更新"当前会话 id"：内存 + workspaceState 持久化（Reload 后可恢复）。 */
+  private persistSessionId(id: string | undefined): void {
+    this.storedSessionId = id;
+    this.deps.setStoredSessionId(id);
   }
 
   /** 绑定（或解绑）宿主实例。 */
@@ -81,6 +101,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       // 宿主销毁：清空审批缓存与状态栏
       this.pendingApprovals.clear();
       this.refreshApprovalStatusBar();
+      this.hintStatusItem?.hide();
     }
     if (host) this.hostDisposable = host.onEvent((e) => this.handleHostEvent(e));
   }
@@ -106,6 +127,24 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   /** 向视图推送最新配置摘要（配置向导保存后调用）。 */
   pushConfigToView(): void {
     void this.pushConfig();
+  }
+
+  /**
+   * 配置变更时调用（宿主即将重启）：通知 UI 锁定发送（恢复完成后解锁）。
+   * 会话 id 不在此记录——它已在会话创建/恢复时持久化（storedSessionId），
+   * 会话存续期间不变；宿主重启 ready（空会话）后据 storedSessionId 自动恢复。
+   */
+  noteHostRestart(): void {
+    if (this.storedSessionId) this.push({ t: "restarting" });
+  }
+
+  /** disposeHost 之后调用：立即按新配置重建宿主（否则 UI 会卡在恢复锁定，
+   *  直到用户操作才惰性启动）。重启就绪后 handleHostEvent ready 自动 resume 原会话。 */
+  restartHost(): void {
+    void this.deps.ensureHost().catch(() => {
+      // 启动失败：保持静默（用户实际操作时 sendChat/历史会给出友好提示），
+      // UI 的恢复锁定由 chat.js 的 15s 兜底自动解除
+    });
   }
 
   private async drainTasks(): Promise<void> {
@@ -150,6 +189,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           this.refreshApprovalStatusBar();
           break;
         case "newSession":
+          // 用户显式开新会话：清空持久化会话（Reload/重启不再恢复），宿主切到空会话
+          this.persistSessionId(undefined);
           this.host?.newSession();
           break;
         case "openWorkspace":
@@ -157,6 +198,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           break;
         case "configure":
           void vscode.commands.executeCommand("dshVscode.configure");
+          break;
+        case "resumeSession":
+          // 用户从历史面板显式选择会话：会话 id 由随后的宿主 ready 帧统一持久化
+          this.host?.resumeSession(msg.id);
           break;
         case "history":
         case "historyRefresh": {
@@ -182,9 +227,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           break;
         }
         case "historyClose":
-          break;
-        case "resumeSession":
-          this.host?.resumeSession(msg.id);
           break;
         case "loadMoreHistory":
           this.host?.loadMoreHistory(msg.beforeSeq);
@@ -213,6 +255,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           this.push({ t: "status", status: this.lastStatus });
           void this.pushConfig();
           this.pushHostState();
+          // Reload 窗口/首次激活场景：存在持久化的会话 id，且宿主当前无会话
+          // （不是 webview 重建但宿主仍持有会话的场景）→ 提前锁定发送，
+          // 等宿主 ready 后自动恢复原会话，不默认停在"新会话"
+          if (this.storedSessionId && !this.host?.sessionId) {
+            this.push({ t: "restarting" });
+          }
           const boot =
             this.lastBootstrap ?? {
               t: "bootstrap",
@@ -241,6 +289,23 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         case "openFile": {
           const uri = vscode.Uri.file(msg.path);
           void vscode.window.showTextDocument(uri, { preview: true });
+          break;
+        }
+        case "hint": {
+          // 提示信息同步到 VS Code 状态栏（composer 行太窄，完整信息放状态栏，
+          // 面板内另有 ⓘ 图标 hover 提示）
+          const text = typeof msg.text === "string" ? msg.text : "";
+          if (!text) {
+            this.hintStatusItem?.hide();
+            break;
+          }
+          if (!this.hintStatusItem) {
+            this.hintStatusItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 90);
+            this.hintStatusItem.command = "dshVscode.chatView.focus";
+          }
+          this.hintStatusItem.text = `◈ ${text}`;
+          this.hintStatusItem.tooltip = text;
+          this.hintStatusItem.show();
           break;
         }
       }
@@ -345,6 +410,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         this.hostReady = true;
         this.hostState = "ready";
         this.hostRestartAttempts = 0;
+        // 宿主就绪但会话为空（配置变更重启 / VS Code Reload 后重启）：
+        // 自动恢复原会话（storedSessionId 在会话存续期间恒定，此处直接读取）。
+        // 先推送 restarting（UI 锁定发送、清空旧列表），再发起 resume。
+        if (!e.sessionId && this.storedSessionId) {
+          this.push({ t: "restarting" });
+          this.host?.resumeSession(this.storedSessionId);
+        } else if (e.sessionId) {
+          // 有真实会话：持久化当前会话 id（Reload 后恢复用）
+          this.persistSessionId(e.sessionId);
+        }
         this.lastBootstrap = {
           t: "bootstrap",
           model: e.model,
@@ -426,9 +501,26 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       case "compactDone":
         this.push({ t: "compactDone", ok: e.ok, text: e.text, error: e.error });
         break;
+      case "stepLimit":
+        // 最大思考轮次兜底触发：宿主不硬截停，而是已引导 Agent 收尾总结；
+        // 此处提示用户任务达到上限，可继续输入指令推进（会话与历史不受影响）
+        this.push({
+          t: "event",
+          e: {
+            kind: "error",
+            text: loc(
+              `已达最大思考轮次（${e.maxSteps} 次），Agent 正在收尾总结。任务若未完成，可继续输入指令推进。`,
+              `Maximum thinking steps reached (${e.maxSteps}); the agent is wrapping up. Keep typing to continue if the task is not done.`
+            ),
+            ts: Date.now(),
+          },
+        });
+        break;
       case "sessionResumed":
-        // 恢复结果通过 history + ready 帧呈现；失败时提示
+        // 恢复结果通过 history + ready 帧呈现；失败时提示，并清空持久化的会话
+        // 记忆（会话已不可用，避免下次 Reload/重启反复尝试恢复同一会话）
         if (!e.ok) {
+          this.persistSessionId(undefined);
           this.push({
             t: "event",
             e: {
@@ -440,6 +532,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         }
         break;
       case "sessionDeleted":
+        // 删除的是当前会话：清空持久化会话记忆（下次 Reload 不再恢复已删会话）
+        if (e.ok && e.id === this.storedSessionId) {
+          this.persistSessionId(undefined);
+        }
         this.push({ t: "sessionDeleted", id: e.id, ok: e.ok, error: e.error });
         break;
       case "sessionExported": {
@@ -573,6 +669,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       <span id="costStats" class="topbar-stat" title="">—</span>
       <span id="contextPct" class="topbar-stat" title="">—</span>
       <span class="spacer"></span>
+      <span id="steps" class="token-stat" title="">🔄 0</span>
       <span id="tokensIn" class="token-stat">↗ 0</span>
       <span id="tokensCache" class="token-stat">⇄ 0</span>
       <span id="tokensOut" class="token-stat">↘ 0</span>
@@ -606,23 +703,28 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     </div>
   </div>
   <footer id="composer">
-    <textarea id="input" rows="2" placeholder="${L.placeholder}"></textarea>
+    <div id="inputRow" class="composer-input-row">
+      <textarea id="input" rows="2" placeholder="${L.placeholder}"></textarea>
+    </div>
     <div id="composerTools" class="composer-tools">
       <select id="selProvider" title="${L.providerTitle}" class="tool-select provider"></select>
       <select id="selModel" title="${L.modelTitle}" class="tool-select model"></select>
+      <!-- 思考等级：值一律小写（off/low/high/max），与内核/官方 API 的 effort 值域一致。
+           注意：low 由官方服务端映射为 high（见 host normalizeEffort），显示小写避免与传值混淆 -->
       <select id="selEffort" title="${L.effortTitle}" class="tool-select effort">
-        <option value="high">HIGH</option>
-        <option value="off">OFF</option>
-        <option value="low">LOW</option>
-        <option value="max">MAX</option>
+        <option value="off">off</option>
+        <option value="low">low</option>
+        <option value="high">high</option>
+        <option value="max">max</option>
       </select>
       <select id="selWorkMode" title="${L.workModeTitle}" class="tool-select workmode">
         <option value="single">${L.workModeSingle}</option>
         <option value="multi">${L.workModeMulti}</option>
       </select>
-      <span id="hint" class="hint"></span>
+      <span id="hint" class="hint hidden" title="">ⓘ</span>
+      <!-- 发送/停止共用同一按钮：运行中变"停止"（红），空闲为"发送"；
+           位于工具行（与模型选择框同一行）最右侧，右缘与输入框右缘对齐 -->
       <button id="btnSend" class="btn send">${L.send}</button>
-      <button id="btnStop" class="btn stop hidden">${L.stop}</button>
     </div>
   </footer>
 </div>

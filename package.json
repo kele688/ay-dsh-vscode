@@ -193,6 +193,21 @@
           "type": "number",
           "default": 40000,
           "markdownDescription": "UI 中单个工具结果/消息的最大渲染字符数（超出折叠）。"
+        },
+        "dshVscode.maxSteps": {
+          "type": "number",
+          "default": 100,
+          "markdownDescription": "单次任务的最大思考轮次（step 上限，借鉴 dsh web）。达到上限自动停止，防止任务无限循环。设为 0 表示不限制。"
+        },
+        "dshVscode.subagentMaxDepth": {
+          "type": "number",
+          "default": 3,
+          "markdownDescription": "子代理递归深度上限（对应 DSH tool-subagent 的 maxDepth，默认与 dsh web 一致）。"
+        },
+        "dshVscode.maxParallelSubagents": {
+          "type": "number",
+          "default": 5,
+          "markdownDescription": "多 Agent 模式下并行子代理数量上限（提示词级约束）。"
         }
       }
     }
@@ -201,7 +216,10 @@
     "build": "node scripts/build.mjs",
     "watch": "node scripts/build.mjs --watch",
     "package": "node scripts/package.mjs",
-    "deploy": "powershell -ExecutionPolicy Bypass -File scripts/deploy.ps1"
+    "deploy": "powershell -ExecutionPolicy Bypass -File scripts/deploy.ps1",
+    "verify:i18n": "node scripts/verify-i18n.mjs",
+    "bump": "node scripts/bump-version.mjs",
+    "release": "node scripts/release.mjs"
   },
   "dependencies": {
     "@deepseek-ai/cordis": "^4.0.1",

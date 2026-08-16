@@ -120,6 +120,17 @@ function composePatches(env) {
         workspaceRoot: process.cwd(),
       },
     },
+    // 子代理工具配置（借鉴 dsh web）：整行替换语义，必须携带完整 config。
+    // maxDepth = 子代理递归深度上限（内核默认 3）；插件可配置。
+    {
+      id: "tool-subagent",
+      config: {
+        provider: "spawn",
+        toolName: "subagent",
+        backgroundMode: "continuable",
+        maxDepth: Number(env.DSH_SUBAGENT_MAX_DEPTH) || 3,
+      },
+    },
     // 独立会话存储：插件会话与 dsh CLI / dsh web 等官方应用的会话完全隔离，
     // 插件的历史列表只包含插件自己的会话。
     {
@@ -210,7 +221,7 @@ class EventPump {
 
 /**
  * 创建 Agent 并挂接所有监听器。
- * @returns {Promise<{handle: import('@deepseek-ai/dsh-agent').AgentHandle, agent: import('@deepseek-ai/dsh-agent').Agent, selection: object}>}
+ * @returns {Promise<{handle: import('@deepseek-ai/dsh-agent').AgentHandle, agent: import('@deepseek-ai/dsh-agent').Agent, selection: object, resetStepBudget: () => void}>}
  */
 async function createAgent(ctx, options, pump, approvals) {
   const agents = ctx.get("agents");
@@ -233,9 +244,9 @@ async function createAgent(ctx, options, pump, approvals) {
     },
   });
 
-  attachAgent(ctx, handle, pump);
+  const attached = attachAgent(ctx, handle, pump);
   await handle.agent.whenIdle();
-  return { handle, agent: handle.agent, selection };
+  return { handle, agent: handle.agent, selection, resetStepBudget: attached.resetStepBudget };
 }
 
 /** 恢复一个持久化会话（继续历史对话）。 */
@@ -283,27 +294,31 @@ async function resumeAgent(ctx, resumeSessionId, options, pump, approvals) {
     log("info", `session cwd ${sessionCwd} != workspace ${currentCwd}; injected cwd correction`);
   }
 
-  attachAgent(ctx, handle, pump);
+  const attached = attachAgent(ctx, handle, pump);
   await handle.agent.whenIdle();
-  return { handle, agent: handle.agent, selection };
+  return { handle, agent: handle.agent, selection, resetStepBudget: attached.resetStepBudget };
 }
 
 /**
  * 多 Agent 编排模式的系统提示补充段。
  * 挂载在 system-prompt/assemble 瀑布上：multi 模式下注入"拆解 → 并行子代理 → 汇总"
  * 的指令，让主 agent 用 DSH 原生的 subagent 工具并行执行子任务。
+ * 并行数量上限（DSH_MAX_PARALLEL_SUBAGENTS，默认 5）：prompt 级约束（内核无硬参数）。
  */
-const MULTI_AGENT_SECTION = {
-  name: "work-mode",
-  text:
-    "Current work mode: MULTI-AGENT ORCHESTRATION.\n" +
-    "For the task at hand: (1) decompose it into independent subtasks; " +
-    "(2) run them in PARALLEL by dispatching subagents with the subagent tools " +
-    "(spawn multiple agents concurrently, one per subtask, giving each a self-contained prompt); " +
-    "(3) collect their results and synthesize a final answer yourself. " +
-    "Use parallel dispatch whenever subtasks do not depend on each other. " +
-    "Keep the user informed: show each dispatched subagent as it starts and when it returns.",
-};
+function multiAgentSection(env) {
+  const maxParallel = Number(env.DSH_MAX_PARALLEL_SUBAGENTS) || 5;
+  return {
+    name: "work-mode",
+    text:
+      "Current work mode: MULTI-AGENT ORCHESTRATION.\n" +
+      "For the task at hand: (1) decompose it into independent subtasks; " +
+      `(2) run them in PARALLEL by dispatching subagents with the subagent tools ` +
+      `(spawn multiple agents concurrently — at most ${maxParallel} in parallel, one per subtask, giving each a self-contained prompt); ` +
+      "(3) collect their results and synthesize a final answer yourself. " +
+      "Use parallel dispatch whenever subtasks do not depend on each other. " +
+      "Keep the user informed: show each dispatched subagent as it starts and when it returns.",
+  };
+}
 
 /**
  * 挂接事件/状态监听（create 与 resume 共用；每个 agent 各挂一份）。
@@ -312,12 +327,183 @@ const MULTI_AGENT_SECTION = {
  * 所有 agent（含 subagent 工具创建的子 agent）的 approval/request，
  * 否则子 agent 的越界请求会因无监听者而 fail-closed（静默拒绝、无弹窗）。
  */
+
+/**
+ * 思考等级（reasoning effort）规范化。
+ *
+ * 备忘：DeepSeek 现役模型为 deepseek-v4-flash / deepseek-v4-pro；
+ * deepseek-chat / deepseek-reasoner 已停止服务（旧模型下线），不再使用。
+ *
+ * 官方文档（api-docs.deepseek.com/guides/thinking_mode）：
+ *   - 思考模式默认开启，默认 effort = high；
+ *   - reasoning_effort 参数支持 low/high/max，映射表（v4-flash 与 v4-pro 相同）：
+ *       low → low；medium → high；high → high；xhigh → high；max → max
+ *     （即 low 是真实低档，medium/xhigh 归并为 high）；
+ *   - 关闭思考用 thinking.type=disabled（即本插件的 off 档）。
+ *
+ * 内核适配器（dsh-llm-deepseek）当前只实现 off/high/max 三档，
+ * 对 low 会抛 UNSUPPORTED_REASONING_EFFORT（resolveCallConfig 实测拒绝，
+ * 见 scripts/effort-probe.mjs）。因此在宿主层把 low 归一为 high：
+ *   官方 API 支持 low（真实低档），但内核未实现——这是"内核能力落后于
+ *   官方 API"的兼容处理；待内核支持 low 后应移除该映射，让 low 真正生效。
+ * 未知/空值返回 undefined → 走内核/提供商默认（DeepSeek 默认 high）。
+ */
+function normalizeEffort(value) {
+  if (value === "off" || value === "high" || value === "max") return value;
+  if (value === "low") return "high";
+  return undefined;
+}
+
+/**
+ * 系统提示层收尾引导（**从一开始就注入**，每轮系统提示均携带）：
+ * 让模型预先知晓"单轮（一条用户消息）有 N 步思考预算"，主动规划任务节奏；
+ * 达到上限时工具调用被禁用、必须立即收尾总结。经 system-prompt/assemble
+ * 瀑布注入 `assembled.sections`，由 renderPrompt 渲染进系统提示（探针实证：
+ * 注入确实进入 request.system，但长系统提示中的指令易被模型重视不足——
+ * 故配合消息层 pre-step 注入与工具拦截兜底）。
+ */
+function stepLimitSystemSection(limit) {
+  return {
+    name: "step-limit",
+    text:
+      `Each turn (one user message) has a thinking-step budget of ${limit} model steps. ` +
+      "Plan your work to finish within this budget. " +
+      "When the budget is reached, tool calls are disabled and you must wrap up immediately: " +
+      "stop all new tool calls and reasoning, and deliver a concise final answer covering what " +
+      "was accomplished, what remains unfinished, and the next command the user should send. " +
+      "Do not continue working beyond the budget.",
+  };
+}
+
+/**
+ * 消息层收尾指令（agent/pre-step 注入的 user 消息，超限后下一步必达）：
+ * 对话末尾的 user 消息是模型必须处理的输入，必然引起响应——软性收尾的强
+ * 注入点。内容明确：阈值（limit）与当前值（steps）、原因（工具已禁用）、
+ * 要求的动作、语气专业坚定且礼貌。该消息会写入会话历史（收尾指令作为对话
+ * 痕迹可见）。注意：纯提示词对模型的约束力有限（实测模型可能继续执行），
+ * 真正的收尾保障是 tools/pre-execute 工具拦截（见 attachAgent）。
+ */
+function stepLimitWrapUpMessage(limit, steps) {
+  return (
+    `[System notice] Step limit reached: ${steps}/${limit} steps used — this turn's thinking budget ` +
+    "is exhausted and all tool calls are now disabled. The per-turn step limit keeps each request " +
+    "bounded and prevents runaway tool loops, so continuing further work is not permitted. " +
+    "Stop further reasoning and deliver your final answer in this reply: what was accomplished, " +
+    "what remains unfinished, and the next command the user should send. " +
+    "Do not continue working after this reply. Thank you for wrapping up cleanly."
+  );
+}
+
+/**
+ * 最大思考轮次兜底（借鉴 dsh web 的 step 概念）：**单轮**（一条用户消息）的
+ * 思考步数上限，防单轮无限循环。内核无内置 step 上限参数，宿主侧监听
+ * step/start 计数：
+ *   - 计数按轮重置（attachAgent 返回 resetStepBudget，chat 入口在每条用户
+ *     消息入队前调用）——stepLimit 只限制"用户发一条消息后、后台与 AI 交互
+ *     的步数"，不是会话累计步数上限；会话可以一直聊下去；
+ *   - 0 = 不限制：不计数、不注入收尾提示、不通报（env 值直接透传，勿用
+ *     `|| 默认值` 吞掉 0）；
+ *   - 软性收尾（不做硬截停）：系统提示从一开始就注入单轮预算约束（提醒模型
+ *     规划节奏），达到上限后由消息层注入收尾指令（模型必须响应、总结收尾），
+ *     直到本轮自然结束——绝不对会话/agent 执行 cancel；
+ *   - 达到上限时向上层通报一次 stepLimit（UI 提示用户任务已到上限，可继续
+ *     输入指令推进；会话与历史不受影响）。
+ */
 function attachAgent(ctx, handle, pump) {
   const agent = handle.agent;
 
+  // 环境变量直读：非数字或缺失时回退 100；合法值原样保留（0 = 不限制）。
+  const maxSteps = Number(process.env.DSH_MAX_STEPS);
+  const stepLimit = Number.isFinite(maxSteps) ? maxSteps : 100;
+  let stepCount = 0;
+  let stepLimitHit = false;
+  /** 消息层收尾指令是否已注入（每轮最多注入一次，避免刷屏）。 */
+  let wrapUpInjected = false;
+
+  /** 新一轮用户消息开始时调用：重置本轮步数预算（stepLimit 是单轮上限）。 */
+  const resetStepBudget = () => {
+    stepCount = 0;
+    stepLimitHit = false;
+    wrapUpInjected = false;
+  };
+
   // 会话事件 → 扩展（scope-filtered：仅本 agent 的会话）
   agent.ctx.on("session/event", (_session, event) => {
+    if (event.type === "step/start") {
+      stepCount++;
+      // 达到上限：不硬截停（agent.cancel 会生硬打断模型），只通报一次，
+      // 由 assemble 钩子注入的收尾提示引导模型自然结束。
+      if (!stepLimitHit && stepLimit > 0 && stepCount >= stepLimit) {
+        stepLimitHit = true;
+        log("warn", `step limit reached (${stepLimit}) — steering the agent to wrap up`);
+        post({ t: "stepLimit", maxSteps: stepLimit, steps: stepCount });
+      }
+    }
     pump.push(event);
+  });
+
+  // 收尾引导（系统提示层）：**从一开始就注入**（每轮系统提示均携带单轮预算
+  // 约束，让模型预先知晓并规划节奏）；达到上限后提示词继续存在于系统提示，
+  // 直到本轮自然结束。stepLimit = 0 时不注入。
+  agent.ctx.on("system-prompt/assemble", async (_assembly, _context, next) => {
+    const assembled = await next();
+    log("info", `assemble hook called (stepCount=${stepCount}, stepLimit=${stepLimit}, sections=${(assembled.sections ?? []).length})`);
+    if (stepLimit > 0) {
+      return {
+        ...assembled,
+        sections: [...(assembled.sections ?? []), stepLimitSystemSection(stepLimit)],
+      };
+    }
+    return assembled;
+  });
+
+  // 收尾引导（对话消息层，最强）：已达上限（stepLimitHit）后，在**下一步**
+  // 的输入 messages 末尾追加一条 user 收尾指令（含明确的阈值与当前值）。
+  // 模型对对话末尾的 user 消息必然响应（它成为该步必须处理的输入），因此
+  // 软性收尾真正生效。仅注入一次（wrapUpInjected），避免每步刷屏；该消息
+  // 会写入会话历史（收尾指令作为对话痕迹可见，属软性收尾的合理表现）。
+  // 注意：agent/request 瀑布改 messages 无效（dsh-agent-loop buildRequest 只
+  // 消费 provider/model/effort 等配置字段，request.messages 由外部组装）——
+  // 消息层注入只能走 agent/pre-step 的 decision.messages（探针已实证可行）。
+  agent.ctx.on("agent/pre-step", async (_payload, next) => {
+    const decision = await next();
+    if (stepLimit > 0 && stepLimitHit && !wrapUpInjected && decision.kind === "enter") {
+      wrapUpInjected = true;
+      log("info", `step-limit pre-step injection (steps=${stepCount}, stepLimit=${stepLimit})`);
+      return {
+        ...decision,
+        messages: [
+          ...(decision.messages ?? []),
+          // 必须用 createUserMessage 构造（含 id/source 身份字段）——内核处理
+          // user/message 事件会读 message.source.kind，裸对象会崩溃
+          // （"Cannot read properties of undefined (reading 'kind')"）。
+          createUserMessage({
+            content: [{ type: "text", text: stepLimitWrapUpMessage(stepLimit, stepCount) }],
+            source: { kind: "user" },
+          }),
+        ],
+      };
+    }
+    return decision;
+  });
+
+  // 工具拦截（软性强制收尾的核心保障）：超限后（stepLimitHit），所有工具调用
+  // 在 tools/pre-execute 门禁处被拒绝——工具不执行，模型收到
+  // "Error: Tool calls are disabled — this turn reached its step limit (N/M)…"，
+  // 无法再执行任何工具，只能总结收尾。与硬终止（agent.cancel）不同：会话、
+  // 历史、后续对话完全不受影响，仅当前轮的工具执行被禁止——即使提示词被
+  // 模型忽视，工具拦截也保证收尾必然发生。scope 向上流动，主 agent 超限时
+  // 子代理的工具同样被禁（整轮收尾，符合预期）。
+  agent.ctx.on("tools/pre-execute", async (exec, next) => {
+    const gate = await next();
+    if (stepLimit > 0 && stepLimitHit && gate.kind === "allow") {
+      log("info", `step-limit tool gate denied: ${exec.name} (steps=${stepCount}, stepLimit=${stepLimit})`);
+      return {
+        kind: "deny",
+        reason: `Tool calls are disabled — this turn reached its step limit (${stepCount}/${stepLimit}). Stop working and deliver your final summary now.`,
+      };
+    }
+    return gate;
   });
 
   // 生命周期状态
@@ -331,9 +517,11 @@ function attachAgent(ctx, handle, pump) {
     if (getWorkMode() !== "multi") return assembled;
     return {
       ...assembled,
-      sections: [...(assembled.sections ?? []), MULTI_AGENT_SECTION],
+      sections: [...(assembled.sections ?? []), multiAgentSection(process.env)],
     };
   });
+
+  return { resetStepBudget };
 }
 
 /**
@@ -498,7 +686,7 @@ async function listSessions(ctx) {
  * 由宿主侧全量扫描一次：标题 / token 累计 / 上下文窗口）。
  */
 function computeSessionStats(events) {
-  const stats = { inputTokens: 0, cacheReadTokens: 0, outputTokens: 0 };
+  const stats = { inputTokens: 0, cacheReadTokens: 0, outputTokens: 0, steps: 0 };
   for (const e of events) {
     const d = e.data ?? {};
     if (e.type === "session/title" && typeof d.title === "string" && d.title) {
@@ -516,6 +704,8 @@ function computeSessionStats(events) {
         stats.contextWindow = d.contextWindow;
       }
       if (typeof d.model === "string" && d.model) stats.model = d.model;
+    } else if (e.type === "step/start") {
+      stats.steps = (stats.steps ?? 0) + 1;
     }
   }
   return stats;
@@ -736,6 +926,8 @@ async function main() {
   let agent;
   /** 当前 agent 的可变模型选择引用（installModelSelection 使用；setModel 热切换）。 */
   let selection = null;
+  /** 当前 agent 的"重置本轮思考步数预算"回调（chat 入口在每条用户消息前调用）。 */
+  let resetStepBudget = null;
   let shuttingDown = false;
 
   try {
@@ -809,6 +1001,19 @@ async function main() {
   process.on("SIGINT", () => void shutdown(0));
 
   const rl = createInterface({ input: process.stdin, crlfDelay: Infinity });
+
+  /**
+   * 帧处理串行队列（仅共享 agent 状态的帧排队）：
+   * resumeSession / chat / newSession / deleteSession / compact 会读写 handle/agent/
+   * resetStepBudget 等共享状态，若并发执行会产生错乱——典型场景：恢复历史会话期间
+   * 用户发送消息，chat 帧在 resume 完成前看到 agent === undefined，误判为"无 agent"
+   * 而**新建会话**（丢失"接着对话"语义）。这些帧按到达顺序串行处理。
+   * stop / approval:resolve / setModel 等帧即时执行、不排队：stop 必须能随时打断
+   * 正在运行的 chat（chat 帧 await whenIdle 时会阻塞队列，stop 不能等它）。
+   */
+  let criticalQueue = Promise.resolve();
+  const CRITICAL_FRAMES = new Set(["chat", "newSession", "resumeSession", "deleteSession", "compact"]);
+
   rl.on("line", (line) => {
     if (line.trim() === "") return;
     let msg;
@@ -818,9 +1023,19 @@ async function main() {
       log("warn", "unparseable frame", line.slice(0, 200));
       return;
     }
-    void (async () => {
-      try {
-        switch (msg.t) {
+    if (CRITICAL_FRAMES.has(msg.t)) {
+      // 串行执行；handleFrame 内部已捕获错误并补发失败帧，.catch 仅为防队列断裂
+      criticalQueue = criticalQueue.then(() => handleFrame(msg)).catch((error) => {
+        log("error", "critical frame chain failure", error instanceof Error ? error.message : String(error));
+      });
+    } else {
+      void handleFrame(msg);
+    }
+  });
+
+  async function handleFrame(msg) {
+    try {
+      switch (msg.t) {
           case "chat": {
             const text = typeof msg.text === "string" ? msg.text : "";
             if (text.trim() === "") {
@@ -833,7 +1048,11 @@ async function main() {
               handle = created.handle;
               agent = created.agent;
               selection = created.selection;
+              resetStepBudget = created.resetStepBudget;
             }
+            // 新一轮用户消息：重置本轮思考步数预算（maxSteps 是单轮上限，
+            // 不是会话累计上限——会话对话次数一直累加，不作为控制指标）。
+            resetStepBudget?.();
             // 首次创建后，向 UI 报告真实会话 id
             post({
               t: "ready",
@@ -876,6 +1095,7 @@ async function main() {
               await handle.dispose();
               handle = undefined;
               agent = undefined;
+              resetStepBudget = null;
             }
             // 惰性：新会话也等第一条消息才真正创建
             post({
@@ -914,6 +1134,7 @@ async function main() {
             handle = resumed.handle;
             agent = resumed.agent;
             selection = resumed.selection;
+            resetStepBudget = resumed.resetStepBudget;
             // 重放历史（分页）：首次只取最近 limit 条事件，避免大会话
             // （2.6MB / 数百条）全量传输拖慢恢复；向上滚动时按需补更早的。
             // 同时由宿主侧计算完整统计快照（分页下 host.ts 无法从部分事件累计）。
@@ -969,6 +1190,7 @@ async function main() {
               handle = undefined;
               agent = undefined;
               selection = null;
+              resetStepBudget = null;
               post({
                 t: "ready",
                 sessionId: "",
@@ -996,10 +1218,11 @@ async function main() {
               const base = defaultModel.currentSelection();
               const provider = typeof msg.provider === "string" && msg.provider !== "" ? msg.provider : base.provider;
               const model = typeof msg.model === "string" && msg.model !== "" ? msg.model : base.model;
+              // 思考等级：统一小写并规范化（low → high，见 normalizeEffort 注释）；
+              // 非法/空值回退到当前基线（基线同样规范化，历史遗留的大写/非法值一并修正）
+              const baseEffort = normalizeEffort(base.reasoningEffort);
               const reasoningEffort =
-                typeof msg.reasoningEffort === "string" && msg.reasoningEffort !== ""
-                  ? msg.reasoningEffort
-                  : base.reasoningEffort;
+                normalizeEffort(typeof msg.reasoningEffort === "string" ? msg.reasoningEffort : "") ?? baseEffort;
               const next = { provider, model, reasoningEffort };
               // 持久化默认选择（影响之后新建的 agent）
               await defaultModel.saveSelection(next);
@@ -1042,25 +1265,37 @@ async function main() {
                 }
               }
               if (models.length === 0) {
-                // 兜底：常见 DeepSeek 模型（也包含当前选择，保证下拉至少可选回当前模型）
+                // 兜底：现役 DeepSeek 模型（也包含当前选择，保证下拉至少可选回当前模型）。
+                // 备忘：deepseek-chat / deepseek-reasoner 已停止服务（旧模型下线），
+                // 不再列入候选；现役为 deepseek-v4-flash / deepseek-v4-pro。
                 const cur = defaultModel?.currentSelection?.();
-                const extra = new Set(["deepseek-chat", "deepseek-reasoner", "deepseek-v4-flash", "deepseek-v4-pro"]);
+                const extra = new Set(["deepseek-v4-flash", "deepseek-v4-pro"]);
                 if (cur?.model) extra.add(cur.model);
                 models = [...extra];
               }
               const current = defaultModel?.currentSelection?.() ?? { provider: "", model: "" };
-              // 查询当前模型支持的思考等级（如 deepseek-v4 系列支持 off/high/max；
-              // 未来模型若支持 low 会自动出现在列表里，UI 按此渲染下拉选项）
-              let supportedEfforts;
-              if (llm !== undefined && typeof llm.resolveModel === "function" && current.provider && current.model) {
+              // 查询当前模型支持的思考等级与默认档（内核真实能力）。
+              // 备忘：DeepSeek 适配器（dsh-llm-deepseek）只声明 off/high/max 三档，
+              // 无 low——low 由官方服务端映射为 high。插件向 UI 返回完整四档
+              // （off/low/high/max），low 在宿主 setModel 层归一为 high，保证可选不报错。
+              let supportedEfforts = ["off", "low", "high", "max"];
+              let defaultEffort = "high";
+              if (llm !== undefined && typeof llm.resolveModelInfo === "function" && current.provider && current.model) {
                 try {
-                  const resolved = await llm.resolveModel(current.provider, current.model, undefined);
+                  // 注意：llm 服务（LlmRuntime）的方法名是 resolveModelInfo（resolveModel 是
+                  // adapter 层方法，服务上不存在——早期误用导致内核能力从未被真正查询）。
+                  const resolved = await llm.resolveModelInfo(current.provider, current.model, undefined);
                   const efforts = resolved?.reasoning?.efforts;
                   if (Array.isArray(efforts)) {
-                    supportedEfforts = efforts.map((e) => (typeof e === "string" ? e : e?.id)).filter(Boolean);
+                    supportedEfforts = ["off", "low", "high", "max"]; // 插件语义层固定四档（见上）
+                    const kernelEfforts = efforts.map((e) => (typeof e === "string" ? e : e?.id)).filter(Boolean);
+                    log("info", `model ${current.provider}/${current.model} kernel reasoning efforts: ${kernelEfforts.join(", ")}`);
+                    if (typeof resolved?.reasoning?.defaultEffort === "string" && resolved.reasoning.defaultEffort !== "") {
+                      defaultEffort = normalizeEffort(resolved.reasoning.defaultEffort) ?? "high";
+                    }
                   }
-                } catch {
-                  supportedEfforts = undefined;
+                } catch (error) {
+                  log("warn", "resolveModelInfo failed, fallback to 4-level effort list", error instanceof Error ? error.message : String(error));
                 }
               }
               post({
@@ -1070,8 +1305,9 @@ async function main() {
                 current: {
                   provider: current.provider,
                   model: current.model,
-                  reasoningEffort: current.reasoningEffort,
+                  reasoningEffort: normalizeEffort(current.reasoningEffort),
                   supportedEfforts,
+                  defaultEffort,
                 },
               });
             } catch (error) {
@@ -1107,6 +1343,21 @@ async function main() {
                   ok: true,
                   text: `Compacted ${result.shadowedSeqs.length} history items (~${result.shadowedTokenCount} tokens).`,
                 });
+                // 压缩完成：立即推送刷新后的统计（上下文占用应显著下降）。
+                // lastRequestInput 是最近一次请求输入（含缓存），减去被遮蔽的
+                // token 数即近似当前上下文占用；下一次真实请求会给出精确值。
+                try {
+                  const allEvents = agent.session.events.filter(
+                    (e) => e.type !== "assistant/chunk" && e.type !== "session/end-seed"
+                  );
+                  const stats = computeSessionStats(allEvents);
+                  if (Number.isFinite(stats.lastRequestInput) && stats.lastRequestInput > 0 && result.shadowedTokenCount > 0) {
+                    stats.lastRequestInput = Math.max(0, stats.lastRequestInput - result.shadowedTokenCount);
+                  }
+                  post({ t: "stats", stats });
+                } catch (error) {
+                  log("warn", "compact stats refresh failed", error instanceof Error ? error.message : String(error));
+                }
               }
             } catch (error) {
               log("warn", "compact failed", error instanceof Error ? error.message : String(error));
@@ -1131,8 +1382,7 @@ async function main() {
           post({ t: "chatDone", id: msg.id, ok: false, error: message });
         }
       }
-    })();
-  });
+  }
 
   rl.on("close", () => void shutdown(0));
 }

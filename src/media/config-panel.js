@@ -11,7 +11,8 @@
   const vscode = acquireVsCodeApi();
   const $ = (id) => document.getElementById(id);
 
-  const zh = window.__DSH_CONFIG_LOCALE__ === "zh";
+  // 语言由服务端渲染时写入 <body data-locale>（CSP 禁止内联脚本，不能用行内变量）
+  const zh = document.body.dataset.locale === "zh";
   const L = {
     title: zh ? "DSH 配置" : "DSH Settings",
     apiKey: zh ? "API Key（DeepSeek）" : "API Key (DeepSeek)",
@@ -33,6 +34,9 @@
     workspace: zh ? "默认工作目录（未打开文件夹时）" : "Default working directory (when no folder is open)",
     workspaceHint: zh ? "Agent 生成的文件保存位置；留空使用 ~/ay-dsh-workspace" : "Where agent files are saved; empty uses ~/ay-dsh-workspace",
     maxOutput: zh ? "最大输出字符数（UI 渲染折叠阈值）" : "Max output chars (UI render fold threshold)",
+    maxSteps: zh ? "最大思考轮次（0 = 不限制）" : "Max thinking steps (0 = unlimited)",
+    subagentDepth: zh ? "子代理递归深度上限" : "Subagent recursion depth limit",
+    maxParallel: zh ? "并行子代理数量上限" : "Max parallel subagents",
     cwd: zh ? "当前工作目录" : "Current working directory",
     save: zh ? "保存并应用" : "Save & Apply",
     cancel: zh ? "取消" : "Cancel",
@@ -53,6 +57,9 @@
     nodePath: $("cfgNodePath"),
     defaultWorkspace: $("cfgDefaultWorkspace"),
     maxOutputChars: $("cfgMaxOutputChars"),
+    maxSteps: $("cfgMaxSteps"),
+    subagentMaxDepth: $("cfgSubagentDepth"),
+    maxParallelSubagents: $("cfgMaxParallel"),
   };
   const statusEl = $("cfgStatus");
   const saveBtn = $("cfgSave");
@@ -128,6 +135,9 @@
         nodePath: fields.nodePath.value.trim(),
         defaultWorkspace: fields.defaultWorkspace.value.trim(),
         maxOutputChars: parseInt(fields.maxOutputChars.value, 10) || 40000,
+        maxSteps: parseInt(fields.maxSteps.value, 10) || 0,
+        subagentMaxDepth: parseInt(fields.subagentMaxDepth.value, 10) || 3,
+        maxParallelSubagents: parseInt(fields.maxParallelSubagents.value, 10) || 5,
       },
     });
   });
@@ -156,6 +166,9 @@
     fields.nodePath.value = c.nodePath || "";
     fields.defaultWorkspace.value = c.defaultWorkspace || "";
     fields.maxOutputChars.value = String(c.maxOutputChars || 40000);
+    fields.maxSteps.value = String(c.maxSteps ?? 100);
+    fields.subagentMaxDepth.value = String(c.subagentMaxDepth ?? 3);
+    fields.maxParallelSubagents.value = String(c.maxParallelSubagents ?? 5);
     cwdEl.value = c.cwd || "";
     saveBtn.disabled = false;
   }
@@ -175,9 +188,11 @@
         break;
       case "saved":
         saveBtn.disabled = false;
+        // 保存结果提示由扩展显示在 VS Code 状态栏（setStatusBarMessage，见
+        // configPanel.ts）；面板内仅显示表单状态文字，**不自动关闭**——
+        // 由用户自行点击"取消"或关闭面板（保存成功后也可继续调整再保存）。
         if (msg.ok) {
           setStatus(L.saved, false);
-          setTimeout(() => vscode.postMessage({ t: "cancel" }), 1200); // 保存成功后自动关闭
         } else {
           setStatus(L.saveFailed + (msg.message || "unknown error"), true);
         }

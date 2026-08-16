@@ -13,7 +13,6 @@
   const btnAllow = $("btnAllow");
   const btnDeny = $("btnDeny");
   const btnSend = $("btnSend");
-  const btnStop = $("btnStop");
   const btnNew = $("btnNew");
   const hintEl = $("hint");
   const btnExportFull = $("btnExportFull");
@@ -22,6 +21,7 @@
   const costStatsEl = $("costStats");
   const contextPctEl = $("contextPct");
   const tokensInEl = $("tokensIn");
+  const stepsEl = $("steps");
   const tokensCacheEl = $("tokensCache");
   const tokensOutEl = $("tokensOut");
   const btnCompact = $("btnCompact");
@@ -30,16 +30,25 @@
   const selEffort = $("selEffort");
   const selWorkMode = $("selWorkMode");
 
-  // DeepSeek 官方价格（USD / 1M tokens；仅对已知模型计价，未知模型显示"—"）
+  // DeepSeek 官方人民币定价（CNY / 1M tokens；仅对已知模型计价，未知模型显示"—"）。
+  // 货币符号（¥）与计价单位（人民币）保持一致，与官方 API 实际计费单位相同。
+  // 现役模型为 deepseek-v4-flash / deepseek-v4-pro，按官方公布的人民币基准价估算
+  // （与 deepseek-chat / deepseek-reasoner 同档：约等于旧版 USD 0.27/0.07/1.1 与
+  // 0.55/0.14/2.19 按官方汇率换算）；官方自 2026-08-17 起实行高峰/闲时分时计价，
+  // 此处为基准价，仅供参考。deepseek-chat / deepseek-reasoner 已停止服务（旧模型
+  // 下线），下方价格仅作旧会话历史统计的参考，不再用于新会话。
   const PRICES = {
-    "deepseek-chat": { input: 0.27, cache: 0.07, output: 1.1 },
-    "deepseek-reasoner": { input: 0.55, cache: 0.14, output: 2.19 },
-    "deepseek-v4-flash": { input: 0.27, cache: 0.07, output: 1.1 },
-    "deepseek-v4-pro": { input: 0.55, cache: 0.14, output: 2.19 },
+    "deepseek-chat": { input: 2, cache: 0.5, output: 8 }, // 已停服，历史参考
+    "deepseek-reasoner": { input: 4, cache: 1, output: 16 }, // 已停服，历史参考
+    "deepseek-v4-flash": { input: 2, cache: 0.5, output: 8 }, // 现役模型，基准价估算
+    "deepseek-v4-pro": { input: 4, cache: 1, output: 16 }, // 现役模型，基准价估算
   };
 
   const state = {
     running: false,
+    compacting: false, // 上下文压缩进行中（发送按钮禁用，防止与压缩冲突）
+    resuming: false, // 正在恢复历史会话（history 帧渲染完成前锁定发送，防止用户消息被清空）
+    discardPending: false, // 停止后：丢弃随后到达的本轮收尾消息（未接收完的输出不再渲染）
     approvals: new Map(), // id -> {toolName, reason}
     currentAssistant: null, // 当前正在流式输出的助手消息元素
     currentReasoning: null,
@@ -52,6 +61,12 @@
     historyLoadingMore: false, // 正在加载更早历史（防重入）
     streamText: "", // 当前流式气泡的累积纯文本（供节流 markdown 渲染使用）
   };
+
+  // 代码块复制：codeId -> 代码文本（渲染时登记，点击复制按钮时读取）
+  const codeTexts = new Map();
+  let codeSeq = 0;
+  /** 会话恢复兜底定时器（history 帧 15 秒未到达则自动解除发送锁定）。 */
+  let resumeTimer = null;
 
   /* ---------------- 国际化（跟随 VS Code 语言） ---------------- */
 
@@ -70,6 +85,7 @@
       resume: "▶ 继续",
       resumeTitle: "重新加载此会话并继续对话",
       restoring: "正在恢复会话…",
+      restartingHint: "正在恢复原会话…",
       del: "🗑 删除",
       delTitle: "删除此会话（不可恢复）",
       confirmDel: "确认删除？",
@@ -83,7 +99,8 @@
       starting: "宿主启动中…",
       welcomeEmpty: "◈ DSH Agent\n\n给 Agent 下达任务：描述目标、贴代码、提问都可以。\nAgent 会读文件、写代码、跑命令，并实时展示每一步。",
       ready: "就绪",
-      exited: "宿主已退出",      unknownState: "未知状态",
+      exited: "宿主已退出",
+      unknownState: "未知状态",
       session: (id) => `会话: ${id}…`,
       newSessionHint: "新会话（发送第一条消息后创建）",
       loadFailed: (e) => `加载失败：${e}`,
@@ -96,12 +113,20 @@
       compacting: "正在压缩上下文…",
       compacted: (t) => `✓ 已压缩：${t}`,
       compactFailed: (e) => `压缩失败：${e}`,
+      compactTimeout: "压缩超时（宿主无响应），已恢复输入，请稍后重试",
+      compactBusyTitle: "Agent 运行中，完成当前任务后才能压缩上下文",
       costTitle: (m) => `估算费用（${m || "—"}，仅供参考）`,
       ctxTitle: (used, win) => `上下文占用 ${used} / ${win} tokens`,
       tokensInTitle: "累计输入 tokens（缓存未命中）",
+      stepsTitle: "本会话累计AI调用次数（会话删除前始终累计）",
+      copyTitle: "复制代码到剪贴板",
+      copyLabel: "复制",
       tokensCacheTitle: "累计缓存读取 tokens",
       tokensOutTitle: "累计输出 tokens",
       modelSwitchFailed: "模型切换失败：",
+      send: "发送",
+      stop: "停止",
+      stopTitle: "停止当前对话（丢弃未完成的内容，不新建会话）",
     },
     en: {
       thinking: "Thinking",
@@ -117,6 +142,7 @@
       resume: "▶ Resume",
       resumeTitle: "Reload this session and continue the conversation",
       restoring: "Restoring session…",
+      restartingHint: "Restoring the previous session…",
       del: "🗑 Delete",
       delTitle: "Delete this session (cannot be undone)",
       confirmDel: "Confirm delete?",
@@ -144,12 +170,20 @@
       compacting: "Compacting context…",
       compacted: (t) => `✓ Compacted: ${t}`,
       compactFailed: (e) => `Compaction failed: ${e}`,
+      compactTimeout: "Compaction timed out (host unresponsive); input restored — retry shortly",
+      compactBusyTitle: "Agent is busy; compaction is available after the current task finishes",
       costTitle: (m) => `Estimated cost (${m || "—"}, approximate)`,
       ctxTitle: (used, win) => `Context usage ${used} / ${win} tokens`,
       tokensInTitle: "Total input tokens (cache miss)",
+      stepsTitle: "Total AI calls in this session (accumulates until the session is deleted)",
+      copyTitle: "Copy code to clipboard",
+      copyLabel: "Copy",
       tokensCacheTitle: "Total cache-read tokens",
       tokensOutTitle: "Total output tokens",
       modelSwitchFailed: "Model switch failed: ",
+      send: "Send",
+      stop: "Stop",
+      stopTitle: "Stop the current conversation (discards unfinished output, keeps the session)",
     },
   };
 
@@ -157,6 +191,20 @@
   function t(key, ...args) {
     const fn = L[key];
     return typeof fn === "function" ? fn(...args) : (fn ?? key);
+  }
+
+  /**
+   * 设置提示信息（唯一入口）：composer 行的 ⓘ 图标（hover 显示完整信息）
+   * + 同步到 VS Code 状态栏（面板行太窄，完整信息放状态栏）。
+   * 传空字符串/undefined 时隐藏两处。
+   */
+  function setHint(text) {
+    const value = text || "";
+    hintEl.classList.toggle("hidden", !value);
+    // 极简内联显示：ⓘ + 文本（超长自动省略号截断，hover 看完整信息）
+    hintEl.textContent = value ? `ⓘ ${value}` : "";
+    hintEl.title = value;
+    vscode.postMessage({ t: "hint", text: value });
   }
 
   /* ---------------- 工具函数 ---------------- */
@@ -232,10 +280,11 @@
     return String(Math.round(n));
   }
 
-  function fmtCost(usd) {
-    if (!Number.isFinite(usd) || usd <= 0) return "$0.00";
-    if (usd < 0.01) return "<$0.01";
-    return "$" + usd.toFixed(2);
+  /** 人民币金额格式化（符号 ¥ 与计费单位 CNY 一致）。 */
+  function fmtCost(cny) {
+    if (!Number.isFinite(cny) || cny <= 0) return "¥0.00";
+    if (cny < 0.01) return "<¥0.01";
+    return "¥" + cny.toFixed(2);
   }
 
   /**
@@ -265,18 +314,25 @@
       sessionTitleEl.title = "";
     }
 
-    // 估算费用：仅当模型价格已知时才计算；未知模型显示"—"（不给错误数值）
-    const price = priceFor(stats.model);
+    // 估算费用：仅当模型价格已知时才计算；未知模型显示"—"（不给错误数值）。
+    // 模型名优先取会话统计（含历史恢复快照）；旧会话快照缺 model 时回退到
+    // 当前选择（下拉 / modelInfo），保证恢复历史后金额仍能按当前模型估算。
+    const priceModel =
+      stats.model ||
+      state.modelInfo?.current?.model ||
+      selModel.value ||
+      "";
+    const price = priceFor(priceModel);
     if (price) {
       const cost =
         (stats.inputTokens / 1e6) * price.input +
         (stats.cacheReadTokens / 1e6) * price.cache +
         (stats.outputTokens / 1e6) * price.output;
       costStatsEl.textContent = fmtCost(cost);
-      costStatsEl.title = t("costTitle", stats.model || "");
+      costStatsEl.title = t("costTitle", priceModel || "");
     } else {
       costStatsEl.textContent = "—";
-      costStatsEl.title = stats.model ? `价格未知（${stats.model}）` : "价格未知";
+      costStatsEl.title = priceModel ? `价格未知（${priceModel}）` : "价格未知";
     }
 
     // 上下文占比：最近一次请求输入（含缓存读取）占上下文窗口的百分比
@@ -292,8 +348,11 @@
     }
 
     // token 用量（与费用/上下文同一行）：有统计才显示
-    const hasTokens = stats.inputTokens > 0 || stats.cacheReadTokens > 0 || stats.outputTokens > 0;
+    const hasTokens = stats.inputTokens > 0 || stats.cacheReadTokens > 0 || stats.outputTokens > 0 || (stats.steps ?? 0) > 0;
     topbarEl.classList.toggle("has-tokens", hasTokens);
+    // API 调用次数（step，对应 dsh web）：显示在输入 token 前面
+    stepsEl.textContent = `🔄 ${fmtNum(stats.steps ?? 0)}`;
+    stepsEl.title = t("stepsTitle");
     tokensInEl.textContent = `↗ ${fmtNum(stats.inputTokens)}`;
     tokensInEl.title = t("tokensInTitle");
     // 缓存命中率 = 缓存读取 / (未命中输入 + 缓存读取)，括号内百分比显示
@@ -310,7 +369,7 @@
     tokensOutEl.title = t("tokensOutTitle");
   }
 
-  /** 思考等级选项（固定顺序：off → low → high → max）。 */
+  /** 思考等级选项（固定顺序：off → low → high → max；值一律小写，与内核一致）。 */
   const EFFORT_OPTIONS = ["off", "low", "high", "max"];
 
   /** 填充模型/提供者下拉并同步当前选择（来自 host 的 modelInfo 帧）。 */
@@ -327,9 +386,10 @@
       selProvider.appendChild(opt);
     }
     selProvider.value = info.current.provider || providers[0].id;
-    // model 下拉
+    // model 下拉（备忘：现役模型为 deepseek-v4-flash / deepseek-v4-pro；
+    // deepseek-chat / deepseek-reasoner 已停止服务，不再作为兜底候选）
     selModel.innerHTML = "";
-    const models = info.models.length > 0 ? info.models : [info.current.model || "deepseek-chat"];
+    const models = info.models.length > 0 ? info.models : [info.current.model || "deepseek-v4-flash"];
     for (const m of models) {
       const opt = el("option", "", m);
       opt.value = m;
@@ -341,20 +401,24 @@
       selModel.appendChild(opt);
     }
     selModel.value = info.current.model || "";
-    // 思考等级：按 off/low/high/max 固定顺序渲染 4 档；
-    // 模型不支持的档位禁用并标注（能力来自 host 的 resolveModel，真实反映模型能力）
+    // 思考等级：按 off/low/high/max 固定顺序渲染 4 档，值/显示均小写。
+    // host 返回的 supportedEfforts 为插件语义层四档（low 由宿主映射为 high，
+    // 不会触发内核 UNSUPPORTED 报错），故四档均可选。
     const supported = info.current.supportedEfforts;
     selEffort.innerHTML = "";
     for (const effort of EFFORT_OPTIONS) {
-      const opt = el("option", "", effort.toUpperCase());
+      const opt = el("option", "", effort);
       opt.value = effort;
       if (supported && !supported.includes(effort)) {
         opt.disabled = true;
-        opt.textContent = `${effort.toUpperCase()}（不支持）`;
+        opt.textContent = `${effort}（不支持）`;
       }
       selEffort.appendChild(opt);
     }
-    if (info.current.reasoningEffort) selEffort.value = info.current.reasoningEffort;
+    // 默认值优先级：当前已选 effort > 内核/提供商默认（如 DeepSeek 的 high）> high。
+    // 修复：下拉重建后不能停留在首个选项（off=关闭思考），否则"思考级别像没起作用"。
+    const effort = info.current.reasoningEffort || info.current.defaultEffort || "high";
+    selEffort.value = effort;
     if (!selEffort.value || selEffort.selectedIndex < 0) {
       selEffort.value = supported && supported.includes("high") ? "high" : (supported?.[0] ?? "high");
     }
@@ -403,7 +467,7 @@
     state.suppressSelectorEvents = false;
   }
 
-  /** 轻量 Markdown 渲染：代码块 / 行内代码 / 标题 / 粗体 / 列表 / 引用 / 空行。 */
+  /** 轻量 Markdown 渲染：代码块（独立引用区+复制按钮）/ 行内代码 / 标题 / 粗体 / 列表 / 引用 / 表格 / 空行。 */
   function renderMarkdown(src) {
     if (!src) return "";
     const lines = src.replace(/\r\n/g, "\n").split("\n");
@@ -423,15 +487,27 @@
       }
     };
 
+    /** 把代码块渲染为"独立引用区 + 语言标签 + 复制按钮"（需求：可一键复制执行）。 */
+    const emitCodeBlock = () => {
+      const lang = codeLang || "text";
+      const codeId = `code-${codeSeq++}`;
+      codeTexts.set(codeId, codeBuf.join("\n"));
+      out.push(
+        `<div class="codeblock">` +
+          `<div class="codeblock-head"><span class="codeblock-lang">${escapeHtml(lang)}</span>` +
+          `<button class="codeblock-copy" data-code="${codeId}" title="${t("copyTitle")}">⧉ ${t("copyLabel")}</button></div>` +
+          `<pre><code class="lang-${escapeHtml(lang)}">${escapeHtml(codeBuf.join("\n"))}</code></pre>` +
+          `</div>`
+      );
+      codeBuf = [];
+    };
+
     while (i < lines.length) {
       const line = lines[i];
       const codeMatch = /^```(\w*)\s*$/.exec(line);
       if (codeMatch) {
         if (inCode) {
-          out.push(
-            `<pre><code class="lang-${escapeHtml(codeLang || "text")}">${escapeHtml(codeBuf.join("\n"))}</code></pre>`
-          );
-          codeBuf = [];
+          emitCodeBlock();
           inCode = false;
         } else {
           flushListStack();
@@ -451,6 +527,23 @@
         flushListStack();
         flushQuote();
         i++;
+        continue;
+      }
+      // 表格：`| a | b |` 表头 + `|---|---|` 分隔行（支持 :--- 对齐）+ 数据行
+      if (/^\s*\|.*\|\s*$/.test(line)) {
+        flushListStack();
+        flushQuote();
+        const rows = [];
+        while (i < lines.length && /^\s*\|.*\|\s*$/.test(lines[i])) {
+          rows.push(lines[i].trim());
+          i++;
+        }
+        if (rows.length >= 2 && /^\|[\s:|-]+\|$/.test(rows[1])) {
+          out.push(renderTable(rows));
+        } else {
+          // 非表格（孤立管道行）：按普通段落回退
+          for (const r of rows) out.push(`<p>${inlineMd(r)}</p>`);
+        }
         continue;
       }
       // 列表：无序 `- ` / `* `，有序 `1. ` / `1) `；按缩进嵌套
@@ -504,9 +597,34 @@
     flushListStack();
     flushQuote();
     if (inCode) {
-      out.push(`<pre><code class="lang-${escapeHtml(codeLang || "text")}">${escapeHtml(codeBuf.join("\n"))}</code></pre>`);
+      emitCodeBlock();
     }
     return out.join("\n");
+
+    /** 渲染 markdown 表格（对齐按分隔行的冒号位置：`:---` 左、`---:` 右、`:---:` 中）。 */
+    function renderTable(rows) {
+      const parseRow = (r) => r.replace(/^\||\|$/g, "").split("|").map((c) => c.trim());
+      const alignOf = (cell) => {
+        const c = cell.replace(/\s/g, "");
+        if (c.startsWith(":") && c.endsWith(":")) return "center";
+        if (c.endsWith(":")) return "right";
+        if (c.startsWith(":")) return "left";
+        return "";
+      };
+      const headers = parseRow(rows[0]);
+      const aligns = parseRow(rows[1]).map(alignOf);
+      let html = `<div class="md-table-wrap"><table>`;
+      html += `<thead><tr>${headers.map((h, idx) => `<th${aligns[idx] ? ` style="text-align:${aligns[idx]}"` : ""}>${inlineMd(h)}</th>`).join("")}</tr></thead>`;
+      if (rows.length > 2) {
+        html += `<tbody>`;
+        for (const r of rows.slice(2)) {
+          html += `<tr>${parseRow(r).map((c, idx) => `<td${aligns[idx] ? ` style="text-align:${aligns[idx]}"` : ""}>${inlineMd(c)}</td>`).join("")}</tr>`;
+        }
+        html += `</tbody>`;
+      }
+      html += `</table></div>`;
+      return html;
+    }
 
     function flushListStack() {
       while (listStack.length > 0) {
@@ -791,11 +909,29 @@
 
   /* ---------------- 状态 ---------------- */
 
+  /** 压缩按钮的常规标题（运行中/压缩中会临时替换）。 */
+  const compactTitleText = btnCompact.title;
+
+  /**
+   * 发送/停止/压缩按钮状态。发送与停止共用同一按钮（互斥两面）：
+   *  - 运行中 → 变红色"停止"（可用，点击立即中断当前对话）；
+   *  - 空闲 → 蓝色"发送"；
+   *  - 压缩中/恢复历史中 → 禁用（发送会与压缩/历史重放冲突）。
+   */
+  function updateButtons() {
+    const running = state.running;
+    const locked = state.compacting || state.resuming;
+    btnSend.classList.toggle("stop", running);
+    btnSend.textContent = running ? t("stop") : t("send");
+    btnSend.title = running ? t("stopTitle") : "";
+    btnSend.disabled = locked; // 运行中不禁用：按钮要能随时点击"停止"
+    btnCompact.disabled = running || locked;
+    btnCompact.title = running ? t("compactBusyTitle") : compactTitleText;
+  }
+
   function setStatus(status) {
     state.running = status === "running";
-    // 工作状态由发送/停止按钮体现（running 时发送禁用、停止可见），无需状态圆点
-    btnStop.classList.toggle("hidden", !state.running);
-    btnSend.disabled = state.running;
+    updateButtons();
   }
 
   /* ---------------- 消息入口 ---------------- */
@@ -838,11 +974,25 @@
         messagesEl.innerHTML = "";
         state.currentAssistant = null;
         state.streamText = "";
+        state.discardPending = false;
         state.historyMore = null;
         state.historyLoadingMore = false;
+        // 恢复期间锁定发送：history 帧到达（渲染完成）前，若用户发送消息，
+        // 本地渲染的用户消息会被 history 帧的 messagesEl.innerHTML = "" 清空，
+        // 造成"用户消息消失、应答在前"的错乱。锁定后等历史渲染完成再解锁。
+        state.resuming = true;
+        updateButtons();
+        // 兜底：宿主异常（history 帧迟迟不到）时 15 秒后自动解锁，防止发送被永久禁用
+        clearTimeout(resumeTimer);
+        resumeTimer = setTimeout(() => {
+          if (state.resuming) {
+            state.resuming = false;
+            updateButtons();
+          }
+        }, 15000);
         vscode.postMessage({ t: "resumeSession", id: s.id });
         historyPanel.classList.add("hidden");
-        hintEl.textContent = t("restoring");
+        setHint(t("restoring"));
         updateEmptyState();
       });
       const btnDelete = el("button", "hbtn delete", t("del"));
@@ -907,9 +1057,7 @@
   function renderConfig(msg) {
     // 模型已由底部下拉展示（modelInfo 帧同步），无需在顶部重复显示
     // 工作目录不再在 hint 区显示（顶部已有"打开工作目录"图标按钮）
-    hintEl.textContent = "";
-    hintEl.title = "";
-    hintEl.style.cursor = "";
+    setHint("");
     // API Key 未配置时显示引导条
     if (!msg.keyConfigured) {
       configBanner.classList.remove("hidden");
@@ -933,9 +1081,16 @@
         addUserMessage(e.text);
         break;
       case "assistant-delta":
+        // 停止后的残留增量一律丢弃（未接收完的输出不再渲染）
+        if (state.discardPending) break;
         appendAssistantDelta(e.text, e.reasoning);
         break;
       case "assistant":
+        // 停止后内核回发的收尾消息：丢弃（消费标志），不重建气泡
+        if (state.discardPending) {
+          state.discardPending = false;
+          break;
+        }
         finalizeAssistant(e.text, e.reasoning, foldReasoning);
         break;
       case "error":
@@ -950,10 +1105,12 @@
         resolveToolCard(e.callId, e.ok, e.text);
         break;
       case "turn":
-        // 新一轮开始：冲刷上一轮未决的流式渲染，重置累积文本，防止串轮
+        // 新一轮开始：冲刷上一轮未决的流式渲染，重置累积文本，防止串轮；
+        // 同时清除"停止后丢弃"标志——新一轮（用户重新发送）正常渲染。
         if (e.status === "start") {
           flushStreamRender();
           state.streamText = "";
+          state.discardPending = false;
         }
         break;
     }
@@ -973,6 +1130,7 @@
           flushStreamRender();
           state.currentAssistant = null;
           state.streamText = "";
+          state.discardPending = false;
           state.historyMore = null;
           state.historyLoadingMore = false;
           messagesEl.innerHTML = "";
@@ -992,11 +1150,13 @@
           ? state.stats?.title || msg.sessionTitle || t("session", msg.sessionId.slice(0, 12))
           : t("newSessionTitle");
         sessionTitleEl.title = sessionTitleEl.textContent;
-        hintEl.textContent = msg.sessionId
-          ? t("session", msg.sessionId.slice(0, 12))
-          : msg.ready
-            ? t("newSessionHint")
-            : "";
+        setHint(
+          msg.sessionId
+            ? t("session", msg.sessionId.slice(0, 12))
+            : msg.ready
+              ? t("newSessionHint")
+              : ""
+        );
         // 空态始终欢迎语（由 updateEmptyState 维护），不做启动过渡提示
         updateEmptyState();
         break;
@@ -1011,22 +1171,18 @@
         renderModelChanged(msg);
         break;
       case "workModeChanged":
+        // 仅同步选择器状态，不再显示模式注释（保持界面简洁）
         state.suppressSelectorEvents = true;
         selWorkMode.value = msg.mode;
         state.suppressSelectorEvents = false;
-        hintEl.textContent =
-          msg.mode === "multi"
-            ? "🧩 多 Agent 并发：任务将拆解为并行子代理执行"
-            : state.sessionId
-              ? t("session", state.sessionId.slice(0, 12))
-              : t("newSessionHint");
         break;
       case "compactDone": {
-        btnCompact.disabled = false;
+        endCompacting();
         if (msg.ok) {
-          hintEl.textContent = t("compacted", msg.text ?? "");
-          hintEl.style.color = "";
+          // 压缩完成：宿主已推送刷新后的 stats（上下文占用 % 随之更新）
+          setHint(t("compacted", msg.text ?? ""));
         } else {
+          setHint("");
           addErrorMessage(t("compactFailed", msg.error ?? "unknown error"));
         }
         break;
@@ -1037,6 +1193,23 @@
       case "hostState":
         renderHostState(msg.state);
         break;
+      case "restarting": {
+        // 宿主即将重启并自动恢复原会话（配置变更 / VS Code Reload 场景）：
+        // 锁定发送直到恢复完成（history 帧渲染后解锁）——防止"恢复期间发送的
+        // 消息被 history 重放清空、且宿主误判无 agent 而新建会话"。
+        state.resuming = true;
+        updateButtons();
+        setHint(t("restartingHint"));
+        // 兜底：宿主迟迟未就绪/恢复失败时 15 秒后自动解锁，防止发送被永久禁用
+        clearTimeout(resumeTimer);
+        resumeTimer = setTimeout(() => {
+          if (state.resuming) {
+            state.resuming = false;
+            updateButtons();
+          }
+        }, 15000);
+        break;
+      }
       case "event": {
         handleViewEvent(msg.e);
         break;
@@ -1057,11 +1230,17 @@
         messagesEl.innerHTML = "";
         state.currentAssistant = null;
         state.streamText = "";
+        state.discardPending = false; // 历史重放不继承"停止丢弃"状态
         state.historyMore = msg.hasMore ? { hasMore: true, nextSeq: msg.nextSeq } : null;
         state.historyLoadingMore = false;
         for (const e of msg.events) handleViewEvent(e, { foldReasoning: true });
         updateEmptyState();
-        hintEl.textContent = t("resumed", msg.sessionId.slice(0, 12));
+        setHint(t("resumed", msg.sessionId.slice(0, 12)));
+        // 历史渲染完成：解除恢复期间的发送锁定，此后用户消息在 AI 应答之前
+        // 进入消息列表（消息渲染全部按 append 顺序，不会再被 history 清空）。
+        state.resuming = false;
+        clearTimeout(resumeTimer);
+        updateButtons();
         scrollToBottom();
         break;
       }
@@ -1138,9 +1317,13 @@
 
   function send() {
     const text = inputEl.value.trim();
-    if (!text || state.running) return;
+    // resuming：会话历史恢复中，消息区即将被 history 帧重建，此时发送会
+    // 造成"用户消息被清空/应答在前"的错乱——锁定直到历史渲染完成。
+    if (!text || state.running || state.compacting || state.resuming) return;
     inputEl.value = "";
     autoResize();
+    // 用户消息**先**同步渲染进消息列表（append），再通知扩展转发给宿主；
+    // 之后 AI 应答事件按到达顺序追加在用户消息之后，顺序不会错乱。
     addUserMessage(text);
     vscode.postMessage({ t: "chat", text });
   }
@@ -1177,9 +1360,70 @@
       send();
     }
   });
-  btnSend.addEventListener("click", send);
-  btnStop.addEventListener("click", () => vscode.postMessage({ t: "stop" }));
-  btnNew.addEventListener("click", () => vscode.postMessage({ t: "newSession" }));
+  // 发送/停止共用同一按钮（互斥两面）：运行中点击 = 停止（立即中断、丢弃未完成
+  // 输出、不新建会话），空闲点击 = 发送。
+  btnSend.addEventListener("click", () => {
+    if (state.running) {
+      // 停止当前对话：立即丢弃未接收完的助手气泡，并丢弃随后到达的本轮收尾消息
+      // （cancel 后内核可能仍回发一条 assistant/message 收尾帧，不应再渲染）
+      flushStreamRender();
+      if (state.currentAssistant) {
+        state.currentAssistant.wrap.remove();
+        state.currentAssistant = null;
+        state.streamText = "";
+      }
+      state.discardPending = true;
+      vscode.postMessage({ t: "stop" });
+    } else {
+      send();
+    }
+  });
+  btnNew.addEventListener("click", () => {
+    // 用户显式开新会话：解除"自动恢复原会话"的锁定
+    state.resuming = false;
+    updateButtons();
+    vscode.postMessage({ t: "newSession" });
+  });
+
+  // 代码块复制按钮（事件委托）：点击复制对应代码文本到剪贴板
+  messagesEl.addEventListener("click", (ev) => {
+    const btn = ev.target.closest(".codeblock-copy");
+    if (!btn) return;
+    const text = codeTexts.get(btn.getAttribute("data-code"));
+    if (text === undefined) return;
+    const done = () => {
+      const old = btn.textContent;
+      btn.textContent = "✓ 已复制";
+      setTimeout(() => (btn.textContent = old), 1500);
+    };
+    const fail = () => {
+      btn.textContent = "✗";
+      setTimeout(() => (btn.textContent = t("copyLabel")), 1500);
+    };
+    // 优先 Clipboard API；webview 受限时回退 textarea + execCommand
+    if (navigator.clipboard?.writeText) {
+      navigator.clipboard.writeText(text).then(done, () => fallbackCopy(text) ? done() : fail());
+    } else {
+      fallbackCopy(text) ? done() : fail();
+    }
+  });
+
+  /** 剪贴板回退方案（webview 内可靠）。 */
+  function fallbackCopy(text) {
+    try {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      const ok = document.execCommand("copy");
+      ta.remove();
+      return ok;
+    } catch {
+      return false;
+    }
+  }
   $("btnConfig").addEventListener("click", () => vscode.postMessage({ t: "configure" }));
   $("btnWorkspace").addEventListener("click", () => vscode.postMessage({ t: "openWorkspace" }));
   $("btnHistory").addEventListener("click", openHistory);
@@ -1235,15 +1479,35 @@
     vscode.postMessage({ t: "setWorkMode", mode: selWorkMode.value === "multi" ? "multi" : "single" });
   });
 
+  /* 压缩（/compact）：进行中禁用发送按钮（防止与压缩冲突），完成后刷新上下文占用。 */
+  let compactWatchdog = null;
+
+  /** 结束压缩状态：恢复按钮，清理兜底定时器（幂等）。 */
+  function endCompacting() {
+    clearTimeout(compactWatchdog);
+    if (!state.compacting) return;
+    state.compacting = false;
+    updateButtons();
+  }
+
   btnCompact.addEventListener("click", () => {
+    if (state.compacting || state.running) return;
     if (!state.sessionId) {
       addErrorMessage(t("noContent"));
       return;
     }
-    btnCompact.disabled = true;
-    hintEl.textContent = t("compacting");
-    hintEl.style.color = "";
+    state.compacting = true;
+    updateButtons();
+    setHint(t("compacting"));
     vscode.postMessage({ t: "compact" });
+    // 兜底：压缩长时间无响应时恢复输入，防止发送按钮被永久禁用
+    clearTimeout(compactWatchdog);
+    compactWatchdog = setTimeout(() => {
+      if (!state.compacting) return;
+      endCompacting();
+      setHint("");
+      addErrorMessage(t("compactTimeout"));
+    }, 60000);
   });
   updateExportButton();
   // 初始空态：bootstrap 到达前先显示欢迎语（语言随 bootstrap 校正）

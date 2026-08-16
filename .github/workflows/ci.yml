@@ -32,6 +32,9 @@ jobs:
       - name: Leak scan (internal machinery must never be published)
         run: node scripts/verify-no-leaks.mjs
 
+      - name: i18n consistency check (zh/en keys aligned, references complete)
+        run: node scripts/verify-i18n.mjs
+
       - name: Build (esbuild + media)
         run: node scripts/build.mjs
 

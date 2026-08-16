@@ -11,6 +11,7 @@
  */
 import * as vscode from "vscode";
 
+/** 配置命名空间（与 extension.ts 的 CONFIG_NS 一致）。 */
 const CONFIG_NS = "dshVscode";
 const SECRET_KEY = "dshVscode.apiKey";
 
@@ -36,10 +37,26 @@ const PROVIDER_PRESETS: { id: string; name: string; baseUrl: string; models: str
 
 export interface ConfigPanelDeps {
   /** 读取当前生效配置（API Key 不含密钥库，面板侧自行合并判断）。 */
-  readConfig: () => { apiKey?: string; baseUrl?: string; model: string; permissionMode: string; nodePath: string };
+  readConfig: () => {
+    apiKey?: string;
+    baseUrl?: string;
+    model: string;
+    permissionMode: string;
+    nodePath: string;
+    maxSteps: number;
+    subagentMaxDepth: number;
+    maxParallelSubagents: number;
+  };
   /** 当前 Agent 工作目录（展示用）。 */
   workspaceRoot: () => string;
-  /** 保存成功后回调：disposeHost + 刷新聊天视图提示栏。 */
+  /**
+   * 配置保存**事务边界**：onConfigSaveStart 在保存开始（首次写配置前）调用，
+   * onConfigSaveEnd 在保存结束（无论成败）调用。期间扩展忽略逐项配置变更事件，
+   * 由 onSaved（成功）统一按新配置重启宿主——避免"半套配置重启"。
+   */
+  onConfigSaveStart: () => void;
+  onConfigSaveEnd: () => void;
+  /** 保存成功后回调：锁定 UI + 按新配置重启宿主 + 刷新聊天视图。 */
   onSaved: () => void;
 }
 
@@ -87,6 +104,9 @@ export function openConfigPanel(context: vscode.ExtensionContext, deps: ConfigPa
             nodePath: c.nodePath,
             defaultWorkspace: cfg.get<string>("defaultWorkspace") ?? "",
             maxOutputChars: cfg.get<number>("maxOutputChars") ?? 40000,
+            maxSteps: cfg.get<number>("maxSteps") ?? 100,
+            subagentMaxDepth: cfg.get<number>("subagentMaxDepth") ?? 3,
+            maxParallelSubagents: cfg.get<number>("maxParallelSubagents") ?? 5,
             cwd: deps.workspaceRoot(),
           },
           providers: PROVIDER_PRESETS,
@@ -107,6 +127,8 @@ export function openConfigPanel(context: vscode.ExtensionContext, deps: ConfigPa
       }
       case "save": {
         const v = msg.values ?? {};
+        // 保存事务开始：扩展侧忽略逐项配置变更事件，等 onSaved 统一处理
+        deps.onConfigSaveStart();
         try {
           // 1. API Key：清除 / 写入密钥库（写入时清空设置项，保持"密钥库优先"策略）
           if (v.clearKey) {
@@ -134,15 +156,44 @@ export function openConfigPanel(context: vscode.ExtensionContext, deps: ConfigPa
             Number.isFinite(v.maxOutputChars) && v.maxOutputChars > 0 ? v.maxOutputChars : 40000,
             vscode.ConfigurationTarget.Global
           );
-          // 3. 应用：解绑并关闭宿主（下次使用时按新配置拉起）
+          await cfg.update(
+            "maxSteps",
+            Number.isFinite(v.maxSteps) && v.maxSteps >= 0 ? v.maxSteps : 100,
+            vscode.ConfigurationTarget.Global
+          );
+          await cfg.update(
+            "subagentMaxDepth",
+            Number.isFinite(v.subagentMaxDepth) && v.subagentMaxDepth > 0 ? v.subagentMaxDepth : 3,
+            vscode.ConfigurationTarget.Global
+          );
+          await cfg.update(
+            "maxParallelSubagents",
+            Number.isFinite(v.maxParallelSubagents) && v.maxParallelSubagents > 0 ? v.maxParallelSubagents : 5,
+            vscode.ConfigurationTarget.Global
+          );
+          // 3. 应用：所有配置项已写入完成（事务结束点）——由扩展统一按新配置重启宿主
           deps.onSaved();
+          // 保存结果提示显示在 VS Code 状态栏（非阻塞，几秒后自动消失）
+          vscode.window.setStatusBarMessage(
+            zh ? "✅ 配置已保存，将在下次使用时生效" : "✅ Settings saved; effective on next use",
+            5000
+          );
           panel.webview.postMessage({
             t: "saved",
             ok: true,
             message: zh ? "配置已保存，将在下次使用时生效" : "Settings saved; effective on next use",
           });
         } catch (err) {
-          panel.webview.postMessage({ t: "saved", ok: false, message: err instanceof Error ? err.message : String(err) });
+          const message = err instanceof Error ? err.message : String(err);
+          // 保存失败：同样走 VS Code 状态栏提示（不弹任何通知/弹框）
+          vscode.window.setStatusBarMessage(
+            zh ? `✗ 配置保存失败：${message}` : `✗ Failed to save settings: ${message}`,
+            8000
+          );
+          panel.webview.postMessage({ t: "saved", ok: false, message });
+        } finally {
+          // 事务结束（无论成败）：恢复对逐项配置变更事件的监听
+          deps.onConfigSaveEnd();
         }
         break;
       }
@@ -178,6 +229,12 @@ function renderHtml(webview: vscode.Webview, scriptUri: vscode.Uri, styleUri: vs
     pReadonly: zh ? "read-only — 只读，Agent 不能修改任何文件" : "read-only — agent cannot modify any file",
     pFull: zh ? "danger-full-access — 完全访问，不再审批（谨慎）" : "danger-full-access — full access, no approvals (use with care)",
     maxOutput: zh ? "最大输出字符数（UI 渲染折叠阈值）" : "Max output chars (UI render fold threshold)",
+    maxSteps: zh ? "最大思考轮次（0 = 不限制）" : "Max thinking steps (0 = unlimited)",
+    maxStepsHint: zh ? "单次任务达到上限自动停止（防无限循环）；临近上限时 AI 会先总结收尾" : "Task stops at the limit to prevent infinite loops; the AI summarizes before the last step",
+    subagentDepth: zh ? "子代理递归深度上限" : "Subagent recursion depth limit",
+    subagentDepthHint: zh ? "多级子代理嵌套的最大深度（默认 3）" : "Max nesting depth of subagents (default 3)",
+    maxParallel: zh ? "并行子代理数量上限" : "Max parallel subagents",
+    maxParallelHint: zh ? "多 Agent 模式下同时派发的子代理数量上限（默认 5）" : "Max concurrently dispatched subagents in multi-agent mode (default 5)",
     browse: zh ? "浏览…" : "Browse…",
     save: zh ? "保存并应用" : "Save & Apply",
     cancel: zh ? "取消" : "Cancel",
@@ -201,7 +258,7 @@ function renderHtml(webview: vscode.Webview, scriptUri: vscode.Uri, styleUri: vs
 <link rel="stylesheet" href="${styleUri.toString()}">
 <title>${L.title}</title>
 </head>
-<body>
+<body data-locale="${zh ? "zh" : "en"}">
 <h1>◈ ${L.title}</h1>
 
 <h2 class="section-title">${L.groupModel}</h2>
@@ -276,6 +333,24 @@ function renderHtml(webview: vscode.Webview, scriptUri: vscode.Uri, styleUri: vs
 <div class="field">
   <label for="cfgMaxOutputChars">${L.maxOutput}</label>
   <input type="number" id="cfgMaxOutputChars" min="1000" step="1000" value="40000">
+</div>
+
+<div class="field">
+  <label for="cfgMaxSteps">${L.maxSteps}</label>
+  <input type="number" id="cfgMaxSteps" min="0" step="10" value="100">
+  <span class="hint">${L.maxStepsHint}</span>
+</div>
+
+<div class="field">
+  <label for="cfgSubagentDepth">${L.subagentDepth}</label>
+  <input type="number" id="cfgSubagentDepth" min="1" step="1" value="3">
+  <span class="hint">${L.subagentDepthHint}</span>
+</div>
+
+<div class="field">
+  <label for="cfgMaxParallel">${L.maxParallel}</label>
+  <input type="number" id="cfgMaxParallel" min="1" step="1" value="5">
+  <span class="hint">${L.maxParallelHint}</span>
 </div>
 
 <div class="actions">
