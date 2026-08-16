@@ -7112,9 +7112,9 @@ async function currentSessionTitle(ctx, agent) {
 }
 async function bootTree() {
   const home = resolveDshHome();
-  const profileDir = `${home}\\profiles\\dsh-vscode`;
+  const profileDir = join3(home, "profiles", "dsh-vscode");
   mkdirSync2(profileDir, { recursive: true });
-  const rootConfig = `${profileDir}\\cordis.yml`;
+  const rootConfig = join3(profileDir, "cordis.yml");
   writeFileSync2(rootConfig, "# dsh-vscode root \u2014 empty entry list; composed from bundle patches\n[]\n");
   const environment = loadLayeredEnv(NAME);
   const patches = composePatches(environment);
@@ -7577,6 +7577,10 @@ async function main() {
     log("info", "host ready (lazy session)");
   } catch (error) {
     log("error", "host boot failed", error instanceof Error ? error.stack ?? error.message : String(error));
+    if (error instanceof AggregateError && Array.isArray(error.errors)) {
+      const causes = error.errors.map((e) => e instanceof Error ? e.stack ?? e.message : String(e)).join("\n---\n");
+      log("error", "boot failure causes", causes);
+    }
     post({ t: "exit", code: 1, error: error instanceof Error ? error.message : String(error) });
     process.exitCode = 1;
     return;

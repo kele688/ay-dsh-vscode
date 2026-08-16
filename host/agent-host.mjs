@@ -165,9 +165,12 @@ async function currentSessionTitle(ctx, agent) {
  */
 async function bootTree() {
   const home = resolveDshHome();
-  const profileDir = `${home}\\profiles\\dsh-vscode`;
+  // 平台感知路径拼接（修复 P1-15）：此前硬编码 "\\" 在非 Windows 上会生成
+  // 字面反斜杠目录名，导致 path.dirname 解析错误 → cordis include 条目加载失败
+  // （CI smoke test 在 ubuntu 上 "loader entries failed to apply"）。
+  const profileDir = join(home, "profiles", "dsh-vscode");
   mkdirSync(profileDir, { recursive: true });
-  const rootConfig = `${profileDir}\\cordis.yml`;
+  const rootConfig = join(profileDir, "cordis.yml");
   writeFileSync(rootConfig, "# dsh-vscode root — empty entry list; composed from bundle patches\n[]\n");
 
   const environment = loadLayeredEnv(NAME);
@@ -762,6 +765,14 @@ async function main() {
     log("info", "host ready (lazy session)");
   } catch (error) {
     log("error", "host boot failed", error instanceof Error ? error.stack ?? error.message : String(error));
+    // AggregateError（如 cordis loader entries failed to apply）默认不打印 causes
+    // 数组，这里展开明细，便于 CI smoke test / 输出通道定位平台差异
+    if (error instanceof AggregateError && Array.isArray(error.errors)) {
+      const causes = error.errors
+        .map((e) => (e instanceof Error ? e.stack ?? e.message : String(e)))
+        .join("\n---\n");
+      log("error", "boot failure causes", causes);
+    }
     post({ t: "exit", code: 1, error: error instanceof Error ? error.message : String(error) });
     process.exitCode = 1;
     return;
