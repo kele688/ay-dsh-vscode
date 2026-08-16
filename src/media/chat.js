@@ -63,6 +63,8 @@
       done: "✓ 完成",
       failed: "✗ 失败",
       approvalAsk: (name) => `Agent 请求调用工具 <strong>${name}</strong>`,
+      approvalQueue: (n) => `⏳ 队列中还有 ${n} 个待授权请求（逐个处理）`,
+      approvalAgent: (id) => `🧩 子任务 …${id} 请求：`,
       emptyHistory: "暂无历史会话",
       currentSession: " · 当前会话",
       resume: "▶ 继续",
@@ -108,6 +110,8 @@
       done: "✓ Done",
       failed: "✗ Failed",
       approvalAsk: (name) => `Agent requests to call tool <strong>${name}</strong>`,
+      approvalQueue: (n) => `⏳ Queue: ${n} pending approval(s) — handled one by one`,
+      approvalAgent: (id) => `🧩 Subtask …${id} requests:`,
       emptyHistory: "No sessions yet",
       currentSession: " · current",
       resume: "▶ Resume",
@@ -723,18 +727,40 @@
   }
 
   /* ---------------- 审批（面板内 modal 弹窗：唯一授权通道） ---------------- */
+  // 多 agent 并发审批队列：approvals Map 保存全部未决请求，modal 显示最新一个；
+  // 关闭当前时自动展示下一个——并发请求不会互相覆盖、不会丢失（修复 P1-13）。
 
-  function showApproval(id, toolName, reason) {
+  function showApproval(id, toolName, reason, agentId) {
+    state.approvals.set(id, { toolName, reason, agentId });
+    renderApprovalModal();
+  }
+
+  /** 渲染 modal：显示最新一个未决审批，并在标题行提示队列数量。 */
+  function renderApprovalModal() {
+    const pending = [...state.approvals.entries()];
+    if (pending.length === 0) {
+      approvalEl.classList.add("hidden");
+      state.pendingApprovalId = null;
+      return;
+    }
+    const [id, a] = pending[pending.length - 1];
     state.pendingApprovalId = id;
     const body = $("approvalBody");
     body.innerHTML = "";
+    // 队列提示（多 agent 并发时用户知道还有几个待处理）
+    if (pending.length > 1) {
+      body.appendChild(el("p", "approval-queue", t("approvalQueue", pending.length)));
+    }
+    // agent 标识（多 agent 场景：显示哪个子任务在请求授权）
+    if (a.agentId) {
+      body.appendChild(el("p", "approval-agent", t("approvalAgent", a.agentId)));
+    }
     const p1 = el("p", "", "");
     // 该行内含 <strong> 标签，需 innerHTML 渲染（toolName 已转义，安全）
-    p1.innerHTML = t("approvalAsk", escapeHtml(toolName));
+    p1.innerHTML = t("approvalAsk", escapeHtml(a.toolName));
     body.appendChild(p1);
-    if (reason) {
-      const p2 = el("p", "approval-reason", reason);
-      body.appendChild(p2);
+    if (a.reason) {
+      body.appendChild(el("p", "approval-reason", a.reason));
     }
     // 面板内居中 modal（遮罩 + 卡片，像子窗口；webview 保留上下文，
     // 窗口不活动时弹窗保持，切回即可处理——与 Kilo Code / DSH Web 一致）
@@ -742,22 +768,25 @@
     scrollToBottom();
   }
 
-  function hideApproval() {
-    approvalEl.classList.add("hidden");
-    state.pendingApprovalId = null;
+  /** 关闭指定审批；若关闭的是当前显示的，自动展示下一个未决审批。 */
+  function hideApproval(id) {
+    state.approvals.delete(id);
+    if (state.pendingApprovalId === id) {
+      renderApprovalModal();
+    }
   }
 
   btnAllow.addEventListener("click", () => {
     if (state.pendingApprovalId !== null) {
       vscode.postMessage({ t: "approval:resolve", id: state.pendingApprovalId, approve: true });
+      hideApproval(state.pendingApprovalId);
     }
-    hideApproval();
   });
   btnDeny.addEventListener("click", () => {
     if (state.pendingApprovalId !== null) {
       vscode.postMessage({ t: "approval:resolve", id: state.pendingApprovalId, approve: false });
+      hideApproval(state.pendingApprovalId);
     }
-    hideApproval();
   });
 
   /* ---------------- 状态 ---------------- */
@@ -1073,14 +1102,26 @@
         break;
       }
       case "approval":
-        showApproval(msg.id, msg.toolName, msg.reason);
+        showApproval(msg.id, msg.toolName, msg.reason, msg.agentId);
         break;
       case "approvalResolved":
-        hideApproval();
+        // 只关闭对应 id 的审批（多 agent 并发时不会误关其他请求）
+        hideApproval(msg.id);
         break;
       case "status":
         setStatus(msg.status);
         break;
+      case "appendInput": {
+        // Ctrl+K Ctrl+I 快捷引用：把扩展侧构造的引用文本追加到输入框（不发送）
+        const text = typeof msg.text === "string" ? msg.text : "";
+        if (!text) break;
+        inputEl.value = inputEl.value ? inputEl.value + "\n" + text : text;
+        autoResize();
+        inputEl.focus();
+        const len = inputEl.value.length;
+        inputEl.setSelectionRange(len, len); // 光标移到末尾，等待用户编辑/回车
+        break;
+      }
       case "hostExit": {
         // 完全静默：宿主异常退出由扩展侧自动重启处理，不打扰用户。
         // 若重启失败，用户真正发消息/查历史时才在对应操作中看到友好提示。

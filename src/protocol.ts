@@ -45,7 +45,7 @@ export type HostFrame =
   | { t: "ready"; sessionId: string; cwd: string; provider: string; model: string; version: string; sessionTitle?: string }
   | { t: "events"; events: SessionEvent[] }
   | { t: "status"; status: "idle" | "running" }
-  | { t: "approval"; id: number; toolName: string; callId?: string; reason?: string }
+  | { t: "approval"; id: number; toolName: string; callId?: string; reason?: string; agentId?: string }
   | { t: "approvalGone"; id: number }
   | { t: "chatDone"; id: number; ok: boolean; error?: string }
   | { t: "stopAck"; id: number }
@@ -123,12 +123,13 @@ export type ExtensionToWebview =
     }
   | { t: "hostState"; state: "starting" | "ready" | "exited" | "not-started"; detail?: string }
   | { t: "event"; e: ViewEvent }
-  | { t: "approval"; id: number; toolName: string; reason?: string; callId?: string }
+  | { t: "approval"; id: number; toolName: string; reason?: string; callId?: string; agentId?: string }
   | { t: "approvalResolved"; id: number }
   | { t: "status"; status: "idle" | "running" }
   | { t: "hostExit"; code: number; error?: string }
   | { t: "setModel"; model: string }
   | { t: "stats"; stats: SessionStats }
+  | { t: "appendInput"; text: string }
   | { t: "modelInfo"; providers: { id: string; name: string }[]; models: string[]; current: { provider: string; model: string; reasoningEffort?: string; supportedEfforts?: string[] } }
   | { t: "modelChanged"; provider: string; model: string; reasoningEffort?: string; error?: string }
   | { t: "workModeChanged"; mode: "single" | "multi" }

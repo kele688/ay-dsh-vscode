@@ -38,6 +38,7 @@
     "onCommand:dshVscode.explainSelection",
     "onCommand:dshVscode.runOnSelection",
     "onCommand:dshVscode.fixDiagnostics",
+    "onCommand:dshVscode.addSelectionRef",
     "onCommand:dshVscode.configure",
     "onCommand:dshVscode.openWorkspace",
     "onCommand:dshVscode.focus",
@@ -96,6 +97,23 @@
       {
         "command": "dshVscode.fixDiagnostics",
         "title": "DSH: Fix Problems in File"
+      },
+      {
+        "command": "dshVscode.addSelectionRef",
+        "title": "DSH: Reference Selection in Chat (Ctrl+K Ctrl+I)",
+        "icon": "$(quote)"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "dshVscode.addSelectionRef",
+        "key": "ctrl+k ctrl+i",
+        "when": "editorTextFocus && editorHasSelection"
+      },
+      {
+        "command": "dshVscode.addSelectionRef",
+        "key": "cmd+k cmd+i",
+        "when": "editorTextFocus && editorHasSelection"
       }
     ],
     "menus": {

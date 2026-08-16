@@ -23,6 +23,7 @@ Not just a "chat + autocomplete" wrapper — this extension embeds the **officia
 ## Features
 
 - 🗨️ Sidebar chat: streaming output, collapsible reasoning, markdown rendering
+- ⌨️ **Ctrl+K Ctrl+I**: reference the selected code into the chat input with one key chord (file path + line:col range + excerpt, same UX as Kilo Code Ctrl+K Ctrl+A)
 - 🛠️ Tool calls rendered as inline blocks (args + results always visible)
 - 🔐 Approval dialogs for permission escalation (allow / deny, one-time grants)
 - ⚡ Editor integration: explain selection, run agent on selection, fix file diagnostics

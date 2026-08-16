@@ -7163,7 +7163,7 @@ async function createAgent(ctx, options, pump, approvals) {
       installModelSelection(agentCtx, { current: selection, assembled: void 0 });
     }
   });
-  attachAgent(ctx, handle, pump, approvals);
+  attachAgent(ctx, handle, pump);
   await handle.agent.whenIdle();
   return { handle, agent: handle.agent, selection };
 }
@@ -7200,7 +7200,7 @@ async function resumeAgent(ctx, resumeSessionId, options, pump, approvals) {
     });
     log("info", `session cwd ${sessionCwd} != workspace ${currentCwd}; injected cwd correction`);
   }
-  attachAgent(ctx, handle, pump, approvals);
+  attachAgent(ctx, handle, pump);
   await handle.agent.whenIdle();
   return { handle, agent: handle.agent, selection };
 }
@@ -7208,7 +7208,7 @@ var MULTI_AGENT_SECTION = {
   name: "work-mode",
   text: "Current work mode: MULTI-AGENT ORCHESTRATION.\nFor the task at hand: (1) decompose it into independent subtasks; (2) run them in PARALLEL by dispatching subagents with the subagent tools (spawn multiple agents concurrently, one per subtask, giving each a self-contained prompt); (3) collect their results and synthesize a final answer yourself. Use parallel dispatch whenever subtasks do not depend on each other. Keep the user informed: show each dispatched subagent as it starts and when it returns."
 };
-function attachAgent(ctx, handle, pump, approvals) {
+function attachAgent(ctx, handle, pump) {
   const agent = handle.agent;
   agent.ctx.on("session/event", (_session, event) => {
     pump.push(event);
@@ -7224,11 +7224,15 @@ function attachAgent(ctx, handle, pump, approvals) {
       sections: [...assembled.sections ?? [], MULTI_AGENT_SECTION]
     };
   });
-  agent.ctx.on("approval/request", async (req) => {
+}
+function installApprovalListener(ctx, approvals) {
+  ctx.on("approval/request", async (req) => {
     const id = approvals.nextId();
+    const agent = req.agent;
+    const agentId = agent?.session?.id ? String(agent.session.id).slice(-8) : void 0;
     log(
       "info",
-      `approval #${id} requested: ${req.toolName}${req.reason ? ` \u2014 ${req.reason}` : ""}`,
+      `approval #${id} requested: ${req.toolName}${agentId ? ` (agent \u2026${agentId})` : ""}${req.reason ? ` \u2014 ${req.reason}` : ""}`,
       { callId: req.callId ?? null }
     );
     const outcome = await new Promise((resolve4) => {
@@ -7239,7 +7243,8 @@ function attachAgent(ctx, handle, pump, approvals) {
         id,
         toolName: req.toolName,
         callId: req.callId,
-        reason: req.reason
+        reason: req.reason,
+        agentId
       });
       entry.timer = setTimeout(() => {
         if (approvals.pending.get(id) === entry) {
@@ -7556,6 +7561,8 @@ async function main() {
   try {
     ctx = await bootTree();
     log("info", "DSH tree booted");
+    installApprovalListener(ctx, approvals);
+    log("info", "approval listener installed (root scope, covers all agents)");
     migrateLegacySessions();
     handle = void 0;
     agent = void 0;
