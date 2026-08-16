@@ -68,6 +68,9 @@ child.stdout.on("data", (chunk) => {
       child.stdin.write(JSON.stringify({ t: "shutdown" }) + "\n");
     } else if (frame.t === "exit" && !sawReady) {
       console.error(`✗ host exited before ready: code=${frame.code} error=${frame.error ?? ""}`);
+      // exit 帧先于 close 到达：立即打印 stderr 尾部（宿主 boot 错误明细），
+      // 否则 CI 日志只能看到 exit 帧摘要，无法定位平台差异根因
+      if (stderrTail) console.error(`--- stderr tail ---\n${stderrTail}`);
       child.kill();
       process.exit(1);
     }

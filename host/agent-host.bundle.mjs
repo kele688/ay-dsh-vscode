@@ -7577,10 +7577,24 @@ async function main() {
     log("info", "host ready (lazy session)");
   } catch (error) {
     log("error", "host boot failed", error instanceof Error ? error.stack ?? error.message : String(error));
-    if (error instanceof AggregateError && Array.isArray(error.errors)) {
-      const causes = error.errors.map((e) => e instanceof Error ? e.stack ?? e.message : String(e)).join("\n---\n");
-      log("error", "boot failure causes", causes);
+    const details = [];
+    let cur = error;
+    for (let depth = 0; cur && depth < 6; depth++) {
+      if (Array.isArray(cur.errors)) {
+        for (const e of cur.errors) {
+          details.push(e instanceof Error ? e.stack ?? e.message : String(e));
+        }
+      } else if (cur.cause !== void 0 && cur.cause !== null) {
+        details.push(cur.cause instanceof Error ? cur.cause.stack ?? cur.cause.message : String(cur.cause));
+      } else if (typeof cur.message === "string") {
+        details.push(cur.message);
+        break;
+      } else {
+        break;
+      }
+      cur = cur.cause ?? null;
     }
+    if (details.length > 0) log("error", "boot failure causes", details.join("\n---\n"));
     post({ t: "exit", code: 1, error: error instanceof Error ? error.message : String(error) });
     process.exitCode = 1;
     return;
