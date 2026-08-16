@@ -728,7 +728,7 @@
 
   /* ---------------- 审批（面板内 modal 弹窗：唯一授权通道） ---------------- */
   // 多 agent 并发审批队列：approvals Map 保存全部未决请求，modal 显示最新一个；
-  // 关闭当前时自动展示下一个——并发请求不会互相覆盖、不会丢失（修复 P1-13）。
+  // 关闭当前时自动展示下一个——并发请求不会互相覆盖、不会丢失。
 
   function showApproval(id, toolName, reason, agentId) {
     state.approvals.set(id, { toolName, reason, agentId });

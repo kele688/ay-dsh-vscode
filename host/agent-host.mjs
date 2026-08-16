@@ -165,9 +165,12 @@ async function currentSessionTitle(ctx, agent) {
  */
 async function bootTree() {
   const home = resolveDshHome();
-  const profileDir = `${home}\\profiles\\dsh-vscode`;
+  // 平台感知路径拼接：此前硬编码 "\\" 在非 Windows 上会生成
+  // 字面反斜杠目录名，导致 path.dirname 解析错误 → cordis include 条目加载失败
+  // （CI smoke test 在 ubuntu 上 "loader entries failed to apply"）。
+  const profileDir = join(home, "profiles", "dsh-vscode");
   mkdirSync(profileDir, { recursive: true });
-  const rootConfig = `${profileDir}\\cordis.yml`;
+  const rootConfig = join(profileDir, "cordis.yml");
   writeFileSync(rootConfig, "# dsh-vscode root — empty entry list; composed from bundle patches\n[]\n");
 
   const environment = loadLayeredEnv(NAME);
@@ -762,6 +765,27 @@ async function main() {
     log("info", "host ready (lazy session)");
   } catch (error) {
     log("error", "host boot failed", error instanceof Error ? error.stack ?? error.message : String(error));
+    // 展开错误明细：boot() 会把底层错误包装（消息带 NAME 前缀），AggregateError
+    // 也可能不是裸类型——不依赖 instanceof，直接遍历 .errors 数组与 .cause 链，
+    // 便于 CI smoke test / 输出通道定位平台差异（如 loader entries failed to apply）。
+    const details = [];
+    let cur = error;
+    for (let depth = 0; cur && depth < 6; depth++) {
+      if (Array.isArray(cur.errors)) {
+        for (const e of cur.errors) {
+          details.push(e instanceof Error ? e.stack ?? e.message : String(e));
+        }
+      } else if (cur.cause !== undefined && cur.cause !== null) {
+        details.push(cur.cause instanceof Error ? cur.cause.stack ?? cur.cause.message : String(cur.cause));
+      } else if (typeof cur.message === "string") {
+        details.push(cur.message);
+        break;
+      } else {
+        break;
+      }
+      cur = cur.cause ?? null;
+    }
+    if (details.length > 0) log("error", "boot failure causes", details.join("\n---\n"));
     post({ t: "exit", code: 1, error: error instanceof Error ? error.message : String(error) });
     process.exitCode = 1;
     return;
