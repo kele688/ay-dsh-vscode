@@ -58,7 +58,7 @@ export type HostEvent =
   | { type: "ready"; sessionId: string; model: string; provider: string; cwd: string; sessionTitle?: string }
   | { type: "view"; event: ViewEvent }
   | { type: "status"; status: "idle" | "running" }
-  | { type: "approval"; id: number; toolName: string; reason?: string; callId?: string }
+  | { type: "approval"; id: number; toolName: string; reason?: string; callId?: string; agentId?: string }
   | { type: "approvalGone"; id: number }
   | { type: "sessions"; list: SessionSummary[]; error?: string }
   | { type: "history"; sessionId: string; events: ViewEvent[]; hasMore?: boolean; nextSeq?: number }
@@ -289,6 +289,7 @@ export class AgentHost {
           toolName: frame.toolName,
           reason: frame.reason,
           callId: frame.callId,
+          agentId: frame.agentId,
         });
         break;
       }

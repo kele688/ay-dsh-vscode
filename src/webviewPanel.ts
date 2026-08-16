@@ -34,12 +34,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private host: AgentHost | undefined;
   private hostDisposable: vscode.Disposable | undefined;
   private pendingTasks: string[] = [];
+  /** 未决的"追加到输入框"文本（webview 未就绪时缓存，就绪后补发，避免快捷键引用丢失）。 */
+  private pendingInputs: string[] = [];
+  /** webview 是否已完成 ready 握手（决定消息是直发还是缓存）。 */
+  private webviewReady = false;
   private lastStatus: "idle" | "running" = "idle";
   private hostReady = false;
   private lastBootstrap: (ExtensionToWebview & { t: "bootstrap" }) | undefined;
   private hostState: "starting" | "ready" | "exited" | "not-started" = "not-started";
   /** 未决的审批请求（webview 未就绪/重建时缓存，就绪后补发，避免工具调用永久挂起）。 */
-  private pendingApprovals = new Map<number, { toolName: string; reason?: string; callId?: string }>();
+  private pendingApprovals = new Map<number, { toolName: string; reason?: string; callId?: string; agentId?: string }>();
   /** 待审批时显示的状态栏项（点击聚焦面板）。 */
   private approvalStatusItem: vscode.StatusBarItem | undefined;
   /** 最近一次会话统计（webview ready 时补发，避免就绪前的事件丢失）。 */
@@ -85,6 +89,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   queueTask(text: string): void {
     this.pendingTasks.push(text);
     void this.drainTasks();
+  }
+
+  /**
+   * 把一段文本追加到聊天输入框（如 Ctrl+K Ctrl+I 快捷引用）。
+   * webview 未就绪/未打开时缓存，ready 握手后补发——快捷键操作永不静默丢失。
+   */
+  appendInput(text: string): void {
+    if (this.view && this.webviewReady) {
+      this.push({ t: "appendInput", text });
+    } else {
+      this.pendingInputs.push(text);
+    }
   }
 
   /** 向视图推送最新配置摘要（配置向导保存后调用）。 */
@@ -192,6 +208,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           // 视图就绪：立即补发状态/配置/未就绪 bootstrap（宿主未 ready 时
           // 也给出完整 UI 骨架：标题"新会话"、下拉"加载中…"、提示"正在启动"），
           // 避免 webview 空白等待宿主（转圈感知的来源）。
+          this.webviewReady = true;
           this.outputLog(`[perf] webview ready 握手 (${Date.now() - (this.viewCreatedAt ?? Date.now())}ms)`);
           this.push({ t: "status", status: this.lastStatus });
           void this.pushConfig();
@@ -211,11 +228,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           if (this.lastStats) this.push(this.lastStats);
           // 补发未决的审批请求（webview 未就绪/重建期间产生的）
           for (const [id, a] of this.pendingApprovals) {
-            this.push({ t: "approval", id, toolName: a.toolName, reason: a.reason, callId: a.callId });
+            this.push({ t: "approval", id, toolName: a.toolName, reason: a.reason, callId: a.callId, agentId: a.agentId });
           }
           this.refreshApprovalStatusBar();
           const queued = this.pendingTasks.splice(0);
           for (const task of queued) void this.sendChat(task);
+          // 补发未决的输入框追加（Ctrl+K Ctrl+I 引用在视图就绪前触发也不丢失）
+          const inputs = this.pendingInputs.splice(0);
+          for (const text of inputs) this.push({ t: "appendInput", text });
           break;
         }
         case "openFile": {
@@ -354,9 +374,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         // 授权唯一通道 = webview 内 modal 弹窗（面板居中，Kilo Code / DSH Web
         // 同款交互）：webview 保留上下文，弹窗一直保持，窗口不活动时切回即可处理。
         // 状态栏仅作"有待授权"指示（点击聚焦面板），不是第二个弹窗。
-        this.pendingApprovals.set(e.id, { toolName: e.toolName, reason: e.reason, callId: e.callId });
-        this.push({ t: "approval", id: e.id, toolName: e.toolName, reason: e.reason, callId: e.callId });
+        this.pendingApprovals.set(e.id, { toolName: e.toolName, reason: e.reason, callId: e.callId, agentId: e.agentId });
+        this.push({ t: "approval", id: e.id, toolName: e.toolName, reason: e.reason, callId: e.callId, agentId: e.agentId });
         this.refreshApprovalStatusBar();
+        // 必然可见：无论用户当前在看编辑器还是其他面板，收到审批请求即自动
+        // 聚焦聊天面板——授权弹窗一定会出现在用户视野中（不会因未打开面板而错过）。
+        void vscode.commands.executeCommand("dshVscode.chatView.focus");
         break;
       case "approvalGone":
         // 审批已被宿主取消/超时：清理缓存与状态栏，并通知 webview 关闭弹窗

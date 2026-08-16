@@ -572,6 +572,17 @@ body {
   font-style: italic;
 }
 
+.approval-queue {
+  color: var(--warn);
+  font-weight: 600;
+  font-size: 11.5px;
+}
+
+.approval-agent {
+  color: var(--muted);
+  font-size: 11.5px;
+}
+
 .approval-actions {
   display: flex;
   gap: 8px;

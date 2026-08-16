@@ -230,7 +230,7 @@ async function createAgent(ctx, options, pump, approvals) {
     },
   });
 
-  attachAgent(ctx, handle, pump, approvals);
+  attachAgent(ctx, handle, pump);
   await handle.agent.whenIdle();
   return { handle, agent: handle.agent, selection };
 }
@@ -280,7 +280,7 @@ async function resumeAgent(ctx, resumeSessionId, options, pump, approvals) {
     log("info", `session cwd ${sessionCwd} != workspace ${currentCwd}; injected cwd correction`);
   }
 
-  attachAgent(ctx, handle, pump, approvals);
+  attachAgent(ctx, handle, pump);
   await handle.agent.whenIdle();
   return { handle, agent: handle.agent, selection };
 }
@@ -302,8 +302,14 @@ const MULTI_AGENT_SECTION = {
     "Keep the user informed: show each dispatched subagent as it starts and when it returns.",
 };
 
-/** 挂接事件/审批/状态监听（create 与 resume 共用）。 */
-function attachAgent(ctx, handle, pump, approvals) {
+/**
+ * 挂接事件/状态监听（create 与 resume 共用；每个 agent 各挂一份）。
+ * 注意：审批监听不在这里——它必须挂在**根 ctx**（installApprovalListener，
+ * 全局一次）：dsh-scope 的事件向上流动，根 ctx 的无标签监听器能收到
+ * 所有 agent（含 subagent 工具创建的子 agent）的 approval/request，
+ * 否则子 agent 的越界请求会因无监听者而 fail-closed（静默拒绝、无弹窗）。
+ */
+function attachAgent(ctx, handle, pump) {
   const agent = handle.agent;
 
   // 会话事件 → 扩展（scope-filtered：仅本 agent 的会话）
@@ -325,14 +331,24 @@ function attachAgent(ctx, handle, pump, approvals) {
       sections: [...(assembled.sections ?? []), MULTI_AGENT_SECTION],
     };
   });
+}
 
-  // 工具审批（waterfall：返回 outcome 即 claim 请求）。
-  // 超时兜底：用户侧（webview）长时间无响应时自动取消，避免工具调用永久挂起。
-  agent.ctx.on("approval/request", async (req) => {
+/**
+ * 全局审批监听（挂在根 ctx，仅安装一次）。
+ * 覆盖所有 agent（主 agent 与 subagent 工具创建的子 agent）：
+ * dsh-scope 保证根 ctx（无标签 = 全局监听）能收到每个后代作用域的事件。
+ * 瀑布语义要求监听器唯一：若同时在 agent.ctx 挂监听，同一请求会被
+ * 两个监听器各自 claim（重复弹窗/双帧），故全部审批集中在此。
+ */
+function installApprovalListener(ctx, approvals) {
+  ctx.on("approval/request", async (req) => {
     const id = approvals.nextId();
+    const agent = req.agent;
+    // agent 标识：会话 id 短形式（多 agent 场景让用户知道是谁在请求授权）
+    const agentId = agent?.session?.id ? String(agent.session.id).slice(-8) : undefined;
     log(
       "info",
-      `approval #${id} requested: ${req.toolName}${req.reason ? ` — ${req.reason}` : ""}`,
+      `approval #${id} requested: ${req.toolName}${agentId ? ` (agent …${agentId})` : ""}${req.reason ? ` — ${req.reason}` : ""}`,
       { callId: req.callId ?? null }
     );
     const outcome = await new Promise((resolve) => {
@@ -344,6 +360,7 @@ function attachAgent(ctx, handle, pump, approvals) {
         toolName: req.toolName,
         callId: req.callId,
         reason: req.reason,
+        agentId,
       });
       // 2 分钟无人回应 → 视为取消（Agent 会收到工具取消并调整策略）
       entry.timer = setTimeout(() => {
@@ -721,6 +738,10 @@ async function main() {
   try {
     ctx = await bootTree();
     log("info", "DSH tree booted");
+
+    // 全局审批监听（根 ctx，一次）：覆盖主 agent 与所有 subagent 的越界请求
+    installApprovalListener(ctx, approvals);
+    log("info", "approval listener installed (root scope, covers all agents)");
 
     // 会话隔离迁移：把旧共享目录中插件自己的会话搬入独立目录（幂等）
     migrateLegacySessions();

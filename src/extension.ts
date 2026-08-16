@@ -233,6 +233,31 @@ async function deliverTask(context: vscode.ExtensionContext, text: string): Prom
   await vscode.commands.executeCommand("dshVscode.chatView.focus");
 }
 
+/**
+ * 构造"快捷引用原文"文本（对标 Kilo Code 的 Ctrl+K Ctrl+A）：
+ *   文件相对路径 + 起止位置（行,列，1-based）+ 代码围栏内的原文摘录。
+ * 原文 ≤5 行全量；>5 行取前 3 行 + 省略行 + 末 1 行。
+ * 围栏自动加长：原文含 ``` 时用更长的反引号围栏，避免提前闭合。
+ */
+function buildSelectionRef(editor: vscode.TextEditor): string {
+  const doc = editor.document;
+  const sel = editor.selection;
+  const text = doc.getText(sel);
+  if (!text.trim()) return "";
+  const relPath = vscode.workspace.asRelativePath(doc.uri, false) || doc.uri.fsPath;
+  // VS Code 位置 0-based，引用展示用 1-based
+  const sLine = sel.start.line + 1;
+  const sCol = sel.start.character + 1;
+  const eLine = sel.end.line + 1;
+  const eCol = sel.end.character + 1;
+  const lines = text.split(/\r?\n/);
+  const excerpt =
+    lines.length <= 5 ? lines : [...lines.slice(0, 3), "…", lines[lines.length - 1]];
+  let fence = "```";
+  while (excerpt.some((l) => l.includes(fence))) fence += "`";
+  return [`[${relPath} (${sLine},${sCol})-(${eLine},${eCol})]`, `${fence}text`, ...excerpt, fence].join("\n");
+}
+
 /* ------------------------------------------------------------------ */
 /* 配置：完整配置面板（src/configPanel.ts）                              */
 /* ------------------------------------------------------------------ */
@@ -328,6 +353,17 @@ export function activate(context: vscode.ExtensionContext): void {
         context,
         `当前文件 ${path.basename(editor.document.uri.fsPath)} 有以下诊断问题，请修复它们：\n${lines}`
       );
+    }),
+    // Ctrl+K Ctrl+I：快捷引用选中代码到聊天输入框（对标 Kilo Code Ctrl+K Ctrl+A）。
+    // 只追加不发送——用户可继续编辑后回车，或继续追加更多引用。
+    vscode.commands.registerCommand("dshVscode.addSelectionRef", () => {
+      const editor = vscode.window.activeTextEditor;
+      if (!editor) return;
+      const ref = buildSelectionRef(editor);
+      if (!ref) return;
+      void vscode.commands.executeCommand("dshVscode.chatView.focus").then(() => {
+        provider?.appendInput(ref);
+      });
     })
   );
 
