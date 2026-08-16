@@ -32,6 +32,8 @@ export interface SessionStats {
   cacheReadTokens: number;
   /** 累计输出 token。 */
   outputTokens: number;
+  /** 累计 API 调用次数（step/start 事件计数；对应 dsh web 的 step 参数）。 */
+  steps: number;
   /** 当前模型的上下文窗口大小（来自 request/context 事件）。 */
   contextWindow?: number;
   /** 最近一次请求的输入 token（含缓存读取），用于上下文占用占比。 */
@@ -59,6 +61,8 @@ export type HostFrame =
   | { t: "modelChanged"; provider: string; model: string; reasoningEffort?: string }
   | { t: "workModeChanged"; mode: "single" | "multi" }
   | { t: "compactDone"; id: number; ok: boolean; text?: string; error?: string }
+  | { t: "stepLimit"; maxSteps: number; steps: number }
+  | { t: "stats"; stats: SessionStats }
   | { t: "exit"; code: number; error?: string };
 
 /** Extension -> Host */
@@ -108,7 +112,8 @@ export type WebviewMessage =
   | { t: "setWorkMode"; mode: "single" | "multi" }
   | { t: "compact" }
   | { t: "ready" }
-  | { t: "openFile"; path: string };
+  | { t: "openFile"; path: string }
+  | { t: "hint"; text: string };
 
 /** Extension -> Webview 的消息。 */
 export type ExtensionToWebview =
@@ -130,11 +135,12 @@ export type ExtensionToWebview =
   | { t: "setModel"; model: string }
   | { t: "stats"; stats: SessionStats }
   | { t: "appendInput"; text: string }
-  | { t: "modelInfo"; providers: { id: string; name: string }[]; models: string[]; current: { provider: string; model: string; reasoningEffort?: string; supportedEfforts?: string[] } }
+  | { t: "modelInfo"; providers: { id: string; name: string }[]; models: string[]; current: { provider: string; model: string; reasoningEffort?: string; supportedEfforts?: string[]; defaultEffort?: string } }
   | { t: "modelChanged"; provider: string; model: string; reasoningEffort?: string; error?: string }
   | { t: "workModeChanged"; mode: "single" | "multi" }
   | { t: "compactDone"; ok: boolean; text?: string; error?: string }
   | { t: "sessions"; list: SessionSummary[]; error?: string }
+  | { t: "restarting" }
   | { t: "history"; sessionId: string; events: ViewEvent[]; hasMore?: boolean; nextSeq?: number }
   | { t: "historyMore"; sessionId: string; events: ViewEvent[]; hasMore?: boolean; nextSeq?: number }
   | { t: "sessionDeleted"; id: string; ok: boolean; error?: string }

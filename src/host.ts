@@ -48,6 +48,12 @@ export interface AgentHostOptions {
   model: string;
   permissionMode: string;
   nodePath?: string;
+  /** 单次任务最大思考轮次（0 = 不限制；宿主在 step/start 计数超限时自动取消）。 */
+  maxSteps?: number;
+  /** 子代理递归深度上限（tool-subagent maxDepth）。 */
+  subagentMaxDepth?: number;
+  /** 多 agent 模式并行子代理数量上限（prompt 级约束）。 */
+  maxParallelSubagents?: number;
   /** 插件专属的 DSH home 目录（会话/配置均存于此，与官方 dsh 完全隔离）。 */
   dshHome: string;
   /** 旧 DSH home（用于一次性迁移历史会话）。 */
@@ -71,11 +77,12 @@ export type HostEvent =
       type: "modelInfo";
       providers: { id: string; name: string }[];
       models: string[];
-      current: { provider: string; model: string; reasoningEffort?: string; supportedEfforts?: string[] };
+      current: { provider: string; model: string; reasoningEffort?: string; supportedEfforts?: string[]; defaultEffort?: string };
     }
   | { type: "modelChanged"; provider: string; model: string; reasoningEffort?: string; error?: string }
   | { type: "workModeChanged"; mode: "single" | "multi" }
   | { type: "compactDone"; ok: boolean; text?: string; error?: string }
+  | { type: "stepLimit"; maxSteps: number; steps: number }
   | { type: "exit"; code: number; error?: string }
   | { type: "log"; level: string; message: string };
 
@@ -116,6 +123,24 @@ async function resolveNode(nodePath: string | undefined): Promise<string | null>
   return null;
 }
 
+/**
+ * 共享输出通道：所有 AgentHost 实例**复用同一个** channel（模块级单例）。
+ *
+ * 为什么单例：宿主会因配置变更/工作区切换/自动重启而频繁重建。若每次构造都
+ * `createOutputChannel("ay-dsh-vscode Host")`，会生成多个同名 channel——输出面板
+ * 仍停留在旧 channel 视图，新宿主的日志写进新 channel，表现为"重启后输出界面
+ * 不再输出"。单例化后：重启日志继续追加到同一面板、历史保留、无同名堆积。
+ * 刻意不 dispose：保留跨重启日志历史，有助于问题定位（扩展停用时由 VS Code
+ * 自行回收）。
+ */
+let sharedOutputChannel: vscode.OutputChannel | undefined;
+function getOutputChannel(): vscode.OutputChannel {
+  if (!sharedOutputChannel) {
+    sharedOutputChannel = vscode.window.createOutputChannel("ay-dsh-vscode Host");
+  }
+  return sharedOutputChannel;
+}
+
 export class AgentHost {
   private child: ChildProcessWithoutNullStreams | null = null;
   private rl: readline.Interface | null = null;
@@ -133,10 +158,11 @@ export class AgentHost {
   private hostScript: string | undefined;
   private fallbackHostScript: string | undefined;
   /** 当前会话的 token/标题统计（随事件流累计，推送给 UI 顶部信息栏）。 */
-  private stats: SessionStats = { inputTokens: 0, cacheReadTokens: 0, outputTokens: 0 };
+  private stats: SessionStats = { inputTokens: 0, cacheReadTokens: 0, outputTokens: 0, steps: 0 };
 
   constructor(private readonly options: AgentHostOptions, private readonly ctx: vscode.ExtensionContext) {
-    this.output = vscode.window.createOutputChannel("ay-dsh-vscode Host");
+    // 复用共享单例 channel：宿主重启后日志继续输出到同一面板（不新建同名 channel）
+    this.output = getOutputChannel();
   }
 
   get sessionId(): string | undefined {
@@ -183,6 +209,9 @@ export class AgentHost {
       DSH_HOME: this.options.dshHome,
       DSH_VSCODE_MODEL: this.options.model,
       DSH_PERMISSION_MODE: this.options.permissionMode,
+      DSH_MAX_STEPS: String(this.options.maxSteps ?? 100),
+      DSH_SUBAGENT_MAX_DEPTH: String(this.options.subagentMaxDepth ?? 3),
+      DSH_MAX_PARALLEL_SUBAGENTS: String(this.options.maxParallelSubagents ?? 5),
       DSH_TELEMETRY_DISABLED: "1",
       // 统一子进程文本编码为 UTF-8：Windows PowerShell 5.1 / Python 默认按
       // 系统代码页（GBK）输出中文，Node 侧按 UTF-8 读取会乱码。
@@ -256,7 +285,7 @@ export class AgentHost {
         // 例外：若刚重放过该会话的历史（resume 时序：history 帧先到、ready 帧后到），
         // 统计已由 history 重放累计，这里不能重置，否则 UI 的 token 统计会消失。
         if (frame.sessionId !== this.readySessionId && frame.sessionId !== this.lastHistorySessionId) {
-          this.stats = { inputTokens: 0, cacheReadTokens: 0, outputTokens: 0 };
+          this.stats = { inputTokens: 0, cacheReadTokens: 0, outputTokens: 0, steps: 0 };
         }
         this.lastHistorySessionId = undefined;
         this.readySessionId = frame.sessionId;
@@ -386,8 +415,18 @@ export class AgentHost {
         this.emit({ type: "workModeChanged", mode: frame.mode });
         break;
       }
+      case "stats": {
+        // 宿主主动推送的统计快照（如压缩完成后立即刷新上下文占用）
+        this.stats = { ...this.stats, ...frame.stats };
+        this.emitStats();
+        break;
+      }
       case "compactDone": {
         this.emit({ type: "compactDone", ok: frame.ok, text: frame.text, error: frame.error });
+        break;
+      }
+      case "stepLimit": {
+        this.emit({ type: "stepLimit", maxSteps: frame.maxSteps, steps: frame.steps });
         break;
       }
       case "exit": {
@@ -397,10 +436,15 @@ export class AgentHost {
     }
   }
 
-  /** 从会话事件中累计统计（标题 / token 用量 / 上下文窗口）。 */
+  /** 从会话事件中累计统计（标题 / token 用量 / 上下文窗口 / API 调用次数）。 */
   private trackStats(event: SessionEvent): void {
     const d = event.data as Record<string, any>;
     switch (event.type) {
+      case "step/start": {
+        this.stats.steps = (this.stats.steps ?? 0) + 1;
+        this.emitStats();
+        break;
+      }
       case "session/title": {
         const title = typeof d.title === "string" ? d.title : "";
         if (title && title !== this.stats.title) {

@@ -74,8 +74,11 @@ body {
 }
 
 .composer-tools .hint {
-  flex: 1;
-  min-width: 60px;
+  /* 极简提示：仅占内容宽度，最长不超过一行可读长度，超长省略号截断；
+     hover（title）显示完整信息，完整信息也同步到 VS Code 状态栏 */
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 45%;
 }
 
 .tool-select {
@@ -105,7 +108,7 @@ body {
   width: 110px;
 }
 
-/* 思考级别：固定适配现有选项文字（OFF/LOW/HIGH/MAX）的宽度 */
+/* 思考级别：固定适配现有选项文字（off/low/high/max）的宽度 */
 .tool-select.effort {
   width: 62px;
 }
@@ -583,6 +586,86 @@ body {
   font-size: 11.5px;
 }
 
+/* ---- 代码块：独立引用区 + 语言标签 + 复制按钮 ---- */
+.codeblock {
+  margin: 6px 0;
+  border: 1px solid var(--border, #3c3c3c);
+  border-radius: 6px;
+  overflow: hidden;
+  background: var(--bubble-assistant);
+}
+
+.codeblock-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 3px 10px;
+  background: rgba(128, 128, 128, 0.12);
+  border-bottom: 1px solid var(--border, #3c3c3c);
+  font-size: 11.5px;
+}
+
+.codeblock-lang {
+  color: var(--muted);
+  font-family: Consolas, monospace;
+  text-transform: lowercase;
+}
+
+.codeblock-copy {
+  background: transparent;
+  border: 1px solid rgba(128, 128, 128, 0.4);
+  border-radius: 4px;
+  color: var(--muted);
+  font-size: 11px;
+  padding: 1px 8px;
+  cursor: pointer;
+}
+
+.codeblock-copy:hover {
+  color: var(--fg, #ddd);
+  border-color: var(--fg, #ddd);
+}
+
+.codeblock pre {
+  margin: 0;
+  padding: 8px 10px;
+  overflow-x: auto;
+}
+
+.codeblock pre code {
+  font-family: Consolas, "Courier New", monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre;
+}
+
+/* ---- Markdown 表格（对齐渲染） ---- */
+.md-table-wrap {
+  overflow-x: auto;
+  margin: 6px 0;
+}
+
+.md-table-wrap table {
+  border-collapse: collapse;
+  font-size: 12px;
+  min-width: 60%;
+}
+
+.md-table-wrap th,
+.md-table-wrap td {
+  border: 1px solid rgba(128, 128, 128, 0.35);
+  padding: 3px 10px;
+}
+
+.md-table-wrap th {
+  background: rgba(128, 128, 128, 0.15);
+  font-weight: 600;
+}
+
+.md-table-wrap tr:nth-child(even) td {
+  background: rgba(128, 128, 128, 0.06);
+}
+
 .approval-actions {
   display: flex;
   gap: 8px;
@@ -610,7 +693,13 @@ body {
   gap: 6px;
 }
 
+/* 输入行：仅输入框（发送按钮在下方工具行右侧，与模型选择框同一行） */
+.composer-input-row {
+  display: block;
+}
+
 #input {
+  flex: 1;
   width: 100%;
   resize: none;
   background: var(--bubble-user);
@@ -658,9 +747,16 @@ body {
 
 .btn.send {
   background: var(--accent);
+  flex: 0 0 auto;
 }
 
-.btn.stop {
+/* 发送/停止按钮位于工具行（与模型选择框同一行）最右侧，右缘与输入框右缘对齐 */
+.composer-tools .btn.send {
+  margin-left: auto;
+}
+
+/* 发送/停止共用按钮的运行态：变红色"停止"，可点击中断当前对话 */
+.btn.send.stop {
   background: var(--error);
   color: #fff;
 }

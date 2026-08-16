@@ -7079,6 +7079,17 @@ function composePatches(env) {
         workspaceRoot: process.cwd()
       }
     },
+    // 子代理工具配置（借鉴 dsh web）：整行替换语义，必须携带完整 config。
+    // maxDepth = 子代理递归深度上限（内核默认 3）；插件可配置。
+    {
+      id: "tool-subagent",
+      config: {
+        provider: "spawn",
+        toolName: "subagent",
+        backgroundMode: "continuable",
+        maxDepth: Number(env.DSH_SUBAGENT_MAX_DEPTH) || 3
+      }
+    },
     // 独立会话存储：插件会话与 dsh CLI / dsh web 等官方应用的会话完全隔离，
     // 插件的历史列表只包含插件自己的会话。
     {
@@ -7163,9 +7174,9 @@ async function createAgent(ctx, options, pump, approvals) {
       installModelSelection(agentCtx, { current: selection, assembled: void 0 });
     }
   });
-  attachAgent(ctx, handle, pump);
+  const attached = attachAgent(ctx, handle, pump);
   await handle.agent.whenIdle();
-  return { handle, agent: handle.agent, selection };
+  return { handle, agent: handle.agent, selection, resetStepBudget: attached.resetStepBudget };
 }
 async function resumeAgent(ctx, resumeSessionId, options, pump, approvals) {
   const agents = ctx.get("agents");
@@ -7200,18 +7211,97 @@ async function resumeAgent(ctx, resumeSessionId, options, pump, approvals) {
     });
     log("info", `session cwd ${sessionCwd} != workspace ${currentCwd}; injected cwd correction`);
   }
-  attachAgent(ctx, handle, pump);
+  const attached = attachAgent(ctx, handle, pump);
   await handle.agent.whenIdle();
-  return { handle, agent: handle.agent, selection };
+  return { handle, agent: handle.agent, selection, resetStepBudget: attached.resetStepBudget };
 }
-var MULTI_AGENT_SECTION = {
-  name: "work-mode",
-  text: "Current work mode: MULTI-AGENT ORCHESTRATION.\nFor the task at hand: (1) decompose it into independent subtasks; (2) run them in PARALLEL by dispatching subagents with the subagent tools (spawn multiple agents concurrently, one per subtask, giving each a self-contained prompt); (3) collect their results and synthesize a final answer yourself. Use parallel dispatch whenever subtasks do not depend on each other. Keep the user informed: show each dispatched subagent as it starts and when it returns."
-};
+function multiAgentSection(env) {
+  const maxParallel = Number(env.DSH_MAX_PARALLEL_SUBAGENTS) || 5;
+  return {
+    name: "work-mode",
+    text: `Current work mode: MULTI-AGENT ORCHESTRATION.
+For the task at hand: (1) decompose it into independent subtasks; (2) run them in PARALLEL by dispatching subagents with the subagent tools (spawn multiple agents concurrently \u2014 at most ${maxParallel} in parallel, one per subtask, giving each a self-contained prompt); (3) collect their results and synthesize a final answer yourself. Use parallel dispatch whenever subtasks do not depend on each other. Keep the user informed: show each dispatched subagent as it starts and when it returns.`
+  };
+}
+function normalizeEffort(value) {
+  if (value === "off" || value === "high" || value === "max") return value;
+  if (value === "low") return "high";
+  return void 0;
+}
+function stepLimitSystemSection(limit) {
+  return {
+    name: "step-limit",
+    text: `Each turn (one user message) has a thinking-step budget of ${limit} model steps. Plan your work to finish within this budget. When the budget is reached, tool calls are disabled and you must wrap up immediately: stop all new tool calls and reasoning, and deliver a concise final answer covering what was accomplished, what remains unfinished, and the next command the user should send. Do not continue working beyond the budget.`
+  };
+}
+function stepLimitWrapUpMessage(limit, steps) {
+  return `[System notice] Step limit reached: ${steps}/${limit} steps used \u2014 this turn's thinking budget is exhausted and all tool calls are now disabled. The per-turn step limit keeps each request bounded and prevents runaway tool loops, so continuing further work is not permitted. Stop further reasoning and deliver your final answer in this reply: what was accomplished, what remains unfinished, and the next command the user should send. Do not continue working after this reply. Thank you for wrapping up cleanly.`;
+}
 function attachAgent(ctx, handle, pump) {
   const agent = handle.agent;
+  const maxSteps = Number(process.env.DSH_MAX_STEPS);
+  const stepLimit = Number.isFinite(maxSteps) ? maxSteps : 100;
+  let stepCount = 0;
+  let stepLimitHit = false;
+  let wrapUpInjected = false;
+  const resetStepBudget = () => {
+    stepCount = 0;
+    stepLimitHit = false;
+    wrapUpInjected = false;
+  };
   agent.ctx.on("session/event", (_session, event) => {
+    if (event.type === "step/start") {
+      stepCount++;
+      if (!stepLimitHit && stepLimit > 0 && stepCount >= stepLimit) {
+        stepLimitHit = true;
+        log("warn", `step limit reached (${stepLimit}) \u2014 steering the agent to wrap up`);
+        post({ t: "stepLimit", maxSteps: stepLimit, steps: stepCount });
+      }
+    }
     pump.push(event);
+  });
+  agent.ctx.on("system-prompt/assemble", async (_assembly, _context, next) => {
+    const assembled = await next();
+    log("info", `assemble hook called (stepCount=${stepCount}, stepLimit=${stepLimit}, sections=${(assembled.sections ?? []).length})`);
+    if (stepLimit > 0) {
+      return {
+        ...assembled,
+        sections: [...assembled.sections ?? [], stepLimitSystemSection(stepLimit)]
+      };
+    }
+    return assembled;
+  });
+  agent.ctx.on("agent/pre-step", async (_payload, next) => {
+    const decision = await next();
+    if (stepLimit > 0 && stepLimitHit && !wrapUpInjected && decision.kind === "enter") {
+      wrapUpInjected = true;
+      log("info", `step-limit pre-step injection (steps=${stepCount}, stepLimit=${stepLimit})`);
+      return {
+        ...decision,
+        messages: [
+          ...decision.messages ?? [],
+          // 必须用 createUserMessage 构造（含 id/source 身份字段）——内核处理
+          // user/message 事件会读 message.source.kind，裸对象会崩溃
+          // （"Cannot read properties of undefined (reading 'kind')"）。
+          createUserMessage({
+            content: [{ type: "text", text: stepLimitWrapUpMessage(stepLimit, stepCount) }],
+            source: { kind: "user" }
+          })
+        ]
+      };
+    }
+    return decision;
+  });
+  agent.ctx.on("tools/pre-execute", async (exec, next) => {
+    const gate = await next();
+    if (stepLimit > 0 && stepLimitHit && gate.kind === "allow") {
+      log("info", `step-limit tool gate denied: ${exec.name} (steps=${stepCount}, stepLimit=${stepLimit})`);
+      return {
+        kind: "deny",
+        reason: `Tool calls are disabled \u2014 this turn reached its step limit (${stepCount}/${stepLimit}). Stop working and deliver your final summary now.`
+      };
+    }
+    return gate;
   });
   agent.ctx.on("agent/status", ({ agent: a, status }) => {
     post({ t: "status", status });
@@ -7221,9 +7311,10 @@ function attachAgent(ctx, handle, pump) {
     if (getWorkMode() !== "multi") return assembled;
     return {
       ...assembled,
-      sections: [...assembled.sections ?? [], MULTI_AGENT_SECTION]
+      sections: [...assembled.sections ?? [], multiAgentSection(process.env)]
     };
   });
+  return { resetStepBudget };
 }
 function installApprovalListener(ctx, approvals) {
   ctx.on("approval/request", async (req) => {
@@ -7345,7 +7436,7 @@ async function listSessions(ctx) {
   }));
 }
 function computeSessionStats(events) {
-  const stats = { inputTokens: 0, cacheReadTokens: 0, outputTokens: 0 };
+  const stats = { inputTokens: 0, cacheReadTokens: 0, outputTokens: 0, steps: 0 };
   for (const e of events) {
     const d = e.data ?? {};
     if (e.type === "session/title" && typeof d.title === "string" && d.title) {
@@ -7363,6 +7454,8 @@ function computeSessionStats(events) {
         stats.contextWindow = d.contextWindow;
       }
       if (typeof d.model === "string" && d.model) stats.model = d.model;
+    } else if (e.type === "step/start") {
+      stats.steps = (stats.steps ?? 0) + 1;
     }
   }
   return stats;
@@ -7557,6 +7650,7 @@ async function main() {
   let handle;
   let agent;
   let selection = null;
+  let resetStepBudget = null;
   let shuttingDown = false;
   try {
     ctx = await bootTree();
@@ -7614,6 +7708,8 @@ async function main() {
   process.on("SIGTERM", () => void shutdown(0));
   process.on("SIGINT", () => void shutdown(0));
   const rl = createInterface({ input: process.stdin, crlfDelay: Infinity });
+  let criticalQueue = Promise.resolve();
+  const CRITICAL_FRAMES = /* @__PURE__ */ new Set(["chat", "newSession", "resumeSession", "deleteSession", "compact"]);
   rl.on("line", (line) => {
     if (line.trim() === "") return;
     let msg;
@@ -7623,60 +7719,157 @@ async function main() {
       log("warn", "unparseable frame", line.slice(0, 200));
       return;
     }
-    void (async () => {
-      try {
-        switch (msg.t) {
-          case "chat": {
-            const text = typeof msg.text === "string" ? msg.text : "";
-            if (text.trim() === "") {
-              post({ t: "chatDone", id: msg.id, ok: false, error: "empty message" });
-              return;
-            }
-            if (agent === void 0) {
-              const created = await createAgent(ctx, { model: msg.model ?? env.DSH_VSCODE_MODEL }, pump, approvals);
-              handle = created.handle;
-              agent = created.agent;
-              selection = created.selection;
-            }
-            post({
-              t: "ready",
-              sessionId: agent.session.id,
-              cwd: process.cwd(),
-              provider: agent.options.provider,
-              model: agent.options.model,
-              version: CORE_VERSION,
-              sessionTitle: await currentSessionTitle(ctx, agent)
-            });
-            agent.followup(
-              createUserMessage({
-                content: [{ type: "text", text }],
-                source: { kind: "user" }
-              })
-            );
-            await agent.whenIdle();
-            pump.flush();
-            post({ t: "chatDone", id: msg.id, ok: true });
+    if (CRITICAL_FRAMES.has(msg.t)) {
+      criticalQueue = criticalQueue.then(() => handleFrame(msg)).catch((error) => {
+        log("error", "critical frame chain failure", error instanceof Error ? error.message : String(error));
+      });
+    } else {
+      void handleFrame(msg);
+    }
+  });
+  async function handleFrame(msg) {
+    try {
+      switch (msg.t) {
+        case "chat": {
+          const text = typeof msg.text === "string" ? msg.text : "";
+          if (text.trim() === "") {
+            post({ t: "chatDone", id: msg.id, ok: false, error: "empty message" });
+            return;
+          }
+          if (agent === void 0) {
+            const created = await createAgent(ctx, { model: msg.model ?? env.DSH_VSCODE_MODEL }, pump, approvals);
+            handle = created.handle;
+            agent = created.agent;
+            selection = created.selection;
+            resetStepBudget = created.resetStepBudget;
+          }
+          resetStepBudget?.();
+          post({
+            t: "ready",
+            sessionId: agent.session.id,
+            cwd: process.cwd(),
+            provider: agent.options.provider,
+            model: agent.options.model,
+            version: CORE_VERSION,
+            sessionTitle: await currentSessionTitle(ctx, agent)
+          });
+          agent.followup(
+            createUserMessage({
+              content: [{ type: "text", text }],
+              source: { kind: "user" }
+            })
+          );
+          await agent.whenIdle();
+          pump.flush();
+          post({ t: "chatDone", id: msg.id, ok: true });
+          break;
+        }
+        case "stop": {
+          if (agent !== void 0) agent.cancel({ kind: "user" });
+          post({ t: "stopAck", id: msg.id });
+          break;
+        }
+        case "approval:resolve": {
+          const entry = approvals.pending.get(msg.id);
+          if (entry === void 0) break;
+          approvals.pending.delete(msg.id);
+          clearTimeout(entry.timer);
+          entry.resolve(msg.approve === true ? "allowed-once" : "rejected");
+          break;
+        }
+        case "newSession": {
+          if (handle !== void 0) {
+            await handle.dispose();
+            handle = void 0;
+            agent = void 0;
+            resetStepBudget = null;
+          }
+          post({
+            t: "ready",
+            sessionId: "",
+            cwd: process.cwd(),
+            provider: "",
+            model: env.DSH_VSCODE_MODEL ?? "",
+            version: CORE_VERSION
+          });
+          break;
+        }
+        case "listSessions": {
+          try {
+            const list = await listSessions(ctx);
+            post({ t: "sessions", list });
+          } catch (error) {
+            log("error", "listSessions failed", error instanceof Error ? error.message : String(error));
+            post({ t: "sessions", list: [], error: error instanceof Error ? error.message : String(error) });
+          }
+          break;
+        }
+        case "resumeSession": {
+          if (typeof msg.id !== "string" || msg.id.trim() === "") {
+            post({ t: "sessionResumed", id: msg.id, ok: false, error: "invalid session id" });
             break;
           }
-          case "stop": {
-            if (agent !== void 0) agent.cancel({ kind: "user" });
-            post({ t: "stopAck", id: msg.id });
+          if (handle !== void 0) await handle.dispose();
+          const resumed = await resumeAgent(
+            ctx,
+            msg.id,
+            { model: msg.model ?? env.DSH_VSCODE_MODEL },
+            pump,
+            approvals
+          );
+          handle = resumed.handle;
+          agent = resumed.agent;
+          selection = resumed.selection;
+          resetStepBudget = resumed.resetStepBudget;
+          const allEvents = agent.session.events.filter(
+            (e) => e.type !== "assistant/chunk" && e.type !== "session/end-seed"
+          );
+          const limit = Number.isInteger(msg.limit) && msg.limit > 0 ? msg.limit : 200;
+          const tail = allEvents.slice(-limit);
+          const hasMore = allEvents.length > tail.length;
+          const nextSeq = hasMore ? tail[0].seq : void 0;
+          const stats = computeSessionStats(allEvents);
+          post({ t: "history", sessionId: agent.session.id, events: tail, hasMore, nextSeq, stats });
+          post({
+            t: "ready",
+            sessionId: agent.session.id,
+            cwd: process.cwd(),
+            provider: agent.options.provider,
+            model: agent.options.model,
+            version: CORE_VERSION,
+            sessionTitle: await currentSessionTitle(ctx, agent)
+          });
+          post({ t: "sessionResumed", id: msg.id, ok: true });
+          break;
+        }
+        case "loadMoreHistory": {
+          if (agent === void 0 || !Number.isFinite(msg.beforeSeq)) {
+            post({ t: "historyMore", sessionId: "", events: [], hasMore: false });
             break;
           }
-          case "approval:resolve": {
-            const entry = approvals.pending.get(msg.id);
-            if (entry === void 0) break;
-            approvals.pending.delete(msg.id);
-            clearTimeout(entry.timer);
-            entry.resolve(msg.approve === true ? "allowed-once" : "rejected");
-            break;
-          }
-          case "newSession": {
-            if (handle !== void 0) {
-              await handle.dispose();
-              handle = void 0;
-              agent = void 0;
-            }
+          const allEvents = agent.session.events.filter(
+            (e) => e.type !== "assistant/chunk" && e.type !== "session/end-seed"
+          );
+          const limit = Number.isInteger(msg.limit) && msg.limit > 0 ? msg.limit : 200;
+          const older = allEvents.filter((e) => e.seq < msg.beforeSeq).slice(-limit);
+          const hasMore = allEvents.some((e) => e.seq < (older[0]?.seq ?? msg.beforeSeq));
+          post({
+            t: "historyMore",
+            sessionId: agent.session.id,
+            events: older,
+            hasMore,
+            nextSeq: hasMore && older.length > 0 ? older[0].seq : void 0
+          });
+          break;
+        }
+        case "deleteSession": {
+          const result = await deleteSession(ctx, msg.id);
+          if (result.ok && agent !== void 0 && agent.session.id === msg.id) {
+            if (handle !== void 0) await handle.dispose();
+            handle = void 0;
+            agent = void 0;
+            selection = null;
+            resetStepBudget = null;
             post({
               t: "ready",
               sessionId: "",
@@ -7685,237 +7878,172 @@ async function main() {
               model: env.DSH_VSCODE_MODEL ?? "",
               version: CORE_VERSION
             });
-            break;
           }
-          case "listSessions": {
-            try {
-              const list = await listSessions(ctx);
-              post({ t: "sessions", list });
-            } catch (error) {
-              log("error", "listSessions failed", error instanceof Error ? error.message : String(error));
-              post({ t: "sessions", list: [], error: error instanceof Error ? error.message : String(error) });
-            }
-            break;
-          }
-          case "resumeSession": {
-            if (typeof msg.id !== "string" || msg.id.trim() === "") {
-              post({ t: "sessionResumed", id: msg.id, ok: false, error: "invalid session id" });
+          post({ t: "sessionDeleted", id: msg.id, ok: result.ok, error: result.error });
+          break;
+        }
+        case "exportSession": {
+          const result = await exportSession(ctx, msg.id);
+          post({ t: "sessionExported", id: msg.id, ok: result.ok, path: result.path, error: result.error });
+          break;
+        }
+        case "setModel": {
+          try {
+            const defaultModel = ctx.get("agentDefaultModel");
+            if (defaultModel === void 0) {
+              post({ t: "modelChanged", provider: "", model: "", error: "agentDefaultModel unavailable" });
               break;
             }
-            if (handle !== void 0) await handle.dispose();
-            const resumed = await resumeAgent(
-              ctx,
-              msg.id,
-              { model: msg.model ?? env.DSH_VSCODE_MODEL },
-              pump,
-              approvals
-            );
-            handle = resumed.handle;
-            agent = resumed.agent;
-            selection = resumed.selection;
-            const allEvents = agent.session.events.filter(
-              (e) => e.type !== "assistant/chunk" && e.type !== "session/end-seed"
-            );
-            const limit = Number.isInteger(msg.limit) && msg.limit > 0 ? msg.limit : 200;
-            const tail = allEvents.slice(-limit);
-            const hasMore = allEvents.length > tail.length;
-            const nextSeq = hasMore ? tail[0].seq : void 0;
-            const stats = computeSessionStats(allEvents);
-            post({ t: "history", sessionId: agent.session.id, events: tail, hasMore, nextSeq, stats });
-            post({
-              t: "ready",
-              sessionId: agent.session.id,
-              cwd: process.cwd(),
-              provider: agent.options.provider,
-              model: agent.options.model,
-              version: CORE_VERSION,
-              sessionTitle: await currentSessionTitle(ctx, agent)
-            });
-            post({ t: "sessionResumed", id: msg.id, ok: true });
-            break;
-          }
-          case "loadMoreHistory": {
-            if (agent === void 0 || !Number.isFinite(msg.beforeSeq)) {
-              post({ t: "historyMore", sessionId: "", events: [], hasMore: false });
-              break;
+            const base = defaultModel.currentSelection();
+            const provider = typeof msg.provider === "string" && msg.provider !== "" ? msg.provider : base.provider;
+            const model = typeof msg.model === "string" && msg.model !== "" ? msg.model : base.model;
+            const baseEffort = normalizeEffort(base.reasoningEffort);
+            const reasoningEffort = normalizeEffort(typeof msg.reasoningEffort === "string" ? msg.reasoningEffort : "") ?? baseEffort;
+            const next = { provider, model, reasoningEffort };
+            await defaultModel.saveSelection(next);
+            if (selection !== null) {
+              selection.provider = provider;
+              selection.model = model;
+              selection.reasoningEffort = reasoningEffort;
             }
-            const allEvents = agent.session.events.filter(
-              (e) => e.type !== "assistant/chunk" && e.type !== "session/end-seed"
-            );
-            const limit = Number.isInteger(msg.limit) && msg.limit > 0 ? msg.limit : 200;
-            const older = allEvents.filter((e) => e.seq < msg.beforeSeq).slice(-limit);
-            const hasMore = allEvents.some((e) => e.seq < (older[0]?.seq ?? msg.beforeSeq));
-            post({
-              t: "historyMore",
-              sessionId: agent.session.id,
-              events: older,
-              hasMore,
-              nextSeq: hasMore && older.length > 0 ? older[0].seq : void 0
-            });
-            break;
+            log("info", `model selection \u2192 ${provider}/${model}${reasoningEffort ? ` (effort=${reasoningEffort})` : ""}`);
+            post({ t: "modelChanged", provider, model, reasoningEffort });
+          } catch (error) {
+            log("error", "setModel failed", error instanceof Error ? error.message : String(error));
+            post({ t: "modelChanged", provider: "", model: "", error: error instanceof Error ? error.message : String(error) });
           }
-          case "deleteSession": {
-            const result = await deleteSession(ctx, msg.id);
-            if (result.ok && agent !== void 0 && agent.session.id === msg.id) {
-              if (handle !== void 0) await handle.dispose();
-              handle = void 0;
-              agent = void 0;
-              selection = null;
-              post({
-                t: "ready",
-                sessionId: "",
-                cwd: process.cwd(),
-                provider: "",
-                model: env.DSH_VSCODE_MODEL ?? "",
-                version: CORE_VERSION
-              });
+          break;
+        }
+        case "setWorkMode": {
+          const mode = msg.mode === "multi" ? "multi" : "single";
+          workMode = mode;
+          log("info", `work mode \u2192 ${mode}`);
+          post({ t: "workModeChanged", mode });
+          break;
+        }
+        case "getModelInfo": {
+          try {
+            const llm = ctx.get("llm");
+            const defaultModel = ctx.get("agentDefaultModel");
+            let providers = [];
+            if (llm !== void 0 && typeof llm.listProviders === "function") {
+              providers = llm.listProviders().map((p) => ({ id: p.id, name: p.name ?? p.id }));
             }
-            post({ t: "sessionDeleted", id: msg.id, ok: result.ok, error: result.error });
-            break;
-          }
-          case "exportSession": {
-            const result = await exportSession(ctx, msg.id);
-            post({ t: "sessionExported", id: msg.id, ok: result.ok, path: result.path, error: result.error });
-            break;
-          }
-          case "setModel": {
-            try {
-              const defaultModel = ctx.get("agentDefaultModel");
-              if (defaultModel === void 0) {
-                post({ t: "modelChanged", provider: "", model: "", error: "agentDefaultModel unavailable" });
-                break;
+            let models = [];
+            if (llm !== void 0 && typeof llm.listModels === "function" && providers.length > 0) {
+              try {
+                const listed = await llm.listModels(providers[0].id);
+                models = listed.map((m) => m.id);
+              } catch {
+                models = [];
               }
-              const base = defaultModel.currentSelection();
-              const provider = typeof msg.provider === "string" && msg.provider !== "" ? msg.provider : base.provider;
-              const model = typeof msg.model === "string" && msg.model !== "" ? msg.model : base.model;
-              const reasoningEffort = typeof msg.reasoningEffort === "string" && msg.reasoningEffort !== "" ? msg.reasoningEffort : base.reasoningEffort;
-              const next = { provider, model, reasoningEffort };
-              await defaultModel.saveSelection(next);
-              if (selection !== null) {
-                selection.provider = provider;
-                selection.model = model;
-                selection.reasoningEffort = reasoningEffort;
-              }
-              log("info", `model selection \u2192 ${provider}/${model}${reasoningEffort ? ` (effort=${reasoningEffort})` : ""}`);
-              post({ t: "modelChanged", provider, model, reasoningEffort });
-            } catch (error) {
-              log("error", "setModel failed", error instanceof Error ? error.message : String(error));
-              post({ t: "modelChanged", provider: "", model: "", error: error instanceof Error ? error.message : String(error) });
             }
-            break;
-          }
-          case "setWorkMode": {
-            const mode = msg.mode === "multi" ? "multi" : "single";
-            workMode = mode;
-            log("info", `work mode \u2192 ${mode}`);
-            post({ t: "workModeChanged", mode });
-            break;
-          }
-          case "getModelInfo": {
-            try {
-              const llm = ctx.get("llm");
-              const defaultModel = ctx.get("agentDefaultModel");
-              let providers = [];
-              if (llm !== void 0 && typeof llm.listProviders === "function") {
-                providers = llm.listProviders().map((p) => ({ id: p.id, name: p.name ?? p.id }));
-              }
-              let models = [];
-              if (llm !== void 0 && typeof llm.listModels === "function" && providers.length > 0) {
-                try {
-                  const listed = await llm.listModels(providers[0].id);
-                  models = listed.map((m) => m.id);
-                } catch {
-                  models = [];
-                }
-              }
-              if (models.length === 0) {
-                const cur = defaultModel?.currentSelection?.();
-                const extra2 = /* @__PURE__ */ new Set(["deepseek-chat", "deepseek-reasoner", "deepseek-v4-flash", "deepseek-v4-pro"]);
-                if (cur?.model) extra2.add(cur.model);
-                models = [...extra2];
-              }
-              const current = defaultModel?.currentSelection?.() ?? { provider: "", model: "" };
-              let supportedEfforts;
-              if (llm !== void 0 && typeof llm.resolveModel === "function" && current.provider && current.model) {
-                try {
-                  const resolved = await llm.resolveModel(current.provider, current.model, void 0);
-                  const efforts = resolved?.reasoning?.efforts;
-                  if (Array.isArray(efforts)) {
-                    supportedEfforts = efforts.map((e) => typeof e === "string" ? e : e?.id).filter(Boolean);
+            if (models.length === 0) {
+              const cur = defaultModel?.currentSelection?.();
+              const extra2 = /* @__PURE__ */ new Set(["deepseek-v4-flash", "deepseek-v4-pro"]);
+              if (cur?.model) extra2.add(cur.model);
+              models = [...extra2];
+            }
+            const current = defaultModel?.currentSelection?.() ?? { provider: "", model: "" };
+            let supportedEfforts = ["off", "low", "high", "max"];
+            let defaultEffort = "high";
+            if (llm !== void 0 && typeof llm.resolveModelInfo === "function" && current.provider && current.model) {
+              try {
+                const resolved = await llm.resolveModelInfo(current.provider, current.model, void 0);
+                const efforts = resolved?.reasoning?.efforts;
+                if (Array.isArray(efforts)) {
+                  supportedEfforts = ["off", "low", "high", "max"];
+                  const kernelEfforts = efforts.map((e) => typeof e === "string" ? e : e?.id).filter(Boolean);
+                  log("info", `model ${current.provider}/${current.model} kernel reasoning efforts: ${kernelEfforts.join(", ")}`);
+                  if (typeof resolved?.reasoning?.defaultEffort === "string" && resolved.reasoning.defaultEffort !== "") {
+                    defaultEffort = normalizeEffort(resolved.reasoning.defaultEffort) ?? "high";
                   }
-                } catch {
-                  supportedEfforts = void 0;
                 }
+              } catch (error) {
+                log("warn", "resolveModelInfo failed, fallback to 4-level effort list", error instanceof Error ? error.message : String(error));
               }
+            }
+            post({
+              t: "modelInfo",
+              providers,
+              models,
+              current: {
+                provider: current.provider,
+                model: current.model,
+                reasoningEffort: normalizeEffort(current.reasoningEffort),
+                supportedEfforts,
+                defaultEffort
+              }
+            });
+          } catch (error) {
+            log("error", "getModelInfo failed", error instanceof Error ? error.message : String(error));
+            post({
+              t: "modelInfo",
+              providers: [],
+              models: [],
+              current: { provider: "", model: env.DSH_VSCODE_MODEL ?? "" }
+            });
+          }
+          break;
+        }
+        case "compact": {
+          try {
+            const compaction = ctx.get("compaction");
+            if (compaction === void 0) {
+              post({ t: "compactDone", id: msg.id, ok: false, error: "compaction service unavailable" });
+              break;
+            }
+            if (agent === void 0) {
+              post({ t: "compactDone", id: msg.id, ok: false, error: "no active session yet" });
+              break;
+            }
+            const signal = new AbortController().signal;
+            const result = await compaction.compactNow(agent, signal);
+            if (result === null) {
+              post({ t: "compactDone", id: msg.id, ok: true, text: "No compactable history yet." });
+            } else {
               post({
-                t: "modelInfo",
-                providers,
-                models,
-                current: {
-                  provider: current.provider,
-                  model: current.model,
-                  reasoningEffort: current.reasoningEffort,
-                  supportedEfforts
+                t: "compactDone",
+                id: msg.id,
+                ok: true,
+                text: `Compacted ${result.shadowedSeqs.length} history items (~${result.shadowedTokenCount} tokens).`
+              });
+              try {
+                const allEvents = agent.session.events.filter(
+                  (e) => e.type !== "assistant/chunk" && e.type !== "session/end-seed"
+                );
+                const stats = computeSessionStats(allEvents);
+                if (Number.isFinite(stats.lastRequestInput) && stats.lastRequestInput > 0 && result.shadowedTokenCount > 0) {
+                  stats.lastRequestInput = Math.max(0, stats.lastRequestInput - result.shadowedTokenCount);
                 }
-              });
-            } catch (error) {
-              log("error", "getModelInfo failed", error instanceof Error ? error.message : String(error));
-              post({
-                t: "modelInfo",
-                providers: [],
-                models: [],
-                current: { provider: "", model: env.DSH_VSCODE_MODEL ?? "" }
-              });
+                post({ t: "stats", stats });
+              } catch (error) {
+                log("warn", "compact stats refresh failed", error instanceof Error ? error.message : String(error));
+              }
             }
-            break;
+          } catch (error) {
+            log("warn", "compact failed", error instanceof Error ? error.message : String(error));
+            post({ t: "compactDone", id: msg.id, ok: false, error: error instanceof Error ? error.message : String(error) });
           }
-          case "compact": {
-            try {
-              const compaction = ctx.get("compaction");
-              if (compaction === void 0) {
-                post({ t: "compactDone", id: msg.id, ok: false, error: "compaction service unavailable" });
-                break;
-              }
-              if (agent === void 0) {
-                post({ t: "compactDone", id: msg.id, ok: false, error: "no active session yet" });
-                break;
-              }
-              const signal = new AbortController().signal;
-              const result = await compaction.compactNow(agent, signal);
-              if (result === null) {
-                post({ t: "compactDone", id: msg.id, ok: true, text: "No compactable history yet." });
-              } else {
-                post({
-                  t: "compactDone",
-                  id: msg.id,
-                  ok: true,
-                  text: `Compacted ${result.shadowedSeqs.length} history items (~${result.shadowedTokenCount} tokens).`
-                });
-              }
-            } catch (error) {
-              log("warn", "compact failed", error instanceof Error ? error.message : String(error));
-              post({ t: "compactDone", id: msg.id, ok: false, error: error instanceof Error ? error.message : String(error) });
-            }
-            break;
-          }
-          case "shutdown": {
-            await shutdown(0);
-            break;
-          }
-          default:
-            log("warn", "unknown frame type", msg.t);
+          break;
         }
-      } catch (error) {
-        log("error", "frame handling failed", error instanceof Error ? error.stack ?? error.message : String(error));
-        const message = error instanceof Error ? error.message : String(error);
-        if (msg.t === "resumeSession") {
-          post({ t: "sessionResumed", id: msg.id, ok: false, error: message });
-        } else if (msg.id !== void 0) {
-          post({ t: "chatDone", id: msg.id, ok: false, error: message });
+        case "shutdown": {
+          await shutdown(0);
+          break;
         }
+        default:
+          log("warn", "unknown frame type", msg.t);
       }
-    })();
-  });
+    } catch (error) {
+      log("error", "frame handling failed", error instanceof Error ? error.stack ?? error.message : String(error));
+      const message = error instanceof Error ? error.message : String(error);
+      if (msg.t === "resumeSession") {
+        post({ t: "sessionResumed", id: msg.id, ok: false, error: message });
+      } else if (msg.id !== void 0) {
+        post({ t: "chatDone", id: msg.id, ok: false, error: message });
+      }
+    }
+  }
   rl.on("close", () => void shutdown(0));
 }
 main().catch((error) => {
