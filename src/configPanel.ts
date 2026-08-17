@@ -88,29 +88,34 @@ export function openConfigPanel(context: vscode.ExtensionContext, deps: ConfigPa
   const styleUri = panel.webview.asWebviewUri(vscode.Uri.joinPath(context.extensionUri, "media", "config-panel.css"));
   panel.webview.html = renderHtml(panel.webview, scriptUri, styleUri, zh);
 
+  /** 向面板推送当前配置快照（init 与保存成功后复用，保证 keyConfigured 等状态始终新鲜）。 */
+  const sendConfig = async () => {
+    const c = deps.readConfig();
+    const secretKey = await context.secrets.get(SECRET_KEY);
+    const cfg = vscode.workspace.getConfiguration(CONFIG_NS);
+    panel.webview.postMessage({
+      t: "config",
+      config: {
+        keyConfigured: Boolean(c.apiKey ?? secretKey),
+        model: c.model,
+        baseUrl: c.baseUrl ?? "",
+        permissionMode: c.permissionMode,
+        nodePath: c.nodePath,
+        defaultWorkspace: cfg.get<string>("defaultWorkspace") ?? "",
+        maxOutputChars: cfg.get<number>("maxOutputChars") ?? 40000,
+        maxSteps: cfg.get<number>("maxSteps") ?? 100,
+        subagentMaxDepth: cfg.get<number>("subagentMaxDepth") ?? 3,
+        maxParallelSubagents: cfg.get<number>("maxParallelSubagents") ?? 5,
+        cwd: deps.workspaceRoot(),
+      },
+      providers: PROVIDER_PRESETS,
+    });
+  };
+
   panel.webview.onDidReceiveMessage(async (msg) => {
     switch (msg.t) {
       case "init": {
-        const c = deps.readConfig();
-        const secretKey = await context.secrets.get(SECRET_KEY);
-        const cfg = vscode.workspace.getConfiguration(CONFIG_NS);
-        panel.webview.postMessage({
-          t: "config",
-          config: {
-            keyConfigured: Boolean(c.apiKey ?? secretKey),
-            model: c.model,
-            baseUrl: c.baseUrl ?? "",
-            permissionMode: c.permissionMode,
-            nodePath: c.nodePath,
-            defaultWorkspace: cfg.get<string>("defaultWorkspace") ?? "",
-            maxOutputChars: cfg.get<number>("maxOutputChars") ?? 40000,
-            maxSteps: cfg.get<number>("maxSteps") ?? 100,
-            subagentMaxDepth: cfg.get<number>("subagentMaxDepth") ?? 3,
-            maxParallelSubagents: cfg.get<number>("maxParallelSubagents") ?? 5,
-            cwd: deps.workspaceRoot(),
-          },
-          providers: PROVIDER_PRESETS,
-        });
+        await sendConfig();
         break;
       }
       case "pickFolder": {
@@ -183,6 +188,8 @@ export function openConfigPanel(context: vscode.ExtensionContext, deps: ConfigPa
             ok: true,
             message: zh ? "配置已保存，将在下次使用时生效" : "Settings saved; effective on next use",
           });
+          // 刷新面板状态：API Key 提示（keyConfigured）与各字段回显保存后的真实值
+          await sendConfig();
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
           // 保存失败：同样走 VS Code 状态栏提示（不弹任何通知/弹框）

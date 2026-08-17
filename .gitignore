@@ -17,3 +17,6 @@ Thumbs.db
 
 # ---- 误创建目录 ----
 --dry-run/
+
+# ---- 跨平台原生二进制缓存（Linux 编译产物，一次性放入；绝不提交）----
+scripts/.natives/

@@ -255,6 +255,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           this.push({ t: "status", status: this.lastStatus });
           void this.pushConfig();
           this.pushHostState();
+          // 补拉 provider/model 目录：宿主可能早于 webview 就绪（远端更常见），
+          // 早到的 modelInfo 帧会因 webview 尚未加载而丢失，导致模型下拉为空。
+          // 就绪时重新请求保证目录必达（幂等；重复帧由前端重渲染，无害）。
+          this.host?.getModelInfo();
           // Reload 窗口/首次激活场景：存在持久化的会话 id，且宿主当前无会话
           // （不是 webview 重建但宿主仍持有会话的场景）→ 提前锁定发送，
           // 等宿主 ready 后自动恢复原会话，不默认停在"新会话"

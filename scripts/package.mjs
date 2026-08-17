@@ -23,6 +23,9 @@ function main() {
   // 1. 构建（确保产物最新）
   run(process.execPath, [join(root, "scripts", "build.mjs")], { cwd: root });
 
+  // 1.5 跨平台原生二进制就位（koffi 平台包 / node-pty linux prebuild）——缺失则报错
+  run(process.execPath, [join(root, "scripts", "prepare-natives.mjs")], { cwd: root });
+
   // 2. vsce 打包：直接以 node 运行 vsce 的 JS 入口（避免 Windows .cmd shim 问题）。
   //    打包包含 node_modules 中的全部生产依赖（DSH 内核运行时）。
   const vsceEntry = join(root, "node_modules", "@vscode", "vsce", "vsce");
