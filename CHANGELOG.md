@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.1] - 2026-08-17
+
+- cross-platform native packaging (one VSIX for win32/linux/darwin)
+- config panel refreshes after save (API key hint)
+- modelInfo re-pulled on webview ready (fixes empty model dropdown)
+- step-limit log noise removed
+
 Maintained by scripts/bump-version.mjs (appends a version entry before each release).
 
 ## [0.2.0] - 2026-08-16

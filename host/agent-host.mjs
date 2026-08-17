@@ -25,7 +25,7 @@ import { SessionId } from "@deepseek-ai/dsh-session";
 import { installModelSelection } from "@deepseek-ai/dsh-agent";
 
 const NAME = "dsh-vscode-host";
-const CORE_VERSION = "0.2.0";
+const CORE_VERSION = "0.2.1";
 /** 插件会话 id 前缀（也是会话隔离的标识）。 */
 const SESSION_PREFIX = "dsh-vscode-";
 
@@ -473,8 +473,6 @@ function attachAgent(ctx, handle, pump) {
   let stepLimitHit = false;
   /** 消息层收尾指令是否已注入（每轮最多注入一次，避免刷屏）。 */
   let wrapUpInjected = false;
-  /** 单轮内"stepLimit 已注入系统提示"日志是否已打印（每轮只打印一次）。 */
-  let stepNoticeLogged = false;
   /** 上次打印过的实际思考级别（仅在变化时打印，避免每步刷屏）。 */
   let lastLoggedEffort;
 
@@ -483,7 +481,6 @@ function attachAgent(ctx, handle, pump) {
     stepCount = 0;
     stepLimitHit = false;
     wrapUpInjected = false;
-    stepNoticeLogged = false;
   };
 
   // 会话事件 → 扩展（scope-filtered：仅本 agent 的会话）
@@ -510,11 +507,7 @@ function attachAgent(ctx, handle, pump) {
     // 语言一致性指令：每轮注入（思考/输出语言跟随界面语言，见 languageDirectiveSection）
     sections.push(languageDirectiveSection());
     if (stepLimit > 0) {
-      // step 控制相关日志仅此一条：注入系统提示时打印，每轮一次（stepNoticeLogged）
-      if (!stepNoticeLogged) {
-        stepNoticeLogged = true;
-        log("info", L(`单轮最大对话次数限制（stepLimit=${stepLimit}）已注入系统提示词`, `Per-turn step limit (stepLimit=${stepLimit}) injected into the system prompt`));
-      }
+      // 注入单轮步数预算约束（不打印日志：运行成熟后该信息属无意义刷屏）
       sections.push(stepLimitSystemSection(stepLimit));
     }
     return { ...assembled, sections };
@@ -1366,8 +1359,6 @@ async function main() {
                   const efforts = resolved?.reasoning?.efforts;
                   if (Array.isArray(efforts)) {
                     supportedEfforts = ["off", "low", "high", "max"]; // 插件语义层固定四档（见上）
-                    const kernelEfforts = efforts.map((e) => (typeof e === "string" ? e : e?.id)).filter(Boolean);
-                    log("info", `model ${current.provider}/${current.model} kernel reasoning efforts: ${kernelEfforts.join(", ")}`);
                     if (typeof resolved?.reasoning?.defaultEffort === "string" && resolved.reasoning.defaultEffort !== "") {
                       defaultEffort = normalizeEffort(resolved.reasoning.defaultEffort) ?? "high";
                     }

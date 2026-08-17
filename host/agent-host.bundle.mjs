@@ -7031,7 +7031,7 @@ function installModelSelection(agentCtx, selection) {
 
 // host/agent-host.mjs
 var NAME = "dsh-vscode-host";
-var CORE_VERSION = "0.2.0";
+var CORE_VERSION = "0.2.1";
 var SESSION_PREFIX = "dsh-vscode-";
 var workMode = "single";
 var getWorkMode = () => workMode;
@@ -7271,13 +7271,11 @@ function attachAgent(ctx, handle, pump) {
   let stepCount = 0;
   let stepLimitHit = false;
   let wrapUpInjected = false;
-  let stepNoticeLogged = false;
   let lastLoggedEffort;
   const resetStepBudget = () => {
     stepCount = 0;
     stepLimitHit = false;
     wrapUpInjected = false;
-    stepNoticeLogged = false;
   };
   agent.ctx.on("session/event", (_session, event) => {
     if (event.type === "step/start") {
@@ -7294,10 +7292,6 @@ function attachAgent(ctx, handle, pump) {
     const sections = [...assembled.sections ?? []];
     sections.push(languageDirectiveSection());
     if (stepLimit > 0) {
-      if (!stepNoticeLogged) {
-        stepNoticeLogged = true;
-        log("info", L(`\u5355\u8F6E\u6700\u5927\u5BF9\u8BDD\u6B21\u6570\u9650\u5236\uFF08stepLimit=${stepLimit}\uFF09\u5DF2\u6CE8\u5165\u7CFB\u7EDF\u63D0\u793A\u8BCD`, `Per-turn step limit (stepLimit=${stepLimit}) injected into the system prompt`));
-      }
       sections.push(stepLimitSystemSection(stepLimit));
     }
     return { ...assembled, sections };
@@ -7993,8 +7987,6 @@ async function main() {
                 const efforts = resolved?.reasoning?.efforts;
                 if (Array.isArray(efforts)) {
                   supportedEfforts = ["off", "low", "high", "max"];
-                  const kernelEfforts = efforts.map((e) => typeof e === "string" ? e : e?.id).filter(Boolean);
-                  log("info", `model ${current.provider}/${current.model} kernel reasoning efforts: ${kernelEfforts.join(", ")}`);
                   if (typeof resolved?.reasoning?.defaultEffort === "string" && resolved.reasoning.defaultEffort !== "") {
                     defaultEffort = normalizeEffort(resolved.reasoning.defaultEffort) ?? "high";
                   }
