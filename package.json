@@ -1,9 +1,9 @@
 {
   "name": "ay-dsh-vscode",
   "displayName": "ay-dsh-vscode",
-  "description": "Kilo Code 风格的 AI 编码智能体，内核由 DeepSeek Harness (DSH) 驱动：多智能体编排、长时目标任务、工具透明化、沙箱审批。",
+  "description": "AI coding agent powered by DeepSeek Harness (DSH): multi-agent orchestration, long-running goal tasks, transparent tool usage, sandboxed approvals — in a Kilo Code style chat.",
   "version": "0.2.0",
-  "publisher": "deepseek-harness",
+  "publisher": "kele688",
   "license": "MIT",
   "icon": "media/icon.png",
   "repository": {
@@ -51,7 +51,7 @@
         {
           "id": "dshVscode",
           "title": "ay-dsh-vscode",
-          "icon": "media/icon.svg"
+          "icon": "media/icon.png"
         }
       ]
     },
@@ -61,7 +61,7 @@
           "id": "dshVscode.chatView",
           "name": "ay-dsh-vscode",
           "type": "webview",
-          "icon": "media/icon.svg"
+          "icon": "media/icon.png"
         }
       ]
     },

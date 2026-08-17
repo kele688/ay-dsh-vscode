@@ -100,7 +100,7 @@ code --install-extension release\ay-dsh-vscode.vsix --force
 
 | 内容 | 位置 |
 | --- | --- |
-| 会话历史 | `%APPDATA%/Code/User/globalStorage/deepseek-harness.ay-dsh-vscode/dsh-home/sessions-ay-dsh/` |
+| 会话历史 | `%APPDATA%/Code/User/globalStorage/kele688.ay-dsh-vscode/dsh-home/sessions-ay-dsh/` |
 | API Key | VS Code 密钥库（随扩展隔离） |
 | 设置 | VS Code `settings.json`（`dshVscode.*`） |
 | 官方 dsh 数据 | 完全不触碰 `~/.dsh` |
@@ -137,6 +137,11 @@ npm run package        # 打包 VSIX
 ```
 
 贡献指南见 [CONTRIBUTING](docs/CONTRIBUTING.md)（英文）。
+
+## 反馈与支持
+
+发现 bug 或有功能建议？欢迎在
+[GitHub Issues](https://github.com/kele688/ay-dsh-vscode/issues) 提交反馈。
 
 ## License
 
