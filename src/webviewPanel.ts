@@ -502,19 +502,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         this.push({ t: "compactDone", ok: e.ok, text: e.text, error: e.error });
         break;
       case "stepLimit":
-        // 最大思考轮次兜底触发：宿主不硬截停，而是已引导 Agent 收尾总结；
-        // 此处提示用户任务达到上限，可继续输入指令推进（会话与历史不受影响）
-        this.push({
-          t: "event",
-          e: {
-            kind: "error",
-            text: loc(
-              `已达最大思考轮次（${e.maxSteps} 次），Agent 正在收尾总结。任务若未完成，可继续输入指令推进。`,
-              `Maximum thinking steps reached (${e.maxSteps}); the agent is wrapping up. Keep typing to continue if the task is not done.`
-            ),
-            ts: Date.now(),
-          },
-        });
+        // 最大思考轮次兜底触发：宿主不硬截停，而是已引导 Agent 收尾总结。
+        // 不在对话列表插入红色错误气泡（突兀），改为状态栏简短提示：
+        // 提示用户任务达到上限、可继续输入指令推进（会话与历史不受影响）。
+        vscode.window.setStatusBarMessage(
+          loc(`已达思考上限（${e.maxSteps} 步），Agent 已收尾总结`, `Step limit reached (${e.maxSteps}); agent wrapped up`),
+          10000
+        );
         break;
       case "sessionResumed":
         // 恢复结果通过 history + ready 帧呈现；失败时提示，并清空持久化的会话

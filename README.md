@@ -100,7 +100,7 @@ Open the panel and click the **⚙ gear** (or run `DSH: Configure`) for the grap
 
 | Item | Location |
 | --- | --- |
-| Session history | `%APPDATA%/Code/User/globalStorage/deepseek-harness.ay-dsh-vscode/dsh-home/sessions-ay-dsh/` |
+| Session history | `%APPDATA%/Code/User/globalStorage/kele688.ay-dsh-vscode/dsh-home/sessions-ay-dsh/` |
 | API Key | VS Code SecretStorage (per-extension) |
 | Settings | VS Code `settings.json` (`dshVscode.*`) |
 | Official dsh data | untouched — plugin never reads/writes `~/.dsh` |
@@ -136,16 +136,12 @@ npm run watch          # incremental build
 npm run package        # VSIX
 ```
 
-## Publishing this repository
-
-One-command local init + commit (+ optional push):
-
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts\publish.ps1 `
-  -Remote https://github.com/<your-account>/ay-dsh-vscode.git
-```
-
 See [CONTRIBUTING](docs/CONTRIBUTING.md) for contribution guidelines.
+
+## Feedback & Support
+
+Found a bug or have a feature request? Open an issue on
+[GitHub Issues](https://github.com/kele688/ay-dsh-vscode/issues).
 
 ## License
 

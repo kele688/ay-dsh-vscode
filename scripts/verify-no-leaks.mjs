@@ -15,8 +15,7 @@ import { join } from "node:path";
 
 /* ------------------------------------------------------------------ */
 /* Sensitive patterns. Keywords are assembled at runtime so this very  */
-/* script (and publish.ps1, which shares the defensive vocabulary)     */
-/* never triggers its own scan.                                        */
+/* script never triggers its own scan.                                 */
 /* ------------------------------------------------------------------ */
 const W = (...parts) => parts.join("");
 const RE = (src) => new RegExp(src);
@@ -53,7 +52,6 @@ const USER_IN_REPO_URL = new RegExp(W("github\\.com/", "kele", "688"), "g");
 /* Defense scripts legitimately contain the keywords above. */
 const SELF_EXEMPT = new Set([
   "scripts/verify-no-leaks.mjs",
-  "scripts/publish.ps1",
 ]);
 
 /* ------------------------------------------------------------------ */

@@ -7031,7 +7031,7 @@ function installModelSelection(agentCtx, selection) {
 
 // host/agent-host.mjs
 var NAME = "dsh-vscode-host";
-var CORE_VERSION = "0.1.0";
+var CORE_VERSION = "0.2.0";
 var SESSION_PREFIX = "dsh-vscode-";
 var workMode = "single";
 var getWorkMode = () => workMode;
@@ -7228,14 +7228,41 @@ function normalizeEffort(value) {
   if (value === "low") return "high";
   return void 0;
 }
+var UI_LANG = process.env.DSH_LOCALE === "zh" ? "zh" : "en";
+var L = (zh, en) => UI_LANG === "zh" ? zh : en;
+var userEffortChanged = false;
+function languageDirectiveSection() {
+  if (UI_LANG === "zh") {
+    return {
+      name: "language",
+      text: "\u8BF7\u59CB\u7EC8\u4F7F\u7528\u7B80\u4F53\u4E2D\u6587\u56DE\u590D\u7528\u6237\uFF0C\u601D\u8003\u8FC7\u7A0B\uFF08reasoning\uFF09\u540C\u6837\u4F7F\u7528\u7B80\u4F53\u4E2D\u6587\u3002\u9664\u975E\u7528\u6237\u660E\u786E\u8981\u6C42\u4F7F\u7528\u5176\u4ED6\u8BED\u8A00\u3002"
+    };
+  }
+  return {
+    name: "language",
+    text: "Always reply in English, including your reasoning. Use English unless the user explicitly asks for another language."
+  };
+}
 function stepLimitSystemSection(limit) {
+  if (UI_LANG === "zh") {
+    return {
+      name: "step-limit",
+      text: `\u6BCF\u8F6E\u5BF9\u8BDD\uFF08\u4E00\u6761\u7528\u6237\u6D88\u606F\uFF09\u7684\u601D\u8003\u6B65\u6570\u9884\u7B97\u4E3A ${limit} \u6B65\uFF0C\u8BF7\u5728\u6B64\u9884\u7B97\u5185\u89C4\u5212\u5DE5\u4F5C\u8282\u594F\u3002\u9884\u7B97\u7528\u5C3D\u540E\uFF0C\u5DE5\u5177\u8C03\u7528\u5C06\u88AB\u7981\u7528\uFF0C\u4F60\u5FC5\u987B\u7ACB\u5373\u6536\u5C3E\uFF1A\u505C\u6B62\u6240\u6709\u65B0\u7684\u5DE5\u5177\u8C03\u7528\u4E0E\u63A8\u7406\uFF0C\u5728\u56DE\u590D\u4E2D\u7ED9\u51FA\u7B80\u6D01\u7684\u6700\u7EC8\u7B54\u590D\uFF0C\u8BF4\u660E\u5DF2\u5B8C\u6210\u4E8B\u9879\u3001\u672A\u5B8C\u6210\u4E8B\u9879\uFF0C\u4EE5\u53CA\u7528\u6237\u4E0B\u4E00\u6B65\u5E94\u53D1\u9001\u7684\u547D\u4EE4\u3002\u9884\u7B97\u8017\u5C3D\u540E\u8BF7\u52FF\u7EE7\u7EED\u5DE5\u4F5C\u3002`
+    };
+  }
   return {
     name: "step-limit",
     text: `Each turn (one user message) has a thinking-step budget of ${limit} model steps. Plan your work to finish within this budget. When the budget is reached, tool calls are disabled and you must wrap up immediately: stop all new tool calls and reasoning, and deliver a concise final answer covering what was accomplished, what remains unfinished, and the next command the user should send. Do not continue working beyond the budget.`
   };
 }
+function stepLimitDenyReason(count, limit) {
+  return UI_LANG === "zh" ? `\u5DE5\u5177\u8C03\u7528\u5DF2\u7981\u7528\u2014\u2014\u672C\u8F6E\u5DF2\u8FBE\u601D\u8003\u6B65\u6570\u4E0A\u9650\uFF08${count}/${limit}\uFF09\u3002\u8BF7\u7ACB\u5373\u505C\u6B62\u5DE5\u4F5C\u5E76\u7ED9\u51FA\u6700\u7EC8\u7B54\u590D\u3002` : `Tool calls are disabled \u2014 this turn reached its step limit (${count}/${limit}). Stop working and deliver your final summary now.`;
+}
 function stepLimitWrapUpMessage(limit, steps) {
-  return `[System notice] Step limit reached: ${steps}/${limit} steps used \u2014 this turn's thinking budget is exhausted and all tool calls are now disabled. The per-turn step limit keeps each request bounded and prevents runaway tool loops, so continuing further work is not permitted. Stop further reasoning and deliver your final answer in this reply: what was accomplished, what remains unfinished, and the next command the user should send. Do not continue working after this reply. Thank you for wrapping up cleanly.`;
+  if (UI_LANG === "zh") {
+    return `[\u81EA\u52A8\u63D0\u793A] \u672C\u8F6E\u601D\u8003\u6B65\u6570\u5DF2\u8FBE\u4E0A\u9650\uFF08${steps}/${limit}\uFF09\uFF0C\u6240\u6709\u5DE5\u5177\u8C03\u7528\u5DF2\u88AB\u7981\u7528\u3002\u5355\u8F6E\u6B65\u6570\u4E0A\u9650\u7528\u4E8E\u63A7\u5236\u5355\u6B21\u8BF7\u6C42\u89C4\u6A21\u3001\u9632\u6B62\u5DE5\u5177\u5FAA\u73AF\u5931\u63A7\uFF0C\u56E0\u6B64\u672C\u8F6E\u5DE5\u4F5C\u5230\u6B64\u4E3A\u6B62\u3002\u8BF7\u7ACB\u5373\u505C\u6B62\u8FDB\u4E00\u6B65\u63A8\u7406\uFF0C\u5728\u672C\u56DE\u590D\u4E2D\u7ED9\u51FA\u6700\u7EC8\u7B54\u590D\uFF1A\u5DF2\u5B8C\u6210\u4EC0\u4E48\u3001\u8FD8\u5269\u4E0B\u4EC0\u4E48\u3001\u7528\u6237\u4E0B\u4E00\u6B65\u5E94\u53D1\u9001\u7684\u547D\u4EE4\u3002\u9884\u7B97\u8017\u5C3D\u540E\u8BF7\u52FF\u7EE7\u7EED\u5DE5\u4F5C\u3002\u672C\u63D0\u793A\u7531\u7CFB\u7EDF\u81EA\u52A8\u6CE8\u5165\uFF0C\u5E76\u975E\u7528\u6237\u8F93\u5165\u3002\u8C22\u8C22\u914D\u5408\u6536\u5C3E\u3002`;
+  }
+  return `[Auto notice] Step limit reached: ${steps}/${limit} steps used \u2014 this turn's thinking budget is exhausted and all tool calls are now disabled. The per-turn step limit keeps each request bounded and prevents runaway tool loops, so continuing further work is not permitted. Stop further reasoning and deliver your final answer in this reply: what was accomplished, what remains unfinished, and the next command the user should send. Do not continue working after this reply. This notice was injected automatically and is not user input. Thank you for wrapping up cleanly.`;
 }
 function attachAgent(ctx, handle, pump) {
   const agent = handle.agent;
@@ -7244,17 +7271,19 @@ function attachAgent(ctx, handle, pump) {
   let stepCount = 0;
   let stepLimitHit = false;
   let wrapUpInjected = false;
+  let stepNoticeLogged = false;
+  let lastLoggedEffort;
   const resetStepBudget = () => {
     stepCount = 0;
     stepLimitHit = false;
     wrapUpInjected = false;
+    stepNoticeLogged = false;
   };
   agent.ctx.on("session/event", (_session, event) => {
     if (event.type === "step/start") {
       stepCount++;
       if (!stepLimitHit && stepLimit > 0 && stepCount >= stepLimit) {
         stepLimitHit = true;
-        log("warn", `step limit reached (${stepLimit}) \u2014 steering the agent to wrap up`);
         post({ t: "stepLimit", maxSteps: stepLimit, steps: stepCount });
       }
     }
@@ -7262,20 +7291,21 @@ function attachAgent(ctx, handle, pump) {
   });
   agent.ctx.on("system-prompt/assemble", async (_assembly, _context, next) => {
     const assembled = await next();
-    log("info", `assemble hook called (stepCount=${stepCount}, stepLimit=${stepLimit}, sections=${(assembled.sections ?? []).length})`);
+    const sections = [...assembled.sections ?? []];
+    sections.push(languageDirectiveSection());
     if (stepLimit > 0) {
-      return {
-        ...assembled,
-        sections: [...assembled.sections ?? [], stepLimitSystemSection(stepLimit)]
-      };
+      if (!stepNoticeLogged) {
+        stepNoticeLogged = true;
+        log("info", L(`\u5355\u8F6E\u6700\u5927\u5BF9\u8BDD\u6B21\u6570\u9650\u5236\uFF08stepLimit=${stepLimit}\uFF09\u5DF2\u6CE8\u5165\u7CFB\u7EDF\u63D0\u793A\u8BCD`, `Per-turn step limit (stepLimit=${stepLimit}) injected into the system prompt`));
+      }
+      sections.push(stepLimitSystemSection(stepLimit));
     }
-    return assembled;
+    return { ...assembled, sections };
   });
   agent.ctx.on("agent/pre-step", async (_payload, next) => {
     const decision = await next();
     if (stepLimit > 0 && stepLimitHit && !wrapUpInjected && decision.kind === "enter") {
       wrapUpInjected = true;
-      log("info", `step-limit pre-step injection (steps=${stepCount}, stepLimit=${stepLimit})`);
       return {
         ...decision,
         messages: [
@@ -7295,13 +7325,22 @@ function attachAgent(ctx, handle, pump) {
   agent.ctx.on("tools/pre-execute", async (exec, next) => {
     const gate = await next();
     if (stepLimit > 0 && stepLimitHit && gate.kind === "allow") {
-      log("info", `step-limit tool gate denied: ${exec.name} (steps=${stepCount}, stepLimit=${stepLimit})`);
       return {
         kind: "deny",
-        reason: `Tool calls are disabled \u2014 this turn reached its step limit (${stepCount}/${stepLimit}). Stop working and deliver your final summary now.`
+        reason: stepLimitDenyReason(stepCount, stepLimit)
       };
     }
     return gate;
+  });
+  agent.ctx.on("agent/request", async (_payload, next) => {
+    const request = await next();
+    const actual = request?.reasoningEffort;
+    if (actual !== lastLoggedEffort || userEffortChanged) {
+      lastLoggedEffort = actual;
+      userEffortChanged = false;
+      log("info", L(`AI \u5B9E\u9645\u601D\u8003\u7EA7\u522B: ${actual ?? "\uFF08\u672A\u6307\u5B9A\uFF09"}`, `AI actual reasoning effort: ${actual ?? "(unset)"}`));
+    }
+    return request;
   });
   agent.ctx.on("agent/status", ({ agent: a, status }) => {
     post({ t: "status", status });
@@ -7906,7 +7945,8 @@ async function main() {
               selection.model = model;
               selection.reasoningEffort = reasoningEffort;
             }
-            log("info", `model selection \u2192 ${provider}/${model}${reasoningEffort ? ` (effort=${reasoningEffort})` : ""}`);
+            userEffortChanged = true;
+            log("info", L(`\u6A21\u578B\u9009\u62E9 \u2192 ${provider}/${model}${reasoningEffort ? `\uFF08\u601D\u8003\u7EA7\u522B=${reasoningEffort}\uFF09` : ""}`, `model selection \u2192 ${provider}/${model}${reasoningEffort ? ` (effort=${reasoningEffort})` : ""}`));
             post({ t: "modelChanged", provider, model, reasoningEffort });
           } catch (error) {
             log("error", "setModel failed", error instanceof Error ? error.message : String(error));

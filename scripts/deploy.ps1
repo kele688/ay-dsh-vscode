@@ -67,13 +67,17 @@ if (-not $NoBuild) {
 }
 
 # ---------- 打包并安装 ----------
-# 旧版扩展名 dsh-vscode（deepseek-harness.dsh-vscode）在改名前的残留：先卸载避免两个扩展并存
-$oldExtension = 'deepseek-harness.dsh-vscode'
+# 历史扩展 ID 残留清理（避免多扩展并存）：
+#   1) 改名前的 dsh-vscode（deepseek-harness.dsh-vscode）
+#   2) publisher 变更前的 ay-dsh-vscode（deepseek-harness.ay-dsh-vscode）
+$staleExtensions = @('deepseek-harness.dsh-vscode', 'deepseek-harness.ay-dsh-vscode')
 $installed = & code --list-extensions 2>$null
-if ($installed -contains $oldExtension) {
-    Step "卸载旧版扩展（改名前的 $oldExtension）"
-    & code --uninstall-extension $oldExtension 2>&1 | Out-Null
-    Ok "已卸载 $oldExtension"
+foreach ($stale in $staleExtensions) {
+    if ($installed -contains $stale) {
+        Step "卸载旧版扩展（$stale）"
+        & code --uninstall-extension $stale 2>&1 | Out-Null
+        Ok "已卸载 $stale"
+    }
 }
 
 if ($NoPackage) {

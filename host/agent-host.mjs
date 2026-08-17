@@ -25,7 +25,7 @@ import { SessionId } from "@deepseek-ai/dsh-session";
 import { installModelSelection } from "@deepseek-ai/dsh-agent";
 
 const NAME = "dsh-vscode-host";
-const CORE_VERSION = "0.1.0";
+const CORE_VERSION = "0.2.0";
 /** 插件会话 id 前缀（也是会话隔离的标识）。 */
 const SESSION_PREFIX = "dsh-vscode-";
 
@@ -362,7 +362,44 @@ function normalizeEffort(value) {
  * 注入确实进入 request.system，但长系统提示中的指令易被模型重视不足——
  * 故配合消息层 pre-step 注入与工具拦截兜底）。
  */
+/** 宿主侧提示语言：由扩展按 VS Code 界面语言通过 DSH_LOCALE 传入（zh/en）。 */
+const UI_LANG = process.env.DSH_LOCALE === "zh" ? "zh" : "en";
+
+/** 终端用户可见提示的轻量双语助手：技术/debug 日志保持英文，用户可见提示按 UI 语言适配。 */
+const L = (zh, en) => (UI_LANG === "zh" ? zh : en);
+
+/** 用户刚切换过思考级别（setModel）：下一次模型请求强制打印实际思考级别。 */
+let userEffortChanged = false;
+
+/**
+ * 语言一致性指令（系统提示层，每轮注入）：模型的思考链与输出语言会镜像
+ * 用户消息/系统提示的语言，混杂会导致中英交替。随 DSH_LOCALE 注入明确
+ * 指令，让思考与输出始终跟随 VS Code 界面语言（zh/en）。
+ */
+function languageDirectiveSection() {
+  if (UI_LANG === "zh") {
+    return {
+      name: "language",
+      text: "请始终使用简体中文回复用户，思考过程（reasoning）同样使用简体中文。除非用户明确要求使用其他语言。",
+    };
+  }
+  return {
+    name: "language",
+    text: "Always reply in English, including your reasoning. Use English unless the user explicitly asks for another language.",
+  };
+}
+
 function stepLimitSystemSection(limit) {
+  if (UI_LANG === "zh") {
+    return {
+      name: "step-limit",
+      text:
+        `每轮对话（一条用户消息）的思考步数预算为 ${limit} 步，请在此预算内规划工作节奏。` +
+        "预算用尽后，工具调用将被禁用，你必须立即收尾：停止所有新的工具调用与推理，" +
+        "在回复中给出简洁的最终答复，说明已完成事项、未完成事项，以及用户下一步应发送的命令。" +
+        "预算耗尽后请勿继续工作。",
+    };
+  }
   return {
     name: "step-limit",
     text:
@@ -375,22 +412,39 @@ function stepLimitSystemSection(limit) {
   };
 }
 
+/** 工具拦截拒绝文案（tools/pre-execute deny reason，与 UI 语言一致）。 */
+function stepLimitDenyReason(count, limit) {
+  return UI_LANG === "zh"
+    ? `工具调用已禁用——本轮已达思考步数上限（${count}/${limit}）。请立即停止工作并给出最终答复。`
+    : `Tool calls are disabled — this turn reached its step limit (${count}/${limit}). Stop working and deliver your final summary now.`;
+}
+
 /**
  * 消息层收尾指令（agent/pre-step 注入的 user 消息，超限后下一步必达）：
  * 对话末尾的 user 消息是模型必须处理的输入，必然引起响应——软性收尾的强
  * 注入点。内容明确：阈值（limit）与当前值（steps）、原因（工具已禁用）、
  * 要求的动作、语气专业坚定且礼貌。该消息会写入会话历史（收尾指令作为对话
- * 痕迹可见）。注意：纯提示词对模型的约束力有限（实测模型可能继续执行），
- * 真正的收尾保障是 tools/pre-execute 工具拦截（见 attachAgent）。
+ * 痕迹可见），以"[自动提示]/[Auto notice]"开头标明由系统自动注入，并按 UI
+ * 语言（zh/en）本地化。注意：纯提示词对模型的约束力有限（实测模型可能继续
+ * 执行），真正的收尾保障是 tools/pre-execute 工具拦截（见 attachAgent）。
  */
 function stepLimitWrapUpMessage(limit, steps) {
+  if (UI_LANG === "zh") {
+    return (
+      `[自动提示] 本轮思考步数已达上限（${steps}/${limit}），所有工具调用已被禁用。` +
+      "单轮步数上限用于控制单次请求规模、防止工具循环失控，因此本轮工作到此为止。" +
+      "请立即停止进一步推理，在本回复中给出最终答复：已完成什么、还剩下什么、用户下一步应发送的命令。" +
+      "预算耗尽后请勿继续工作。本提示由系统自动注入，并非用户输入。谢谢配合收尾。"
+    );
+  }
   return (
-    `[System notice] Step limit reached: ${steps}/${limit} steps used — this turn's thinking budget ` +
+    `[Auto notice] Step limit reached: ${steps}/${limit} steps used — this turn's thinking budget ` +
     "is exhausted and all tool calls are now disabled. The per-turn step limit keeps each request " +
     "bounded and prevents runaway tool loops, so continuing further work is not permitted. " +
     "Stop further reasoning and deliver your final answer in this reply: what was accomplished, " +
     "what remains unfinished, and the next command the user should send. " +
-    "Do not continue working after this reply. Thank you for wrapping up cleanly."
+    "Do not continue working after this reply. This notice was injected automatically and is not user input. " +
+    "Thank you for wrapping up cleanly."
   );
 }
 
@@ -419,12 +473,17 @@ function attachAgent(ctx, handle, pump) {
   let stepLimitHit = false;
   /** 消息层收尾指令是否已注入（每轮最多注入一次，避免刷屏）。 */
   let wrapUpInjected = false;
+  /** 单轮内"stepLimit 已注入系统提示"日志是否已打印（每轮只打印一次）。 */
+  let stepNoticeLogged = false;
+  /** 上次打印过的实际思考级别（仅在变化时打印，避免每步刷屏）。 */
+  let lastLoggedEffort;
 
   /** 新一轮用户消息开始时调用：重置本轮步数预算（stepLimit 是单轮上限）。 */
   const resetStepBudget = () => {
     stepCount = 0;
     stepLimitHit = false;
     wrapUpInjected = false;
+    stepNoticeLogged = false;
   };
 
   // 会话事件 → 扩展（scope-filtered：仅本 agent 的会话）
@@ -435,7 +494,7 @@ function attachAgent(ctx, handle, pump) {
       // 由 assemble 钩子注入的收尾提示引导模型自然结束。
       if (!stepLimitHit && stepLimit > 0 && stepCount >= stepLimit) {
         stepLimitHit = true;
-        log("warn", `step limit reached (${stepLimit}) — steering the agent to wrap up`);
+        // step 控制相关日志只保留"注入系统提示"一条（见 assemble 钩子），此处不再打印
         post({ t: "stepLimit", maxSteps: stepLimit, steps: stepCount });
       }
     }
@@ -447,14 +506,18 @@ function attachAgent(ctx, handle, pump) {
   // 直到本轮自然结束。stepLimit = 0 时不注入。
   agent.ctx.on("system-prompt/assemble", async (_assembly, _context, next) => {
     const assembled = await next();
-    log("info", `assemble hook called (stepCount=${stepCount}, stepLimit=${stepLimit}, sections=${(assembled.sections ?? []).length})`);
+    const sections = [...(assembled.sections ?? [])];
+    // 语言一致性指令：每轮注入（思考/输出语言跟随界面语言，见 languageDirectiveSection）
+    sections.push(languageDirectiveSection());
     if (stepLimit > 0) {
-      return {
-        ...assembled,
-        sections: [...(assembled.sections ?? []), stepLimitSystemSection(stepLimit)],
-      };
+      // step 控制相关日志仅此一条：注入系统提示时打印，每轮一次（stepNoticeLogged）
+      if (!stepNoticeLogged) {
+        stepNoticeLogged = true;
+        log("info", L(`单轮最大对话次数限制（stepLimit=${stepLimit}）已注入系统提示词`, `Per-turn step limit (stepLimit=${stepLimit}) injected into the system prompt`));
+      }
+      sections.push(stepLimitSystemSection(stepLimit));
     }
-    return assembled;
+    return { ...assembled, sections };
   });
 
   // 收尾引导（对话消息层，最强）：已达上限（stepLimitHit）后，在**下一步**
@@ -469,7 +532,6 @@ function attachAgent(ctx, handle, pump) {
     const decision = await next();
     if (stepLimit > 0 && stepLimitHit && !wrapUpInjected && decision.kind === "enter") {
       wrapUpInjected = true;
-      log("info", `step-limit pre-step injection (steps=${stepCount}, stepLimit=${stepLimit})`);
       return {
         ...decision,
         messages: [
@@ -497,13 +559,28 @@ function attachAgent(ctx, handle, pump) {
   agent.ctx.on("tools/pre-execute", async (exec, next) => {
     const gate = await next();
     if (stepLimit > 0 && stepLimitHit && gate.kind === "allow") {
-      log("info", `step-limit tool gate denied: ${exec.name} (steps=${stepCount}, stepLimit=${stepLimit})`);
       return {
         kind: "deny",
-        reason: `Tool calls are disabled — this turn reached its step limit (${stepCount}/${stepLimit}). Stop working and deliver your final summary now.`,
+        reason: stepLimitDenyReason(stepCount, stepLimit),
       };
     }
     return gate;
+  });
+
+  // 思考级别实际值追踪：agent/request 是每次模型请求配置的**唯一**入口
+  // （dsh-agent-loop buildRequest 由此消费 provider/model/reasoningEffort），
+  // 应答/usage 不回显 effort（dsh-llm-deepseek 类型仅有请求侧定义），因此
+  // 此处日志即"AI 实际使用的思考级别"。仅在变化、或用户刚切换思考级别
+  // （userEffortChanged）时打印，避免每步刷屏。
+  agent.ctx.on("agent/request", async (_payload, next) => {
+    const request = await next();
+    const actual = request?.reasoningEffort;
+    if (actual !== lastLoggedEffort || userEffortChanged) {
+      lastLoggedEffort = actual;
+      userEffortChanged = false;
+      log("info", L(`AI 实际思考级别: ${actual ?? "（未指定）"}`, `AI actual reasoning effort: ${actual ?? "(unset)"}`));
+    }
+    return request;
   });
 
   // 生命周期状态
@@ -1232,7 +1309,8 @@ async function main() {
                 selection.model = model;
                 selection.reasoningEffort = reasoningEffort;
               }
-              log("info", `model selection → ${provider}/${model}${reasoningEffort ? ` (effort=${reasoningEffort})` : ""}`);
+              userEffortChanged = true; // 用户切换思考级别：下一次模型请求打印实际值
+              log("info", L(`模型选择 → ${provider}/${model}${reasoningEffort ? `（思考级别=${reasoningEffort}）` : ""}`, `model selection → ${provider}/${model}${reasoningEffort ? ` (effort=${reasoningEffort})` : ""}`));
               post({ t: "modelChanged", provider, model, reasoningEffort });
             } catch (error) {
               log("error", "setModel failed", error instanceof Error ? error.message : String(error));

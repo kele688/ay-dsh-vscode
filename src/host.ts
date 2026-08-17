@@ -210,6 +210,7 @@ export class AgentHost {
       DSH_VSCODE_MODEL: this.options.model,
       DSH_PERMISSION_MODE: this.options.permissionMode,
       DSH_MAX_STEPS: String(this.options.maxSteps ?? 100),
+      DSH_LOCALE: vscode.env.language.startsWith("zh") ? "zh" : "en",
       DSH_SUBAGENT_MAX_DEPTH: String(this.options.subagentMaxDepth ?? 3),
       DSH_MAX_PARALLEL_SUBAGENTS: String(this.options.maxParallelSubagents ?? 5),
       DSH_TELEMETRY_DISABLED: "1",
