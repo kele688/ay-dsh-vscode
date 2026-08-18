@@ -1025,6 +1025,12 @@ async function main() {
       version: CORE_VERSION,
     });
     log("info", "host ready (lazy session)");
+    // 自检模式（运行时升级验证用）：就绪即输出哨兵并退出（扩展侧据此判定闭包可用）
+    if (process.env.DSH_SELF_TEST === "1") {
+      process.stdout.write("DSH_SELF_TEST_OK\n");
+      log("info", "self-test ok — exiting");
+      process.exit(0);
+    }
   } catch (error) {
     log("error", "host boot failed", error instanceof Error ? error.stack ?? error.message : String(error));
     // 展开错误明细：boot() 会把底层错误包装（消息带 NAME 前缀），AggregateError

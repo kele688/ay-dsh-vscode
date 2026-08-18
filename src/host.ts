@@ -58,6 +58,8 @@ export interface AgentHostOptions {
   dshHome: string;
   /** 旧 DSH home（用于一次性迁移历史会话）。 */
   legacyDshHome?: string;
+  /** 用户采纳的 DSH 运行时闭包 node_modules 目录（未设置 = 用 VSIX 内置）。 */
+  runtimeNodeModulesPath?: string;
 }
 
 export type HostEvent =
@@ -86,16 +88,18 @@ export type HostEvent =
   | { type: "exit"; code: number; error?: string }
   | { type: "log"; level: string; message: string };
 
-/** 探测一个可用的 Node 可执行文件（结果缓存：扩展生命周期内只探测一次）。 */
+/** 探测一个可用的 Node 可执行文件（结果缓存：扩展生命周期内只探测一次）。
+ *  导出供 DSH 运行时自检复用同一解析逻辑（含 ELECTRON_RUN_AS_NODE 分支）。 */
 let cachedNode: string | null | undefined;
-async function resolveNode(nodePath: string | undefined): Promise<string | null> {
+let cachedNodeVersion: string | null | undefined;
+export async function resolveNode(nodePath: string | undefined): Promise<string | null> {
   if (cachedNode !== undefined) return cachedNode;
   const candidates: string[] = [];
   if (nodePath && nodePath.trim() !== "") candidates.push(nodePath.trim());
   candidates.push("node"); // PATH 中的 node（spawn 会解析）
   for (const candidate of candidates) {
     try {
-      const result = await new Promise<string | null>((resolve) => {
+      const result = await new Promise<{ path: string; version: string } | null>((resolve) => {
         const child = spawn(candidate, ["--version"], {
           windowsHide: true,
           stdio: ["ignore", "pipe", "pipe"],
@@ -106,14 +110,15 @@ async function resolveNode(nodePath: string | undefined): Promise<string | null>
         child.stderr.on("data", (d) => (err += String(d)));
         child.on("error", () => resolve(null));
         child.on("close", (code) => {
-          const match = /v(\d+)\./.exec(out || err);
+          const match = /v(\d+)\.(\d+)/.exec(out || err);
           const major = match ? Number(match[1]) : 0;
-          resolve(code === 0 && major >= 20 ? candidate : null);
+          resolve(code === 0 && major >= 20 ? { path: candidate, version: match?.[0] ?? "" } : null);
         });
       });
       if (result) {
-        cachedNode = result;
-        return result;
+        cachedNode = result.path;
+        cachedNodeVersion = result.version;
+        return result.path;
       }
     } catch {
       // 继续探测下一个
@@ -121,6 +126,24 @@ async function resolveNode(nodePath: string | undefined): Promise<string | null>
   }
   cachedNode = null;
   return null;
+}
+
+/** 探测到的宿主 Node 是否支持 module.registerHooks（≥22.12）。 */
+export function nodeSupportsRegisterHooks(): boolean {
+  const m = /^v?(\d+)\.(\d+)/.exec(cachedNodeVersion ?? "");
+  if (!m) return false;
+  const major = Number(m[1]);
+  const minor = Number(m[2]);
+  return major > 22 || (major === 22 && minor >= 12);
+}
+
+/** 宿主 ESM 重定向器的统一加载参数（跨平台；唯一决策点，各处复用）。
+ *  Node ≥22.12 用 `-r` CJS preload（registerHooks，规避 Node 24 Windows 的 main 加载回归）；
+ *  旧 Node 回退 --experimental-loader（mjs 薄壳 re-export cjs 的 resolve）。 */
+export function hostLoaderArgs(extensionPath: string): string[] {
+  return nodeSupportsRegisterHooks()
+    ? ["-r", path.join(extensionPath, "host", "runtime-redirector.cjs")]
+    : ["--experimental-loader", path.join(extensionPath, "host", "runtime-redirector.mjs")];
 }
 
 /**
@@ -134,7 +157,7 @@ async function resolveNode(nodePath: string | undefined): Promise<string | null>
  * 自行回收）。
  */
 let sharedOutputChannel: vscode.OutputChannel | undefined;
-function getOutputChannel(): vscode.OutputChannel {
+export function getOutputChannel(): vscode.OutputChannel {
   if (!sharedOutputChannel) {
     sharedOutputChannel = vscode.window.createOutputChannel("ay-dsh-vscode Host");
   }
@@ -159,6 +182,22 @@ export class AgentHost {
   private fallbackHostScript: string | undefined;
   /** 当前会话的 token/标题统计（随事件流累计，推送给 UI 顶部信息栏）。 */
   private stats: SessionStats = { inputTokens: 0, cacheReadTokens: 0, outputTokens: 0, steps: 0 };
+  /** Agent 是否正在运行（status 帧维护；供 DSH 更新检测器做"空闲门控"）。 */
+  private running = false;
+
+  /** Agent 是否正在运行（status 帧维护；供 DSH 更新检测器做"空闲门控"）。 */
+  get isRunning(): boolean {
+    return this.running;
+  }
+
+  /**
+   * 构造时解析的运行时闭包 node_modules 路径（undefined = 用 VSIX 内置）。
+   * 注意这是**创建时刻的快照**：崩溃回退/reset 等状态变更后不会自动更新，
+   * 调用方须销毁本实例并重建（见 extension.ts ensureHost 的一致性检查）。
+   */
+  get runtimeNodeModulesPath(): string | undefined {
+    return this.options.runtimeNodeModulesPath;
+  }
 
   constructor(private readonly options: AgentHostOptions, private readonly ctx: vscode.ExtensionContext) {
     // 复用共享单例 channel：宿主重启后日志继续输出到同一面板（不新建同名 channel）
@@ -192,14 +231,15 @@ export class AgentHost {
   /** 启动子进程并等待 ready。 */
   async start(): Promise<void> {
     if (this.child) return;
-    // 优先使用 esbuild bundle 版宿主（单文件，冷启动快——不需要解析
-    // node_modules 中数百个 ESM 文件）；bundle 不存在时回退源文件
-    // （如开发环境中只改了 agent-host.mjs 尚未构建）。
-    const bundlePath = path.join(this.options.extensionPath, "host", "agent-host.bundle.mjs");
-    const sourcePath = path.join(this.options.extensionPath, "host", "agent-host.mjs");
-    // bundle 启动失败时允许回退到源文件（记录在 this.hostScript）
-    this.hostScript = fs.existsSync(bundlePath) ? bundlePath : sourcePath;
-    this.fallbackHostScript = fs.existsSync(bundlePath) && fs.existsSync(sourcePath) ? sourcePath : undefined;
+    // 首次启动选脚本：优先 bundle（单文件冷启动快）；不存在时用源文件。
+    // bundle 启动失败回退源文件后（close 里已改 hostScript），此处不再重选，
+    // 避免 fallback 死循环：start 重选 bundle → 崩 → fallback → 再重选 bundle → …
+    if (!this.hostScript) {
+      const bundlePath = path.join(this.options.extensionPath, "host", "agent-host.bundle.mjs");
+      const sourcePath = path.join(this.options.extensionPath, "host", "agent-host.mjs");
+      this.hostScript = fs.existsSync(bundlePath) ? bundlePath : sourcePath;
+      this.fallbackHostScript = fs.existsSync(bundlePath) && fs.existsSync(sourcePath) ? sourcePath : undefined;
+    }
     const hostScript = this.hostScript;
     const nodeExe = (await resolveNode(this.options.nodePath)) ?? process.execPath;
     const useElectronNode = nodeExe === process.execPath;
@@ -222,11 +262,17 @@ export class AgentHost {
       POWERSHELL_TELEMETRY_OPTOUT: "1",
     };
     if (this.options.legacyDshHome) env.DSH_LEGACY_HOME = this.options.legacyDshHome;
+    if (this.options.runtimeNodeModulesPath) env.DSH_RUNTIME_NODE_MODULES = this.options.runtimeNodeModulesPath;
     if (useElectronNode) env.ELECTRON_RUN_AS_NODE = "1";
     if (this.options.apiKey) env.DEEPSEEK_API_KEY = this.options.apiKey;
     if (this.options.baseUrl) env.DEEPSEEK_BASE_URL = this.options.baseUrl;
 
-    const child = spawn(nodeExe, [hostScript], {
+    // 运行时升级（机制 A，见决策文档 1.4.3）：把 DSH 依赖集解析到用户采纳的闭包目录。
+    // 加载参数统一由 hostLoaderArgs 决策（Node ≥22.12 用 -r CJS preload 规避 Node 24
+    // Windows 的 main 加载回归；旧 Node 回退 --experimental-loader）。
+    const runtime = this.options.runtimeNodeModulesPath;
+    const spawnArgs = runtime ? [...hostLoaderArgs(this.options.extensionPath), hostScript] : [hostScript];
+    const child = spawn(nodeExe, spawnArgs, {
       cwd: this.options.workspaceRoot,
       env,
       windowsHide: true,
@@ -246,6 +292,7 @@ export class AgentHost {
     child.on("close", (code) => {
       this.output.appendLine(`[host] exited with code ${code}`);
       this.child = null;
+      this.readySessionId = undefined; // 宿主已退出：会话 id 失效（重启后由 webviewPanel 以 storedSessionId 恢复）
       this.rl?.close();
       this.rl = null;
       this.turns.clear();
@@ -301,6 +348,7 @@ export class AgentHost {
         break;
       }
       case "status": {
+        this.running = frame.status === "running";
         this.emit({ type: "status", status: frame.status });
         break;
       }

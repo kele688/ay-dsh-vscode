@@ -11,6 +11,8 @@ import type { ExtensionToWebview, WebviewMessage } from "./protocol";
 
 export interface ChatViewDeps {
   extensionUri: vscode.Uri;
+  /** 当前生效的 DSH 版本（升级后跟随；未升级 = VSIX 内置），顶栏展示（P1/P2 可见性）。 */
+  getDshVersion: () => string | undefined;
   getModel: () => string;
   getConfigSummary: () => Promise<{
     keyConfigured: boolean;
@@ -23,6 +25,21 @@ export interface ChatViewDeps {
   /** 读取/保存"当前会话 id"（workspaceState 持久化，跨 VS Code Reload 窗口保持）。 */
   getStoredSessionId: () => string | undefined;
   setStoredSessionId: (id: string | undefined) => void;
+  /** 宿主异常退出回调（供 DSH 运行时管理器做失败版本标记与回滚）。 */
+  onHostExit?: (code: number, error?: string) => void;
+  /** 宿主正常就绪回调（供 DSH 运行时管理器清零崩溃计数）。 */
+  onHostReady?: () => void;
+  /** 对话完成回调（供 DSH 运行时管理器累计稳定性统计）。 */
+  onChatDone?: () => void;
+  /** 宿主退出后自动重启的延迟决策（ms）：试用版本返回 0（立即重启），
+   *  回退后的稳定基线/内置版本返回指数退避值（1.5s 起步递增，无限）。 */
+  getHostRestartDelay?: () => number;
+  /** 当前 DSH 升级候选状态（顶栏横幅；latest 为空 = 无候选）。 */
+  getDshUpdate?: () => { latest?: string; upgrading?: boolean } | undefined;
+  /** 顶栏横幅按钮回调（升级/忽略/详情）。 */
+  onDshUpgrade?: () => void;
+  onDshIgnore?: () => void;
+  onDshDetails?: () => void;
 }
 
 /** 扩展侧错误消息的国际化（zh/en 双语，跟随 VS Code 界面语言）。 */
@@ -72,7 +89,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
   }
   /** 宿主自动重启计数（连续失败多次后放弃，避免死循环）。 */
-  private hostRestartAttempts = 0;
   private hostRestartTimer: NodeJS.Timeout | undefined;
 
   constructor(private readonly deps: ChatViewDeps) {
@@ -243,6 +259,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         case "setWorkMode":
           this.host?.setWorkMode(msg.mode);
           break;
+        case "dshUpgrade":
+          this.deps.onDshUpgrade?.();
+          break;
+        case "dshIgnore":
+          this.deps.onDshIgnore?.();
+          break;
+        case "dshDetails":
+          this.deps.onDshDetails?.();
+          break;
         case "compact":
           this.host?.compact();
           break;
@@ -259,6 +284,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           // 早到的 modelInfo 帧会因 webview 尚未加载而丢失，导致模型下拉为空。
           // 就绪时重新请求保证目录必达（幂等；重复帧由前端重渲染，无害）。
           this.host?.getModelInfo();
+          // DSH 升级候选状态（顶栏横幅）补发
+          this.pushDshUpdate();
           // Reload 窗口/首次激活场景：存在持久化的会话 id，且宿主当前无会话
           // （不是 webview 重建但宿主仍持有会话的场景）→ 提前锁定发送，
           // 等宿主 ready 后自动恢复原会话，不默认停在"新会话"
@@ -274,6 +301,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
               sessionId: "",
               ready: false,
               locale: vscode.env.language.startsWith("zh") ? "zh" : "en",
+              dshVersion: this.deps.getDshVersion(),
             };
           this.push(boot);
           // 补发最近统计（webview 就绪前产生的会话统计不丢失）
@@ -364,6 +392,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.setStatus("running");
     try {
       const ok = await host.chat(text);
+      if (ok) this.deps.onChatDone?.();
       if (!ok) {
         this.push({
           t: "event",
@@ -413,7 +442,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       case "ready": {
         this.hostReady = true;
         this.hostState = "ready";
-        this.hostRestartAttempts = 0;
+        this.deps.onHostReady?.();
         // 宿主就绪但会话为空（配置变更重启 / VS Code Reload 后重启）：
         // 自动恢复原会话（storedSessionId 在会话存续期间恒定，此处直接读取）。
         // 先推送 restarting（UI 锁定发送、清空旧列表），再发起 resume。
@@ -433,6 +462,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           sessionTitle: e.sessionTitle,
           ready: true,
           locale: vscode.env.language.startsWith("zh") ? "zh" : "en",
+          dshVersion: this.deps.getDshVersion(),
         };
         this.pushHostState();
         this.push(this.lastBootstrap);
@@ -551,6 +581,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         this.hostState = "exited";
         this.push({ t: "hostExit", code: e.code, error: e.error });
         this.pushHostState();
+        // 运行时升级回滚钩子：宿主异常退出且启用了运行时闭包 → 标记失败版本并回滚，
+        // 随后的 scheduleHostRestart 会以回滚后的运行时（或 VSIX 内置）重启。
+        this.deps.onHostExit?.(e.code, e.error);
         // 宿主异常退出后自动重启一次（koffi 依赖缺失、瞬时失败等场景下
         // 无需用户手动操作即可恢复；重启仍失败才需要用户介入）。
         this.scheduleHostRestart();
@@ -560,25 +593,32 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  /** 宿主异常退出后自动重启（最多 2 次，间隔 1.5s；成功后重置计数）。静默处理：不打扰用户。 */
+  /**
+   * 宿主异常退出后自动重启。延迟由扩展侧统一决策（见 getHostRestartDelay）：
+   * - 试用版本（current !== previous）：前 3 次崩溃**立即重启**（尽快恢复，第 3 次后由
+   *   崩溃检测触发回退）；
+   * - 回退后的稳定基线 / VSIX 内置：**指数退避**（1.5s 起步每次翻倍，无限增长——
+   *   已是最低底线时永不放弃但绝不高频重启拖垮 VS Code）。
+   */
   private scheduleHostRestart(): void {
-    if (this.hostRestartAttempts >= 2) {
-      this.hostRestartAttempts = 0;
-      return; // 连续失败过多次：停止自动重启，等用户操作时再提示
-    }
-    this.hostRestartAttempts++;
+    const delay = this.deps.getHostRestartDelay?.() ?? 0;
     this.hostState = "starting";
     this.pushHostState();
     if (this.hostRestartTimer) clearTimeout(this.hostRestartTimer);
     this.hostRestartTimer = setTimeout(() => {
-      void this.deps.ensureHost().then(() => {
-        this.hostRestartAttempts = 0; // 成功就绪后重置
-      });
-    }, 1500);
+      // 不在这里重置任何计数（ensureHost 在 spawn 成功即 resolve，非宿主 ready）——
+      // 退避/立即策略由扩展侧在宿主真正 ready 时重置。
+      void this.deps.ensureHost();
+    }, delay);
   }
 
   private push(msg: ExtensionToWebview): void {
     void this.view?.webview.postMessage(msg);
+  }
+
+  /** 推送 DSH 升级候选状态到 webview（顶栏横幅；候选变化或 webview 就绪时调用）。 */
+  public pushDshUpdate(): void {
+    this.push({ t: "dshUpdate", ...(this.deps.getDshUpdate?.() ?? {}) });
   }
 
   /**
@@ -654,6 +694,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 <div id="app">
   <header id="header">
     <span class="logo">◈ DSH</span>
+    <span id="dshVersion" class="token-stat header-version"></span>
+    <span id="dshUpdate" class="dsh-update hidden"></span>
     <span id="sessionTitle" class="session-title" title="">…</span>
     <span class="spacer"></span>
     <button id="btnExportFull" class="icon-btn disabled" title="${L.exportTitle}">📄</button>

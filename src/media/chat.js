@@ -22,6 +22,8 @@
   const contextPctEl = $("contextPct");
   const tokensInEl = $("tokensIn");
   const stepsEl = $("steps");
+  const dshVersionEl = $("dshVersion");
+  const dshUpdateEl = $("dshUpdate");
   const tokensCacheEl = $("tokensCache");
   const tokensOutEl = $("tokensOut");
   const btnCompact = $("btnCompact");
@@ -127,6 +129,12 @@
       send: "发送",
       stop: "停止",
       stopTitle: "停止当前对话（丢弃未完成的内容，不新建会话）",
+      dshNewVersionPre: "有新版 ",
+      dshNewVersionPost: " 可用",
+      dshUpgrade: "升级",
+      dshIgnore: "忽略",
+      dshDetails: "查看发布说明",
+      dshUpgrading: (v) => `升级 ${v} 过程中…`,
     },
     en: {
       thinking: "Thinking",
@@ -184,6 +192,12 @@
       send: "Send",
       stop: "Stop",
       stopTitle: "Stop the current conversation (discards unfinished output, keeps the session)",
+      dshNewVersionPre: "New version ",
+      dshNewVersionPost: " available",
+      dshUpgrade: "Upgrade",
+      dshIgnore: "Ignore",
+      dshDetails: "View release notes",
+      dshUpgrading: (v) => `Upgrading ${v}…`,
     },
   };
 
@@ -215,6 +229,48 @@
     if (text !== undefined) node.textContent = text;
     return node;
   }
+
+  /* ---- 顶栏 DSH 升级候选横幅（常驻显示，直到用户操作；不侵入右侧命令按钮区） ---- */
+  const dshUpdateText = el("span", "", "");
+  // 版本号即"详情"链接（点击打开新 DSH 版本特性页），替代独立的"详情"按钮
+  const dshVersionLink = el("a", "dsh-update-link", "");
+  const btnDshUpgrade = el("button", "btn", "");
+  const btnDshIgnore = el("button", "btn", "");
+  dshUpdateEl.append(dshUpdateText, btnDshUpgrade, btnDshIgnore);
+  function renderDshUpdate(info) {
+    const latest = info?.latest;
+    const upgrading = info?.upgrading;
+    if (!latest) {
+      dshUpdateEl.classList.add("hidden");
+      return;
+    }
+    dshUpdateEl.classList.remove("hidden");
+    if (upgrading) {
+      // 升级中：隐藏按钮，仅显示进度文案
+      dshUpdateText.textContent = t("dshUpgrading", latest);
+      btnDshUpgrade.classList.add("hidden");
+      btnDshIgnore.classList.add("hidden");
+    } else {
+      dshUpdateText.textContent = "";
+      dshVersionLink.textContent = latest;
+      dshVersionLink.title = t("dshDetails");
+      dshUpdateText.append(
+        document.createTextNode(t("dshNewVersionPre")),
+        dshVersionLink,
+        document.createTextNode(t("dshNewVersionPost"))
+      );
+      btnDshUpgrade.textContent = t("dshUpgrade");
+      btnDshIgnore.textContent = t("dshIgnore");
+      btnDshUpgrade.classList.remove("hidden");
+      btnDshIgnore.classList.remove("hidden");
+    }
+  }
+  btnDshUpgrade.addEventListener("click", () => vscode.postMessage({ t: "dshUpgrade" }));
+  btnDshIgnore.addEventListener("click", () => vscode.postMessage({ t: "dshIgnore" }));
+  dshVersionLink.addEventListener("click", (e) => {
+    e.preventDefault();
+    vscode.postMessage({ t: "dshDetails" });
+  });
 
   /**
    * 智能滚动：滚动容器在底部时自动跟随最新输出；
@@ -1146,6 +1202,8 @@
         updateExportButton();
         // 顶部信息栏常显（Kilo Code 风格）：会话标题显示在顶栏（header 中）
         topbarEl.classList.remove("hidden");
+        // DSH 运行时版本（logo 已含 "DSH"，此处仅版本号）
+        dshVersionEl.textContent = msg.dshVersion || "";
         sessionTitleEl.textContent = msg.sessionId
           ? state.stats?.title || msg.sessionTitle || t("session", msg.sessionId.slice(0, 12))
           : t("newSessionTitle");
@@ -1166,6 +1224,9 @@
         break;
       case "modelInfo":
         renderModelInfo(msg);
+        break;
+      case "dshUpdate":
+        renderDshUpdate(msg);
         break;
       case "modelChanged":
         renderModelChanged(msg);

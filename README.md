@@ -36,6 +36,7 @@ Not just a "chat + autocomplete" wrapper — this extension embeds the **officia
 
 - **Node.js ≥ 20** (22+ recommended)
 - **VS Code ≥ 1.90** (with the `code` CLI on PATH)
+- **Platforms**: Windows, Linux (including Remote-SSH) and macOS — a single cross-platform VSIX
 - A **DeepSeek API Key** ([platform.deepseek.com](https://platform.deepseek.com))
 
 > 💡 No prior DSH installation needed: the DSH kernel is bundled inside the VSIX — fully self-contained, offline-installable.
