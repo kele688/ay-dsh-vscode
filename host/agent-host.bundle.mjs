@@ -7702,6 +7702,11 @@ async function main() {
       version: CORE_VERSION
     });
     log("info", "host ready (lazy session)");
+    if (process.env.DSH_SELF_TEST === "1") {
+      process.stdout.write("DSH_SELF_TEST_OK\n");
+      log("info", "self-test ok \u2014 exiting");
+      process.exit(0);
+    }
   } catch (error) {
     log("error", "host boot failed", error instanceof Error ? error.stack ?? error.message : String(error));
     const details = [];

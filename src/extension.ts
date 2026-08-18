@@ -11,12 +11,63 @@ import * as vscode from "vscode";
 import * as path from "node:path";
 import * as os from "node:os";
 import * as fs from "node:fs";
-import { AgentHost } from "./host";
+import { AgentHost, getOutputChannel, resolveNode, hostLoaderArgs } from "./host";
 import { ChatViewProvider } from "./webviewPanel";
 import { openConfigPanel } from "./configPanel";
+import { bundledDshVersion, startDshUpdateChecker, LAST_CHECK_KEY } from "./dshUpdater";
+import { DshRuntimeManager } from "./dshRuntime";
 
 let provider: ChatViewProvider | undefined;
 let host: AgentHost | undefined;
+/** DSH 运行时管理器（P2：动态解析升级/回滚/黑名单；采纳 UI 见顶栏横幅）。 */
+let runtimeManager: DshRuntimeManager | undefined;
+/** 当前 DSH 升级候选（顶栏横幅常驻显示，直到用户操作；latest 为空 = 无候选）。 */
+let dshCandidate: { latest: string; upgrading: boolean } | undefined;
+/** 候选版本持久化键（跨 Reload 保留横幅，直到用户操作）。 */
+const DSH_CANDIDATE_KEY = "dshCandidateVersion";
+/** 宿主就绪时刻与版本（退出时结算运行时长，计入稳定性统计）。 */
+let hostReadyAt: number | undefined;
+let hostReadyVersion: string | undefined;
+/** 指数退避计数（仅回退后的稳定基线/内置版本崩溃时递增；宿主 ready 时重置）。 */
+let backoffAttempt = 0;
+
+/** 设置/清除 DSH 升级候选（持久化 + 推送顶栏横幅）。 */
+function setDshCandidate(context: vscode.ExtensionContext, latest: string | undefined): void {
+  dshCandidate = latest ? { latest, upgrading: false } : undefined;
+  void context.workspaceState.update(DSH_CANDIDATE_KEY, latest ?? undefined);
+  provider?.pushDshUpdate();
+}
+
+/** 执行升级：横幅置"升级中" → 后台安装+自检（不影响进行中的对话）→ 空闲后切换宿主。 */
+async function doDshUpgrade(context: vscode.ExtensionContext): Promise<void> {
+  const latest = dshCandidate?.latest;
+  if (!latest || !runtimeManager) return;
+  dshCandidate = { latest, upgrading: true };
+  provider?.pushDshUpdate();
+  // ① 后台安装闭包 + 宿主自检：全程不触碰正在运行的宿主进程，对话不受影响
+  const ok = await runtimeManager.upgrade(latest);
+  if (!ok) {
+    setDshCandidate(context, undefined); // 失败已进黑名单，收起横幅
+    return;
+  }
+  // ② 切换避让：等待当前对话空闲再重启宿主（不打断进行中的对话）
+  setDshCandidate(context, undefined);
+  await waitForHostIdle();
+  // ③ 切换（对话保护）：noteHostRestart 锁定发送 + 会话自动恢复（storedSessionId）；
+  //    输入区内容保留（"先记着"），就绪后用户可继续（"切换后再发"），全程静默
+  provider?.noteHostRestart();
+  disposeHost();
+  void ensureHost(context);
+}
+
+/** 等待宿主空闲（升级切换避让；每 5s 轮询，最多 10 分钟，期间静默不打扰）。 */
+async function waitForHostIdle(): Promise<void> {
+  const deadline = Date.now() + 10 * 60 * 1000;
+  while (Date.now() < deadline) {
+    if (!host?.isRunning) return;
+    await new Promise((r) => setTimeout(r, 5000));
+  }
+}
 /** 配置面板保存事务标志（保存期间忽略逐项配置变更事件，由 onSaved 统一重启）。 */
 let configSaveTransaction = false;
 /** 配置变更后的宿主重启防抖定时器（settings.json 直接编辑等非面板场景）。 */
@@ -200,15 +251,23 @@ function legacyDshHome(): string {
 /** 确保宿主存在且已启动（惰性创建；视图/命令首次使用时才拉起子进程）。 */
 async function ensureHost(context: vscode.ExtensionContext): Promise<AgentHost> {
   if (host) {
-    if (!host.sessionId) {
-      try {
-        await host.start();
-      } catch (err) {
-        vscode.window.showErrorMessage(`DSH 宿主启动失败: ${String(err)}`);
-        throw err;
+    // 防御：运行时闭包路径是 AgentHost 构造时快照，若与当前解析不一致
+    // （崩溃回退 / resetDshRuntime 等状态变更后未走 disposeHost 的路径），
+    // 销毁旧实例走下方重建，避免用旧版本闭包启动（"回退了却没退"的复现条件）。
+    const currentRuntime = runtimeManager?.runtimeNodeModules();
+    if (host.runtimeNodeModulesPath !== currentRuntime) {
+      disposeHost();
+    } else {
+      if (!host.sessionId) {
+        try {
+          await host.start();
+        } catch (err) {
+          vscode.window.showErrorMessage(`DSH 宿主启动失败: ${String(err)}`);
+          throw err;
+        }
       }
+      return host;
     }
-    return host;
   }
   await ensureWorkspaceChoice();
   const cfg = readConfig();
@@ -228,6 +287,7 @@ async function ensureHost(context: vscode.ExtensionContext): Promise<AgentHost> 
       maxParallelSubagents: cfg.maxParallelSubagents,
       dshHome: pluginDshHome(context),
       legacyDshHome: legacyDshHome(),
+      runtimeNodeModulesPath: runtimeManager?.runtimeNodeModules(),
     },
     context
   );
@@ -319,9 +379,24 @@ function openSettings(context: vscode.ExtensionContext): void {
 /* 激活 / 停用                                                          */
 /* ------------------------------------------------------------------ */
 
+/* ---------------- DSH 版本详情：直接调系统浏览器打开官方发布说明 ---------------- */
+
+/** 打开 DSH 内核官方 GitHub Release 页面（tag 格式 dsh-v<version>，官方发布说明最完整）。 */
+function openDshDetails(version: string): void {
+  void vscode.env.openExternal(
+    vscode.Uri.parse(`https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v${version}`)
+  );
+}
+
+
+
+
+
 export function activate(context: vscode.ExtensionContext): void {
   provider = new ChatViewProvider({
     extensionUri: context.extensionUri,
+    // 当前生效 DSH 版本（升级后 = 采纳版本；未升级 = VSIX 内置），顶栏展示
+    getDshVersion: () => runtimeManager?.currentVersion ?? bundledDshVersion(context.extensionUri.fsPath),
     getModel: () => readConfig().model,
     getConfigSummary: () => getConfigSummary(context),
     ensureHost: () => ensureHost(context),
@@ -330,6 +405,66 @@ export function activate(context: vscode.ExtensionContext): void {
     getStoredSessionId: () => context.workspaceState.get<string>("currentSessionId"),
     setStoredSessionId: (id) => {
       void context.workspaceState.update("currentSessionId", id ?? undefined);
+    },
+    // 宿主异常退出：先结算运行时长（稳定性统计，任何退出都累计），再做崩溃检测
+    // （重启 vs 回退，见决策文档 1.6：时间窗内连续崩溃 < 阈值仅重启；≥ 阈值回退稳定基线）。
+    onHostExit: (code) => {
+      if (hostReadyAt !== undefined && hostReadyVersion) {
+        runtimeManager?.addRunTime(hostReadyVersion, Date.now() - hostReadyAt);
+        hostReadyAt = undefined;
+        hostReadyVersion = undefined;
+      }
+      const active = runtimeManager?.currentVersion;
+      if (code !== 0 && active && runtimeManager?.runtimeNodeModules()) {
+        const decision = runtimeManager.noteHostCrash(active);
+        if (decision === "rollback") {
+          // 关键：回退只更新了持久化状态（KEY_CURRENT），而当前 AgentHost 实例
+          // 构造时缓存的 runtimeNodeModulesPath 仍是旧版本闭包（构造时快照）。
+          // 必须销毁实例，让随后的 scheduleHostRestart → ensureHost 重建并按回退后的
+          // 版本重新解析运行时路径；否则重启会继续加载已失效的旧版本闭包
+          // （如缺失 overlay 文件的目录），表现为"回退了却还在用旧版本启动"。
+          disposeHost();
+        }
+      }
+    },
+    // 宿主正常就绪：清零崩溃计数与退避计数 + 记录就绪时刻（用于运行时长结算）。
+    onHostReady: () => {
+      const v = runtimeManager?.currentVersion;
+      if (!v) return;
+      runtimeManager?.markHostHealthy(v);
+      backoffAttempt = 0;
+      hostReadyAt = Date.now();
+      hostReadyVersion = v;
+    },
+    // 对话完成：累计稳定性统计（previous 提升门槛：>1h 且 >10 次对话）。
+    onChatDone: () => {
+      const v = runtimeManager?.currentVersion;
+      if (v) runtimeManager?.addChat(v);
+    },
+    // 自动重启延迟决策：试用版本（current !== previous）→ 0（崩溃后立即重启，前 3 次
+    // 尽快恢复，第 3 次后崩溃检测回退）；回退后的稳定基线/内置 → 指数退避（1.5s 起步
+    // 每次翻倍，无限——已是最低底线时永不放弃、但绝不高频重启拖垮 VS Code）。
+    getHostRestartDelay: () => {
+      const v = runtimeManager?.currentVersion;
+      const prev = runtimeManager?.previousVersion;
+      if (v && prev && v !== prev) {
+        backoffAttempt = 0;
+        return 0;
+      }
+      backoffAttempt++;
+      return 1500 * 2 ** (backoffAttempt - 1);
+    },
+    // DSH 升级候选横幅（顶栏常驻）：状态读取 + 按钮回调
+    getDshUpdate: () => dshCandidate,
+    onDshUpgrade: () => {
+      void doDshUpgrade(context);
+    },
+    onDshIgnore: () => {
+      if (dshCandidate?.latest) runtimeManager?.ignore(dshCandidate.latest);
+      setDshCandidate(context, undefined);
+    },
+    onDshDetails: () => {
+      if (dshCandidate?.latest) openDshDetails(dshCandidate.latest);
     },
   });
 
@@ -341,6 +476,40 @@ export function activate(context: vscode.ExtensionContext): void {
       { webviewOptions: { retainContextWhenHidden: true } }
     )
   );
+
+  // DSH 更新检测（P1：闲时 24h 周期检测，跨生命周期；P2：候选移交运行时管理器）
+  runtimeManager = new DshRuntimeManager({
+    extensionPath: context.extensionUri.fsPath,
+    globalStoragePath: context.globalStorageUri.fsPath,
+    workspaceState: context.workspaceState,
+    nodeResolver: () => resolveNode(readConfig().nodePath),
+    hostScript: () => path.join(context.extensionUri.fsPath, "host", "agent-host.bundle.mjs"),
+    // 宿主 ESM 重定向器加载参数：统一由 host.ts 的 hostLoaderArgs 决策（复用同一逻辑）
+    loaderArgs: () => hostLoaderArgs(context.extensionUri.fsPath),
+    log: (msg) => getOutputChannel().appendLine(msg),
+    statusBar: (msg) => {
+      void vscode.window.setStatusBarMessage(msg, 8000);
+    },
+  });
+  context.subscriptions.push(
+    startDshUpdateChecker({
+      workspaceState: context.workspaceState,
+      extensionPath: context.extensionUri.fsPath,
+      isChatActive: () => host?.isRunning ?? false,
+      log: (msg) => getOutputChannel().appendLine(msg),
+      onCandidate: (latest) => {
+        if (!runtimeManager?.isCandidate(latest)) return;
+        // 顶栏横幅常驻显示（不弹窗），直到用户操作（升级/忽略/详情）
+        setDshCandidate(context, latest);
+      },
+    })
+  );
+
+  // 恢复跨 Reload 的升级候选横幅（持久化于 workspaceState，直到用户操作）
+  const savedCandidate = context.workspaceState.get<string>(DSH_CANDIDATE_KEY);
+  if (savedCandidate && runtimeManager?.isCandidate(savedCandidate)) {
+    dshCandidate = { latest: savedCandidate, upgrading: false };
+  }
 
   // 命令注册
   context.subscriptions.push(
@@ -356,6 +525,15 @@ export function activate(context: vscode.ExtensionContext): void {
     }),
     vscode.commands.registerCommand("dshVscode.configure", () => openSettings(context)),
     vscode.commands.registerCommand("dshVscode.openWorkspace", () => openWorkspaceFolder()),
+    // 重置 DSH 运行时为 VSIX 内置（清空候选/黑名单/已采纳版本/检测周期；测试与紧急恢复用）
+    vscode.commands.registerCommand("dshVscode.resetDshRuntime", () => {
+      runtimeManager?.reset();
+      setDshCandidate(context, undefined);
+      // 清除检测周期：重置后 1 分钟内即可重新检测（测试升级流程的关键）
+      void context.workspaceState.update(LAST_CHECK_KEY, undefined);
+      disposeHost();
+      void ensureHost(context);
+    }),
     vscode.commands.registerCommand("dshVscode.explainSelection", () => {
       const editor = vscode.window.activeTextEditor;
       if (!editor) return;

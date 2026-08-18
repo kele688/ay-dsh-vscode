@@ -102,6 +102,10 @@
         "command": "dshVscode.addSelectionRef",
         "title": "DSH: Reference Selection in Chat (Ctrl+K Ctrl+I)",
         "icon": "$(quote)"
+      },
+      {
+        "command": "dshVscode.resetDshRuntime",
+        "title": "DSH: Reset Runtime to Bundled"
       }
     ],
     "keybindings": [

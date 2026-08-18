@@ -113,11 +113,14 @@ export type WebviewMessage =
   | { t: "compact" }
   | { t: "ready" }
   | { t: "openFile"; path: string }
-  | { t: "hint"; text: string };
+  | { t: "hint"; text: string }
+  | { t: "dshUpgrade" }
+  | { t: "dshIgnore" }
+  | { t: "dshDetails" };
 
 /** Extension -> Webview 的消息。 */
 export type ExtensionToWebview =
-  | { t: "bootstrap"; model: string; provider: string; cwd: string; sessionId: string; sessionTitle?: string; ready: boolean; locale: string }
+  | { t: "bootstrap"; model: string; provider: string; cwd: string; sessionId: string; sessionTitle?: string; ready: boolean; locale: string; dshVersion?: string }
   | {
       t: "config";
       keyConfigured: boolean;
@@ -141,6 +144,7 @@ export type ExtensionToWebview =
   | { t: "compactDone"; ok: boolean; text?: string; error?: string }
   | { t: "sessions"; list: SessionSummary[]; error?: string }
   | { t: "restarting" }
+  | { t: "dshUpdate"; latest?: string; upgrading?: boolean }
   | { t: "history"; sessionId: string; events: ViewEvent[]; hasMore?: boolean; nextSeq?: number }
   | { t: "historyMore"; sessionId: string; events: ViewEvent[]; hasMore?: boolean; nextSeq?: number }
   | { t: "sessionDeleted"; id: string; ok: boolean; error?: string }

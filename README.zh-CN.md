@@ -36,6 +36,7 @@
 
 - **Node.js ≥ 20**（推荐 22+）
 - **VS Code ≥ 1.90**（含 `code` CLI 于 PATH）
+- **平台支持**：Windows / Linux（含 Remote-SSH）/ macOS —— 单个跨平台 VSIX
 - 一个 **DeepSeek API Key**（[platform.deepseek.com](https://platform.deepseek.com)）
 
 > 💡 无需预先安装 DSH：DSH 内核已打包进 VSIX，自包含、离线可装。

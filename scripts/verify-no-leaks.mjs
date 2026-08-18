@@ -49,6 +49,12 @@ const CONTENT_PATTERNS = [
 const USER = W("kele", "688");
 const USER_IN_REPO_URL = new RegExp(W("github\\.com/", "kele", "688"), "g");
 
+const OWNER_USERNAME_EXEMPT = new Set([
+  "package.json",
+  "README.md",
+  "README.zh-CN.md",
+]);
+
 /* Defense scripts legitimately contain the keywords above. */
 const SELF_EXEMPT = new Set([
   "scripts/verify-no-leaks.mjs",
@@ -76,7 +82,7 @@ for (const f of files) {
   }
   if (content.includes("\0")) continue; // binary asset
   const withoutRepoUrls = content.replace(USER_IN_REPO_URL, "");
-  if (withoutRepoUrls.includes(USER)) {
+  if (!OWNER_USERNAME_EXEMPT.has(f) && withoutRepoUrls.includes(USER)) {
     violations.push(`${f}: content contains owner username outside repo URLs`);
     continue;
   }

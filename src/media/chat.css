@@ -65,6 +65,31 @@ body {
   flex: 0 0 auto;
 }
 
+/* DSH 升级候选横幅（顶栏常驻，直到用户操作；不侵入右侧命令按钮区） */
+.dsh-update {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--warn);
+  flex: 0 0 auto;
+}
+.dsh-update .btn {
+  padding: 1px 8px;
+  font-size: 11px;
+}
+.dsh-update-link {
+  color: var(--accent);
+  cursor: pointer;
+  text-decoration: underline;
+}
+/* header 中的 DSH 版本（logo 之后、会话主题之前） */
+.header-version {
+  font-size: 11px;
+  color: var(--muted);
+  flex: 0 0 auto;
+}
+
 /* ---- composer tools（模型提供者 / 模型 / 思考等级 / 工作模式 + 发送按钮同一行） ---- */
 .composer-tools {
   display: flex;
