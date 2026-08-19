@@ -9,6 +9,9 @@ node_modules/
 # ---- 冒烟测试隔离目录（verify-host-boot.mjs）----
 /.smoke-home/
 
+# ---- 探针临时 DSH home（adapt-probe.mjs 运行残留；绝不提交）----
+/scripts/.probe-home/
+
 # ---- 系统/编辑器 ----
 .vscode/
 .idea/

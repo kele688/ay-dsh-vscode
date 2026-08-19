@@ -18,7 +18,6 @@
   const btnExportFull = $("btnExportFull");
   const topbarEl = $("topbar");
   const sessionTitleEl = $("sessionTitle");
-  const costStatsEl = $("costStats");
   const contextPctEl = $("contextPct");
   const tokensInEl = $("tokensIn");
   const stepsEl = $("steps");
@@ -32,32 +31,21 @@
   const selEffort = $("selEffort");
   const selWorkMode = $("selWorkMode");
 
-  // DeepSeek 官方人民币定价（CNY / 1M tokens；仅对已知模型计价，未知模型显示"—"）。
-  // 货币符号（¥）与计价单位（人民币）保持一致，与官方 API 实际计费单位相同。
-  // 现役模型为 deepseek-v4-flash / deepseek-v4-pro，按官方公布的人民币基准价估算
-  // （与 deepseek-chat / deepseek-reasoner 同档：约等于旧版 USD 0.27/0.07/1.1 与
-  // 0.55/0.14/2.19 按官方汇率换算）；官方自 2026-08-17 起实行高峰/闲时分时计价，
-  // 此处为基准价，仅供参考。deepseek-chat / deepseek-reasoner 已停止服务（旧模型
-  // 下线），下方价格仅作旧会话历史统计的参考，不再用于新会话。
-  const PRICES = {
-    "deepseek-chat": { input: 2, cache: 0.5, output: 8 }, // 已停服，历史参考
-    "deepseek-reasoner": { input: 4, cache: 1, output: 16 }, // 已停服，历史参考
-    "deepseek-v4-flash": { input: 2, cache: 0.5, output: 8 }, // 现役模型，基准价估算
-    "deepseek-v4-pro": { input: 4, cache: 1, output: 16 }, // 现役模型，基准价估算
-  };
-
   const state = {
     running: false,
     compacting: false, // 上下文压缩进行中（发送按钮禁用，防止与压缩冲突）
     resuming: false, // 正在恢复历史会话（history 帧渲染完成前锁定发送，防止用户消息被清空）
+    exporting: false, // 正在导出完整会话记录（导出按钮禁用，防止重复导出）
     discardPending: false, // 停止后：丢弃随后到达的本轮收尾消息（未接收完的输出不再渲染）
     approvals: new Map(), // id -> {toolName, reason}
     currentAssistant: null, // 当前正在流式输出的助手消息元素
     currentReasoning: null,
     pendingApprovalId: null,
     sessionId: null, // 当前会话 id（bootstrap 时更新）
+    viewSessionId: null, // 只读浏览中的会话 id（子代理会话；非 null = 浏览模式，发送禁用）
     stats: null, // 最近一次会话统计
-    modelInfo: null, // provider/model 目录 + 当前选择
+    modelInfo: null, // （历史遗留字段，无读取方；保留以兼容旧帧结构）
+    providerModels: {}, // 按提供商分组的模型（provider -> model id 列表），模型下拉过滤用
     suppressSelectorEvents: false, // 填充下拉时抑制 change 事件
     historyMore: null, // {hasMore, nextSeq} 分页状态
     historyLoadingMore: false, // 正在加载更早历史（防重入）
@@ -86,6 +74,10 @@
       currentSession: " · 当前会话",
       resume: "▶ 继续",
       resumeTitle: "重新加载此会话并继续对话",
+      view: "查看",
+      viewTitle: "只读浏览该子代理会话的历史（不成为对话宿主）",
+      viewingSession: (id) => `浏览模式：正在查看子代理会话 ${id}（只读，切换真实会话后恢复）`,
+      viewFailed: "浏览会话失败，已恢复原会话",
       restoring: "正在恢复会话…",
       restartingHint: "正在恢复原会话…",
       del: "🗑 删除",
@@ -108,8 +100,19 @@
       loadFailed: (e) => `加载失败：${e}`,
       resumed: (id) => `已恢复会话 ${id}…`,
       deleteFailed: (e) => `删除会话失败：${e}`,
+      historyMainGroup: "主代理会话",
+      historySubGroup: "子代理会话",
+      rename: "重命名",
+      renameTitle: "重命名会话标题",
+      renameOk: "确定",
+      renameCancel: "取消",
+      renameFailed: (e) => `重命名失败：${e}`,
       exportTitle: "导出完整对话记录（浏览器打开，含全部思考与工具详情）",
       exportDisabledTitle: "尚无会话内容，发送第一条消息后可用",
+      exporting: "正在导出完整对话记录…",
+      exportingTitle: "正在导出完整对话记录，完成后恢复",
+      exported: (p) => `已导出：${p}`,
+      exportFailed: (e) => `导出失败：${e}`,
       noContent: "尚无对话内容：发送第一条消息后即可导出完整记录。",
       newSessionTitle: "新会话",
       compacting: "正在压缩上下文…",
@@ -117,7 +120,6 @@
       compactFailed: (e) => `压缩失败：${e}`,
       compactTimeout: "压缩超时（宿主无响应），已恢复输入，请稍后重试",
       compactBusyTitle: "Agent 运行中，完成当前任务后才能压缩上下文",
-      costTitle: (m) => `估算费用（${m || "—"}，仅供参考）`,
       ctxTitle: (used, win) => `上下文占用 ${used} / ${win} tokens`,
       tokensInTitle: "累计输入 tokens（缓存未命中）",
       stepsTitle: "本会话累计AI调用次数（会话删除前始终累计）",
@@ -149,6 +151,10 @@
       currentSession: " · current",
       resume: "▶ Resume",
       resumeTitle: "Reload this session and continue the conversation",
+      view: "View",
+      viewTitle: "Read-only: browse this subagent session history (does not become the host)",
+      viewingSession: (id) => `Browsing subagent session ${id} (read-only; resume a real session to continue)`,
+      viewFailed: "Failed to browse session — restored the original session",
       restoring: "Restoring session…",
       restartingHint: "Restoring the previous session…",
       del: "🗑 Delete",
@@ -171,8 +177,19 @@
       loadFailed: (e) => `Load failed: ${e}`,
       resumed: (id) => `Session resumed ${id}…`,
       deleteFailed: (e) => `Delete failed: ${e}`,
+      historyMainGroup: "Main Agent Sessions",
+      historySubGroup: "Subagent Sessions",
+      rename: "Rename",
+      renameTitle: "Rename session title",
+      renameOk: "OK",
+      renameCancel: "Cancel",
+      renameFailed: (e) => `Rename failed: ${e}`,
       exportTitle: "Export full conversation (opens in browser, includes all reasoning & tool details)",
       exportDisabledTitle: "No session content yet — available after the first message",
+      exporting: "Exporting full conversation…",
+      exportingTitle: "Exporting full conversation — button re-enables when done",
+      exported: (p) => `Exported: ${p}`,
+      exportFailed: (e) => `Export failed: ${e}`,
       noContent: "No conversation yet: send the first message to enable export.",
       newSessionTitle: "New session",
       compacting: "Compacting context…",
@@ -180,7 +197,6 @@
       compactFailed: (e) => `Compaction failed: ${e}`,
       compactTimeout: "Compaction timed out (host unresponsive); input restored — retry shortly",
       compactBusyTitle: "Agent is busy; compaction is available after the current task finishes",
-      costTitle: (m) => `Estimated cost (${m || "—"}, approximate)`,
       ctxTitle: (used, win) => `Context usage ${used} / ${win} tokens`,
       tokensInTitle: "Total input tokens (cache miss)",
       stepsTitle: "Total AI calls in this session (accumulates until the session is deleted)",
@@ -312,7 +328,12 @@
       state.historyLoadingMore = true;
       clearTimeout(historyScrollTimer);
       historyScrollTimer = setTimeout(() => {
-        vscode.postMessage({ t: "loadMoreHistory", beforeSeq: state.historyMore.nextSeq });
+        // 只读浏览模式（子代理会话）分页需带 sessionId（宿主从持久化读取）
+        vscode.postMessage({
+          t: "loadMoreHistory",
+          beforeSeq: state.historyMore.nextSeq,
+          sessionId: state.viewSessionId || undefined,
+        });
       }, 250);
     }
   });
@@ -326,7 +347,7 @@
     return s.length > max ? s.slice(0, max) + t("truncated") : s;
   }
 
-  /* ---------------- 顶部信息栏（会话标题 / 费用 / 上下文占比 / token 用量） ---------------- */
+  /* ---------------- 顶部信息栏（会话标题 / 上下文占比 / token 用量） ---------------- */
 
   /** 紧凑数字格式化：1234 → 1.2k，1234567 → 1.2m。 */
   function fmtNum(n) {
@@ -336,26 +357,7 @@
     return String(Math.round(n));
   }
 
-  /** 人民币金额格式化（符号 ¥ 与计费单位 CNY 一致）。 */
-  function fmtCost(cny) {
-    if (!Number.isFinite(cny) || cny <= 0) return "¥0.00";
-    if (cny < 0.01) return "<¥0.01";
-    return "¥" + cny.toFixed(2);
-  }
-
-  /**
-   * 根据模型名取价格表。
-   * @returns 价格对象，或 null（模型不在表内 → 价格未知，不计价、不估算）。
-   */
-  function priceFor(model) {
-    const key = (model || "").toLowerCase();
-    for (const name of Object.keys(PRICES)) {
-      if (key.includes(name)) return PRICES[name];
-    }
-    return null;
-  }
-
-  /** 渲染顶部信息栏（单行）：估算费用、上下文占比、token 用量（含缓存命中率）、压缩按钮。 */
+  /** 渲染顶部信息栏（单行）：上下文占比、token 用量（含缓存命中率）、压缩按钮。 */
   function renderStats(stats) {
     state.stats = stats;
     topbarEl.classList.remove("hidden");
@@ -370,27 +372,6 @@
       sessionTitleEl.title = "";
     }
 
-    // 估算费用：仅当模型价格已知时才计算；未知模型显示"—"（不给错误数值）。
-    // 模型名优先取会话统计（含历史恢复快照）；旧会话快照缺 model 时回退到
-    // 当前选择（下拉 / modelInfo），保证恢复历史后金额仍能按当前模型估算。
-    const priceModel =
-      stats.model ||
-      state.modelInfo?.current?.model ||
-      selModel.value ||
-      "";
-    const price = priceFor(priceModel);
-    if (price) {
-      const cost =
-        (stats.inputTokens / 1e6) * price.input +
-        (stats.cacheReadTokens / 1e6) * price.cache +
-        (stats.outputTokens / 1e6) * price.output;
-      costStatsEl.textContent = fmtCost(cost);
-      costStatsEl.title = t("costTitle", priceModel || "");
-    } else {
-      costStatsEl.textContent = "—";
-      costStatsEl.title = priceModel ? `价格未知（${priceModel}）` : "价格未知";
-    }
-
     // 上下文占比：最近一次请求输入（含缓存读取）占上下文窗口的百分比
     if (stats.contextWindow && stats.lastRequestInput) {
       const pct = Math.min(100, (stats.lastRequestInput / stats.contextWindow) * 100);
@@ -403,7 +384,7 @@
       contextPctEl.classList.remove("warn");
     }
 
-    // token 用量（与费用/上下文同一行）：有统计才显示
+    // token 用量（与上下文同一行）：有统计才显示
     const hasTokens = stats.inputTokens > 0 || stats.cacheReadTokens > 0 || stats.outputTokens > 0 || (stats.steps ?? 0) > 0;
     topbarEl.classList.toggle("has-tokens", hasTokens);
     // API 调用次数（step，对应 dsh web）：显示在输入 token 前面
@@ -428,9 +409,36 @@
   /** 思考等级选项（固定顺序：off → low → high → max；值一律小写，与内核一致）。 */
   const EFFORT_OPTIONS = ["off", "low", "high", "max"];
 
+  /** 按提供商填充模型下拉（模型与提供商一一对应：只显示该提供商已配置的模型）。
+   *  providerModels 条目为 {id, name}：下拉**显示名称**、值用 id（内部以 id 传递识别，
+   *  与提供商下拉"显示名称、值用 id"的约定一致）。 */
+  function fillModelDropdown(provider, currentModel) {
+    selModel.innerHTML = "";
+    const list = (state.providerModels && state.providerModels[provider]) || [];
+    if (list.length === 0) {
+      // 该提供商暂无模型目录：先放占位（与 selProvider change 的空列表行为一致），
+      // 若当前模型真实存在，下方会以 "✦" 追加项保留可选
+      const ph = el("option", "", "…");
+      ph.value = "";
+      selModel.appendChild(ph);
+    } else {
+      for (const m of list) {
+        const opt = el("option", "", m.name || m.id);
+        opt.value = m.id;
+        selModel.appendChild(opt);
+      }
+    }
+    if (currentModel && ![...selModel.options].some((o) => o.value === currentModel)) {
+      const opt = el("option", "", currentModel + " ✦");
+      opt.value = currentModel;
+      selModel.appendChild(opt);
+    }
+    selModel.value = currentModel || selModel.options[0]?.value || "";
+  }
+
   /** 填充模型/提供者下拉并同步当前选择（来自 host 的 modelInfo 帧）。 */
   function renderModelInfo(info) {
-    state.modelInfo = info;
+    state.providerModels = info.providerModels || {};
     if (!info) return;
     state.suppressSelectorEvents = true;
     // provider 下拉
@@ -442,21 +450,8 @@
       selProvider.appendChild(opt);
     }
     selProvider.value = info.current.provider || providers[0].id;
-    // model 下拉（备忘：现役模型为 deepseek-v4-flash / deepseek-v4-pro；
-    // deepseek-chat / deepseek-reasoner 已停止服务，不再作为兜底候选）
-    selModel.innerHTML = "";
-    const models = info.models.length > 0 ? info.models : [info.current.model || "deepseek-v4-flash"];
-    for (const m of models) {
-      const opt = el("option", "", m);
-      opt.value = m;
-      selModel.appendChild(opt);
-    }
-    if (info.current.model && !models.includes(info.current.model)) {
-      const opt = el("option", "", info.current.model + " ✦");
-      opt.value = info.current.model;
-      selModel.appendChild(opt);
-    }
-    selModel.value = info.current.model || "";
+    // model 下拉：按当前选中提供商过滤（只显示该提供商的模型）
+    fillModelDropdown(selProvider.value, info.current.model);
     // 思考等级：按 off/low/high/max 固定顺序渲染 4 档，值/显示均小写。
     // host 返回的 supportedEfforts 为插件语义层四档（low 由宿主映射为 high，
     // 不会触发内核 UNSUPPORTED 报错），故四档均可选。
@@ -498,13 +493,12 @@
         }
         if (found) selModel.value = info.model;
       }
-      if (info.reasoningEffort && !info.error) selEffort.value = info.reasoningEffort;
       state.suppressSelectorEvents = false;
       return;
     }
     if (info.provider) selProvider.value = info.provider;
     if (info.model) {
-      // 若新模型不在下拉中则追加
+      // 若新模型不在下拉中则追加（显示名称：优先从 providerModels 查，查不到用 id）
       let found = false;
       for (const opt of selModel.options) {
         if (opt.value === info.model) {
@@ -513,7 +507,8 @@
         }
       }
       if (!found) {
-        const opt = el("option", "", info.model + " ✦");
+        const entry = (state.providerModels?.[info.provider] || []).find((m) => m.id === info.model);
+        const opt = el("option", "", (entry && (entry.name || entry.id)) || info.model + " ✦");
         opt.value = info.model;
         selModel.appendChild(opt);
       }
@@ -889,7 +884,7 @@
       const wrap = wraps[idx];
       if (wrap._dshCallId === callId) {
         const head = wrap.querySelector(".tool-inline-head");
-        head.textContent = `⚙ ${wrap.querySelector(".tool-inline-head").textContent.replace(/^⚙ /, "")} ${ok ? t("done") : t("failed")}`;
+        if (head) head.textContent = `⚙ ${head.textContent.replace(/^⚙ /, "")} ${ok ? t("done") : t("failed")}`;
         const body = wrap.querySelector(".bubble");
         const resultPre = el("pre", "tool-inline-result");
         resultPre.textContent = t("result") + "\n" + truncate(text, 4000);
@@ -963,6 +958,56 @@
     }
   });
 
+  /* ---------------- 会话重命名（触发行下方就近内联输入条） ---------------- */
+  let renameSessionId = null;
+  let renameInlineEl = null;
+
+  /** 关闭当前重命名输入条（幂等）。 */
+  function closeRenameInline() {
+    if (renameInlineEl !== null) {
+      renameInlineEl.remove();
+      renameInlineEl = null;
+    }
+    renameSessionId = null;
+  }
+
+  /** 在历史会话行下方就近展开重命名输入条（预填当前标题；确定后发送 renameSession）。 */
+  function openRenameInline(rowEl, sessionId, currentTitle) {
+    closeRenameInline();
+    renameSessionId = sessionId;
+    const box = el("div", "rename-inline");
+    const input = document.createElement("input");
+    input.type = "text";
+    input.className = "rename-inline-input";
+    input.value = currentTitle || "";
+    input.maxLength = 200;
+    input.spellcheck = false;
+    const btnOk = el("button", "hbtn", t("renameOk"));
+    const btnCancel = el("button", "hbtn", t("renameCancel"));
+    const submit = () => {
+      const title = input.value.trim();
+      if (renameSessionId === null || title === "") return;
+      const id = renameSessionId;
+      closeRenameInline();
+      vscode.postMessage({ t: "renameSession", id, title });
+    };
+    btnOk.addEventListener("click", submit);
+    btnCancel.addEventListener("click", closeRenameInline);
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        submit();
+      } else if (e.key === "Escape") {
+        closeRenameInline();
+      }
+    });
+    box.append(input, btnOk, btnCancel);
+    rowEl.after(box);
+    renameInlineEl = box;
+    input.focus();
+    input.select();
+  }
+
   /* ---------------- 状态 ---------------- */
 
   /** 压缩按钮的常规标题（运行中/压缩中会临时替换）。 */
@@ -976,13 +1021,19 @@
    */
   function updateButtons() {
     const running = state.running;
-    const locked = state.compacting || state.resuming;
+    const locked = state.compacting || state.resuming || state.viewSessionId !== null;
     btnSend.classList.toggle("stop", running);
     btnSend.textContent = running ? t("stop") : t("send");
     btnSend.title = running ? t("stopTitle") : "";
     btnSend.disabled = locked; // 运行中不禁用：按钮要能随时点击"停止"
     btnCompact.disabled = running || locked;
     btnCompact.title = running ? t("compactBusyTitle") : compactTitleText;
+    // 浏览模式/压缩/恢复历史中：模型参数四个下拉与"发送"同步禁用，
+    // 避免只读浏览时还能改动模型（改动无意义且会被后续帧覆盖）
+    selProvider.disabled = locked;
+    selModel.disabled = locked;
+    selEffort.disabled = locked;
+    selWorkMode.disabled = locked;
   }
 
   function setStatus(status) {
@@ -997,86 +1048,121 @@
   const historyList = $("historyList");
   let confirmDeleteId = null;
 
-  /** 渲染历史会话列表。 */
+  /** 渲染一个会话行（主/子代理共用；仅行内容不同，操作一致）。 */
+  function renderSessionRow(s) {
+    const row = el("div", "history-item");
+    const main = el("div", "history-main");
+    const title = el("div", "history-name", s.title || s.id.slice(0, 18) + "…");
+    const meta = el("div", "history-meta");
+    const when = new Date(s.updatedAt || s.createdAt).toLocaleString("zh-CN", {
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+    const cwdShort = s.cwd ? s.cwd.replace(/\\/g, "/").split("/").slice(-2).join("/") : "";
+    // 子代理会话附模型标识（便于辨认）；主代理同前
+    const modelShort = s.model ? ` · ${s.provider || ""}/${s.model}` : "";
+    meta.textContent = `${when}${s.live ? t("currentSession") : ""}${modelShort}${cwdShort ? " · " + cwdShort : ""}`;
+    main.appendChild(title);
+    main.appendChild(meta);
+    const actions = el("div", "history-actions");
+    // 子代理会话：只读浏览（不创建 agent、不成为对话宿主），主代理会话：继续
+    const isSub = s.kind === "sub";
+    const btnResume = el("button", "hbtn resume", isSub ? t("view") : t("resume"));
+    btnResume.title = isSub ? t("viewTitle") : t("resumeTitle");
+    btnResume.addEventListener("click", () => {
+      // 切换会话：点击瞬间立即清空旧会话消息区（不等 history 帧到达），
+      // 建立明确的"切换会话"观感；history 帧到达后再渲染选定会话的历史。
+      // （history 帧处理里还会幂等地再清一次，双保险）
+      flushStreamRender();
+      messagesEl.innerHTML = "";
+      state.currentAssistant = null;
+      state.streamText = "";
+      state.discardPending = false;
+      state.historyMore = null;
+      state.historyLoadingMore = false;
+      // 恢复期间锁定发送：history 帧到达（渲染完成）前，若用户发送消息，
+      // 本地渲染的用户消息会被 history 帧的 messagesEl.innerHTML = "" 清空，
+      // 造成"用户消息消失、应答在前"的错乱。锁定后等历史渲染完成再解锁。
+      state.resuming = true;
+      updateButtons();
+      // 兜底：宿主异常（history 帧迟迟不到）时 15 秒后自动解锁，防止发送被永久禁用
+      clearTimeout(resumeTimer);
+      resumeTimer = setTimeout(() => {
+        if (state.resuming) {
+          state.resuming = false;
+          updateButtons();
+        }
+      }, 15000);
+      if (isSub) {
+        vscode.postMessage({ t: "viewSession", id: s.id });
+      } else {
+        vscode.postMessage({ t: "resumeSession", id: s.id });
+      }
+      historyPanel.classList.add("hidden");
+      setHint(t("restoring"));
+      updateEmptyState();
+    });
+    const btnRename = el("button", "hbtn rename", t("rename"));
+    btnRename.title = t("renameTitle");
+    btnRename.addEventListener("click", () => {
+      // 在触发行下方就近展开输入条（webview 不支持 window.prompt）
+      openRenameInline(row, s.id, s.title || "");
+    });
+    const btnDelete = el("button", "hbtn delete", t("del"));
+    btnDelete.title = t("delTitle");
+    btnDelete.addEventListener("click", () => {
+      if (confirmDeleteId === s.id) {
+        confirmDeleteId = null;
+        vscode.postMessage({ t: "deleteSession", id: s.id });
+        btnDelete.textContent = t("del");
+      } else {
+        confirmDeleteId = s.id;
+        btnDelete.textContent = t("confirmDel");
+        btnDelete.classList.add("confirming");
+        setTimeout(() => {
+          if (confirmDeleteId === s.id) {
+            confirmDeleteId = null;
+            btnDelete.textContent = t("del");
+            btnDelete.classList.remove("confirming");
+          }
+        }, 3000);
+      }
+    });
+    actions.appendChild(btnResume);
+    actions.appendChild(btnRename);
+    actions.appendChild(btnDelete);
+    row.appendChild(main);
+    row.appendChild(actions);
+    return row;
+  }
+
+  /**
+   * 渲染历史会话列表：分两组展示——主代理会话与子代理会话，各自按
+   * 更新时间排序（新的在上），同方式管理（继续/重命名/删除）。
+   */
   function renderHistory(list) {
     historyList.innerHTML = "";
     if (!list || list.length === 0) {
       historyList.appendChild(el("div", "history-empty", t("emptyHistory")));
       return;
     }
-    for (const s of list) {
-      const row = el("div", "history-item");
-      const main = el("div", "history-main");
-      const title = el("div", "history-name", s.title || s.id.slice(0, 18) + "…");
-      const meta = el("div", "history-meta");
-      const when = new Date(s.updatedAt || s.createdAt).toLocaleString("zh-CN", {
-        month: "2-digit",
-        day: "2-digit",
-        hour: "2-digit",
-        minute: "2-digit",
-      });
-      const cwdShort = s.cwd ? s.cwd.replace(/\\/g, "/").split("/").slice(-2).join("/") : "";
-      meta.textContent = `${when}${s.live ? t("currentSession") : ""}${cwdShort ? " · " + cwdShort : ""}`;
-      main.appendChild(title);
-      main.appendChild(meta);
-      const actions = el("div", "history-actions");
-      const btnResume = el("button", "hbtn resume", t("resume"));
-      btnResume.title = t("resumeTitle");
-      btnResume.addEventListener("click", () => {
-        // 切换会话：点击瞬间立即清空旧会话消息区（不等 history 帧到达），
-        // 建立明确的"切换会话"观感；history 帧到达后再渲染选定会话的历史。
-        // （history 帧处理里还会幂等地再清一次，双保险）
-        flushStreamRender();
-        messagesEl.innerHTML = "";
-        state.currentAssistant = null;
-        state.streamText = "";
-        state.discardPending = false;
-        state.historyMore = null;
-        state.historyLoadingMore = false;
-        // 恢复期间锁定发送：history 帧到达（渲染完成）前，若用户发送消息，
-        // 本地渲染的用户消息会被 history 帧的 messagesEl.innerHTML = "" 清空，
-        // 造成"用户消息消失、应答在前"的错乱。锁定后等历史渲染完成再解锁。
-        state.resuming = true;
-        updateButtons();
-        // 兜底：宿主异常（history 帧迟迟不到）时 15 秒后自动解锁，防止发送被永久禁用
-        clearTimeout(resumeTimer);
-        resumeTimer = setTimeout(() => {
-          if (state.resuming) {
-            state.resuming = false;
-            updateButtons();
-          }
-        }, 15000);
-        vscode.postMessage({ t: "resumeSession", id: s.id });
-        historyPanel.classList.add("hidden");
-        setHint(t("restoring"));
-        updateEmptyState();
-      });
-      const btnDelete = el("button", "hbtn delete", t("del"));
-      btnDelete.title = t("delTitle");
-      btnDelete.addEventListener("click", () => {
-        if (confirmDeleteId === s.id) {
-          confirmDeleteId = null;
-          vscode.postMessage({ t: "deleteSession", id: s.id });
-          btnDelete.textContent = t("del");
-        } else {
-          confirmDeleteId = s.id;
-          btnDelete.textContent = t("confirmDel");
-          btnDelete.classList.add("confirming");
-          setTimeout(() => {
-            if (confirmDeleteId === s.id) {
-              confirmDeleteId = null;
-              btnDelete.textContent = t("del");
-              btnDelete.classList.remove("confirming");
-            }
-          }, 3000);
-        }
-      });
-      actions.appendChild(btnResume);
-      actions.appendChild(btnDelete);
-      row.appendChild(main);
-      row.appendChild(actions);
-      historyList.appendChild(row);
-    }
+    const sortByUpdated = (a, b) => (b.updatedAt || b.createdAt) - (a.updatedAt || a.createdAt);
+    const mainSessions = list.filter((s) => s.kind !== "sub").sort(sortByUpdated);
+    const subSessions = list.filter((s) => s.kind === "sub").sort(sortByUpdated);
+
+    const appendGroup = (titleText, sessions) => {
+      if (sessions.length === 0) return;
+      const head = el("div", "history-group-title", titleText);
+      historyList.appendChild(head);
+      for (const s of sessions) {
+        historyList.appendChild(renderSessionRow(s));
+      }
+    };
+
+    appendGroup(t("historyMainGroup"), mainSessions);
+    appendGroup(t("historySubGroup"), subSessions);
   }
 
   let historyLoadTimer = null;
@@ -1084,6 +1170,7 @@
 
   function openHistory() {
     confirmDeleteId = null;
+    closeRenameInline();
     historyPanel.classList.remove("hidden");
     historyList.innerHTML = "";
     historyList.appendChild(el("div", "history-empty", t("loading")));
@@ -1177,6 +1264,11 @@
       case "bootstrap": {
         // 语言跟随 VS Code 界面语言
         L = msg.locale === "en" ? I18N.en : I18N.zh;
+        // 切换真实会话（继续/新会话）：退出子代理只读浏览模式
+        if (state.viewSessionId !== null && msg.sessionId !== state.viewSessionId) {
+          state.viewSessionId = null;
+          updateButtons();
+        }
         const isNewEmpty = !msg.sessionId && Boolean(state.sessionId);
         if (isNewEmpty) {
           // 切到"新会话"（有旧会话 -> 空会话）：清空消息区与顶部统计，
@@ -1192,7 +1284,6 @@
           messagesEl.innerHTML = "";
           state.stats = null;
           sessionTitleEl.textContent = "";
-          costStatsEl.textContent = "—";
           contextPctEl.textContent = "🧠 —";
           tokensInEl.textContent = "↗ 0";
           tokensCacheEl.textContent = "⇄ 0";
@@ -1331,6 +1422,7 @@
         break;
       }
       case "sessionDeleted": {
+        closeRenameInline();
         if (msg.ok) {
           // 刷新列表（若面板仍打开）
           if (!historyPanel.classList.contains("hidden")) {
@@ -1338,6 +1430,58 @@
           }
         } else {
           addErrorMessage(t("deleteFailed", msg.error ?? "unknown error"));
+        }
+        break;
+      }
+      case "sessionRenamed": {
+        closeRenameInline();
+        if (msg.ok) {
+          // 重命名成功：若当前会话就是被重命名的，同步顶部标题与 stats 缓存
+          // （stats 帧可能用旧 title 覆盖回来），并刷新历史列表
+          if (msg.id === state.sessionId && msg.title) {
+            sessionTitleEl.textContent = msg.title;
+            sessionTitleEl.title = msg.title;
+            if (state.stats) state.stats = { ...state.stats, title: msg.title };
+          }
+          if (!historyPanel.classList.contains("hidden")) {
+            vscode.postMessage({ t: "historyRefresh" });
+          }
+        } else {
+          addErrorMessage(t("renameFailed", msg.error ?? "unknown error"));
+        }
+        break;
+      }
+      case "sessionExported": {
+        // 导出完成/失败：恢复导出按钮；结果只走提示区 + 状态栏（不弹框）
+        if (state.exporting) {
+          state.exporting = false;
+          clearTimeout(exportTimer);
+          updateExportButton();
+          setHint(msg.ok ? t("exported", msg.path ?? "") : t("exportFailed", msg.error ?? "unknown error"));
+        }
+        break;
+      }
+      case "viewSession": {
+        // 只读浏览模式（子代理会话）：history 帧已渲染历史，锁定发送；
+        // 切换真实会话（ready 帧）时自动退出。
+        state.viewSessionId = msg.id;
+        state.resuming = false;
+        updateButtons();
+        setHint(t("viewingSession", msg.id.slice(0, 8)));
+        break;
+      }
+      case "viewSessionFailed": {
+        // 浏览会话失败（读不到该会话历史）：消息区已被清空且发送锁定，
+        // 自动恢复原真实会话视图，避免空白+锁死（需手动"继续"才能回来）。
+        const original = state.sessionId;
+        state.viewSessionId = null;
+        state.resuming = false;
+        updateButtons();
+        if (original) {
+          vscode.postMessage({ t: "resumeSession", id: original });
+          setHint(t("viewFailed"));
+        } else {
+          setHint("");
         }
         break;
       }
@@ -1405,13 +1549,18 @@
     inputEl.style.overflowY = inputEl.scrollHeight > fiveLines ? "auto" : "hidden";
   }
 
-  /** 导出按钮状态：有会话内容时有效，无会话内容（未加载）时灰色禁用。 */
+  /** 导出按钮状态：有会话内容时有效，无会话内容（未加载）时灰色禁用；
+   *  导出进行中禁用（防止重复点击造成多次导出）。
+   *  浏览模式（viewSessionId）下导出目标即当前正在查看的子代理会话。 */
   function updateExportButton() {
-    const enabled = Boolean(state.sessionId);
+    const target = state.viewSessionId || state.sessionId;
+    const enabled = Boolean(target) && !state.exporting;
     btnExportFull.classList.toggle("disabled", !enabled);
-    btnExportFull.title = enabled
-      ? t("exportTitle")
-      : t("exportDisabledTitle");
+    btnExportFull.title = state.exporting
+      ? t("exportingTitle")
+      : enabled
+        ? t("exportTitle")
+        : t("exportDisabledTitle");
   }
 
   inputEl.addEventListener("input", autoResize);
@@ -1490,13 +1639,26 @@
   $("btnHistory").addEventListener("click", openHistory);
   $("btnHistoryRefresh").addEventListener("click", () => vscode.postMessage({ t: "historyRefresh" }));
   $("btnHistoryClose").addEventListener("click", closeHistory);
-  // 导出当前会话完整记录（面板顶部图标；无会话内容时为灰色无效）
+  // 导出当前会话完整记录（面板顶部图标；无会话内容时为灰色无效；
+  // 导出进行中禁用并提示，避免重复点击造成重复导出工作）
+  let exportTimer = null;
   btnExportFull.addEventListener("click", () => {
-    if (!state.sessionId) {
-      addErrorMessage(t("noContent"));
-      return;
-    }
-    vscode.postMessage({ t: "exportSession", id: state.sessionId });
+    // 导出当前会话：浏览模式下导出正在查看的子代理会话（与用户看到的对话一致）
+    const target = state.viewSessionId || state.sessionId;
+    if (!target || state.exporting) return;
+    state.exporting = true;
+    updateExportButton();
+    setHint(t("exporting"));
+    vscode.postMessage({ t: "exportSession", id: target });
+    // 兜底：导出异常无回执时 30 秒后恢复按钮，防止永久禁用
+    clearTimeout(exportTimer);
+    exportTimer = setTimeout(() => {
+      if (state.exporting) {
+        state.exporting = false;
+        updateExportButton();
+        setHint("");
+      }
+    }, 30000);
   });
 
   /* ---------------- 模型选择器 / 压缩 ---------------- */
@@ -1520,8 +1682,26 @@
 
   selProvider.addEventListener("change", () => {
     if (state.suppressSelectorEvents) return;
-    const model = selModel.value || undefined;
-    postSetModel({ provider: selProvider.value, model });
+    // 切换提供商：模型下拉重渲染为该提供商的模型，并**强制选中该提供商模型列表
+    // 第一项**（默认行为）——避免 model 停留在旧提供商的模型上造成 provider/model
+    // 不匹配（如 zai-free + deepseek-v4-flash）。用户之后再明确选模型则跟随修改。
+    const list = (state.providerModels && state.providerModels[selProvider.value]) || [];
+    selModel.innerHTML = "";
+    if (list.length === 0) {
+      const opt = el("option", "", "…");
+      opt.value = "";
+      selModel.appendChild(opt);
+    } else {
+      for (const m of list) {
+        const opt = el("option", "", m.name || m.id);
+        opt.value = m.id;
+        selModel.appendChild(opt);
+      }
+    }
+    // 默认选中第一项（list 为空时 value 为 ""，postSetModel 发送 provider + 空 model，
+    // 宿主会保留该 provider 的当前模型选择）
+    selModel.value = list.length > 0 ? list[0].id : "";
+    postSetModel({ provider: selProvider.value, model: selModel.value || undefined });
   });
 
   selModel.addEventListener("change", () => {
