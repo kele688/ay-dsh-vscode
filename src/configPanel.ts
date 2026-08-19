@@ -10,30 +10,35 @@
  *   ext -> panel: {t:"config", config} | {t:"folder", field, path} | {t:"saved", ok, message}
  */
 import * as vscode from "vscode";
+import type { ProviderApplyItem } from "./protocol";
 
 /** 配置命名空间（与 extension.ts 的 CONFIG_NS 一致）。 */
 const CONFIG_NS = "dshVscode";
 const SECRET_KEY = "dshVscode.apiKey";
 
-/**
- * 提供商预设列表（现状：由项目事先配置）。
- * 将来支持动态添加 provider 配置时，由此常量扩展/替换（或从宿主 modelInfo 拉取）。
- * 选择提供商会联动：自动填充其默认 Base URL、更新模型候选列表。
- */
-const PROVIDER_PRESETS: { id: string; name: string; baseUrl: string; models: string[] }[] = [
-  {
-    id: "deepseek",
-    name: "DeepSeek",
-    baseUrl: "https://api.deepseek.com",
-    models: ["deepseek-v4-flash", "deepseek-v4-pro"],
-  },
-  {
-    id: "ollama",
-    name: "Ollama（本地）",
-    baseUrl: "http://localhost:11434/v1",
-    models: ["llama3.1", "qwen2.5"],
-  },
+/** 已接入的模型提供商（持久化于 workspaceState；可增删改）。 */
+export interface ProviderModel {
+  id: string;
+  displayName?: string;
+  contextWindow?: string;
+  maxOutput?: string;
+}
+export interface ProviderInfo {
+  id: string;
+  name: string;
+  type: string;
+  baseUrl: string;
+  protocol?: string;
+  models: ProviderModel[];
+}
+
+/** 首次打开时的预置提供商。 */
+const DEFAULT_PROVIDERS: ProviderInfo[] = [
+  { id: "deepseek", name: "DeepSeek", type: "deepseek", baseUrl: "https://api.deepseek.com", models: [{ id: "deepseek-v4-flash" }, { id: "deepseek-v4-pro" }] },
+  { id: "ollama", name: "Ollama (local)", type: "ollama", baseUrl: "http://localhost:11434/v1", models: [{ id: "llama3.1" }, { id: "qwen2.5" }] },
 ];
+const PROVIDERS_KEY = "dshProviders";
+const providerSecretKey = (id: string): string => `dshVscode.provider.${id}.apiKey`;
 
 export interface ConfigPanelDeps {
   /** 读取当前生效配置（API Key 不含密钥库，面板侧自行合并判断）。 */
@@ -56,8 +61,17 @@ export interface ConfigPanelDeps {
    */
   onConfigSaveStart: () => void;
   onConfigSaveEnd: () => void;
-  /** 保存成功后回调：锁定 UI + 按新配置重启宿主 + 刷新聊天视图。 */
-  onSaved: () => void;
+  /** 保存成功后回调：restart=true 表示宿主运行参数已变化（锁定 UI + 重启宿主），
+   *  false 表示仅刷新视图（提供商变更已热生效，无需重启）。 */
+  onSaved: (restart: boolean) => void;
+  /** 查询 DSH 提供商目录（Provider ID 下拉数据源；宿主未运行则先拉起）。 */
+  queryProviders: () => Promise<{ id: string; name: string }[]>;
+  /** 把整套提供商配置同步进 DSH（llm-pi-ai settings + credentials，热生效）。 */
+  applyProviders: (providers: ProviderApplyItem[]) => Promise<string | undefined>;
+  /** 模型发现（catalog 提供商免网络返回模型+元数据；未知提供商探活端点）。 */
+  discoverModels: (opts: { provider?: string; baseURL?: string; api?: string; apiKey?: string }) => Promise<{ models: { id: string; name?: string; contextWindow?: number; maxTokens?: number }[]; error?: string }>;
+  /** 提供商配置同步完成后回调（扩展侧触发宿主 getModelInfo，刷新聊天面板模型列表）。 */
+  onProvidersSynced: () => void;
 }
 
 let activePanel: vscode.WebviewPanel | undefined;
@@ -88,28 +102,103 @@ export function openConfigPanel(context: vscode.ExtensionContext, deps: ConfigPa
   const styleUri = panel.webview.asWebviewUri(vscode.Uri.joinPath(context.extensionUri, "media", "config-panel.css"));
   panel.webview.html = renderHtml(panel.webview, scriptUri, styleUri, zh);
 
-  /** 向面板推送当前配置快照（init 与保存成功后复用，保证 keyConfigured 等状态始终新鲜）。 */
+  /** 读取已接入提供商（globalState 跨工作区持久化；首次自动初始化预置列表）。
+   *  兼容迁移：重构前存于 workspaceState（per-workspace），读到则迁入 globalState。 */
+  const loadProviders = (): ProviderInfo[] => {
+    const saved = context.globalState.get<ProviderInfo[]>(PROVIDERS_KEY);
+    if (Array.isArray(saved) && saved.length > 0) return saved;
+    const legacy = context.workspaceState.get<ProviderInfo[]>(PROVIDERS_KEY);
+    if (Array.isArray(legacy) && legacy.length > 0) {
+      void context.globalState.update(PROVIDERS_KEY, legacy);
+      return legacy;
+    }
+    const init = DEFAULT_PROVIDERS;
+    void context.globalState.update(PROVIDERS_KEY, init);
+    return init;
+  };
+  const saveProviders = (list: ProviderInfo[]): void => {
+    void context.globalState.update(PROVIDERS_KEY, list);
+  };
+
+  /** 把当前提供商列表（含已存密钥）全量同步进 DSH（llm-pi-ai settings + credentials，热生效）。
+   *  失败不阻塞面板：宿主侧记录错误，下次保存会再次尝试。 */
+  const syncProvidersToHost = async (): Promise<void> => {
+    try {
+      const items: ProviderApplyItem[] = await Promise.all(
+        loadProviders().map(async (p) => {
+          let apiKey: string | undefined;
+          try {
+            apiKey = (await context.secrets.get(providerSecretKey(p.id))) ?? undefined;
+          } catch {
+            apiKey = undefined;
+          }
+          return { id: p.id, name: p.name, baseUrl: p.baseUrl, protocol: p.protocol, models: p.models, apiKey };
+        })
+      );
+      await deps.applyProviders(items);
+      deps.onProvidersSynced();
+    } catch {
+      // 同步失败不阻塞面板
+    }
+  };
+
+  /** 向面板推送当前配置快照（init 与保存成功后复用）。防御：任何异常都推最小快照，
+   *  避免面板白屏（providers/字段全空的表象往往是 sendConfig 抛错）。 */
   const sendConfig = async () => {
-    const c = deps.readConfig();
-    const secretKey = await context.secrets.get(SECRET_KEY);
-    const cfg = vscode.workspace.getConfiguration(CONFIG_NS);
-    panel.webview.postMessage({
-      t: "config",
-      config: {
-        keyConfigured: Boolean(c.apiKey ?? secretKey),
-        model: c.model,
-        baseUrl: c.baseUrl ?? "",
-        permissionMode: c.permissionMode,
-        nodePath: c.nodePath,
-        defaultWorkspace: cfg.get<string>("defaultWorkspace") ?? "",
-        maxOutputChars: cfg.get<number>("maxOutputChars") ?? 40000,
-        maxSteps: cfg.get<number>("maxSteps") ?? 100,
-        subagentMaxDepth: cfg.get<number>("subagentMaxDepth") ?? 3,
-        maxParallelSubagents: cfg.get<number>("maxParallelSubagents") ?? 5,
-        cwd: deps.workspaceRoot(),
-      },
-      providers: PROVIDER_PRESETS,
-    });
+    try {
+      const c = deps.readConfig();
+      const cfg = vscode.workspace.getConfiguration(CONFIG_NS);
+      // 密钥库查询逐项容错：单个提供商 secret 读取异常不影响整体配置推送
+      const providers = await Promise.all(
+        loadProviders().map(async (p) => {
+          let configured = false;
+          try {
+            configured = Boolean(await context.secrets.get(providerSecretKey(p.id)));
+            // 旧版全局 API Key（dshVscode.apiKey）迁移兜底：deepseek 条目读不到专属 key 时
+            // 视为已配置（旧面板曾把 deepseek key 存在全局键）。
+            if (!configured && p.id === "deepseek") {
+              configured = Boolean(await context.secrets.get(SECRET_KEY));
+            }
+          } catch {
+            configured = false;
+          }
+          return { ...p, apiKeyConfigured: configured };
+        })
+      );
+      panel.webview.postMessage({
+        t: "config",
+        config: {
+          permissionMode: c.permissionMode,
+          nodePath: c.nodePath,
+          defaultWorkspace: cfg.get<string>("defaultWorkspace") ?? "",
+          maxOutputChars: cfg.get<number>("maxOutputChars") ?? 40000,
+          maxSteps: cfg.get<number>("maxSteps") ?? 100,
+          subagentMaxDepth: cfg.get<number>("subagentMaxDepth") ?? 3,
+          maxParallelSubagents: cfg.get<number>("maxParallelSubagents") ?? 5,
+          cwd: deps.workspaceRoot(),
+        },
+        providers,
+      });
+    } catch (e) {
+      vscode.window.setStatusBarMessage(
+        `✗ Config panel load failed: ${e instanceof Error ? e.message : String(e)}`,
+        8000
+      );
+      panel.webview.postMessage({
+        t: "config",
+        config: {
+          permissionMode: "workspace-write",
+          nodePath: "",
+          defaultWorkspace: "",
+          maxOutputChars: 40000,
+          maxSteps: 100,
+          subagentMaxDepth: 3,
+          maxParallelSubagents: 5,
+          cwd: "",
+        },
+        providers: [],
+      });
+    }
   };
 
   panel.webview.onDidReceiveMessage(async (msg) => {
@@ -130,11 +219,140 @@ export function openConfigPanel(context: vscode.ExtensionContext, deps: ConfigPa
         panel.webview.postMessage({ t: "folder", field: msg.field, path: picked?.[0]?.fsPath });
         break;
       }
+      case "providerSave": {
+        // 新增/编辑提供商：id 存在则更新，否则追加；API Key 单独存密钥库。
+        // provider id 是唯一标识：新增时 id 已存在（重复添加）直接拒绝并提示。
+        const p = msg.provider as ProviderInfo | undefined;
+        if (!p?.id || !p?.name?.trim()) break;
+        const isEdit = msg.isEdit === true;
+        const list = loadProviders();
+        const idx = list.findIndex((x) => x.id === p.id);
+        if (!isEdit && idx >= 0) {
+          vscode.window.setStatusBarMessage(
+            zh ? `✗ 提供商 ${p.id} 已存在：id 唯一，请编辑而非重复添加` : `✗ Provider ${p.id} already exists: id is unique — edit it instead`,
+            6000
+          );
+          break;
+        }
+        const clean = { ...p, name: p.name.trim(), baseUrl: (p.baseUrl ?? "").trim(), models: Array.isArray(p.models) ? p.models : [] };
+        if (idx >= 0) list[idx] = clean;
+        else list.push(clean);
+        saveProviders(list);
+        if (typeof msg.apiKey === "string" && msg.apiKey !== "") {
+          await context.secrets.store(providerSecretKey(p.id), msg.apiKey);
+        }
+        await sendConfig();
+        void syncProvidersToHost();
+        break;
+      }
+      case "providerDelete": {
+        if (typeof msg.id !== "string") break;
+        saveProviders(loadProviders().filter((x) => x.id !== msg.id));
+        await context.secrets.delete(providerSecretKey(msg.id));
+        await sendConfig();
+        void syncProvidersToHost();
+        break;
+      }
+      case "queryProviders": {
+        // 提供商目录（DSH listProviders + listConfigurableProviders），Provider ID 下拉数据源
+        const list = await deps.queryProviders();
+        panel.webview.postMessage({ t: "providersCatalog", providers: list });
+        break;
+      }
+      case "fetchModels": {
+        // 实时查询提供商模型列表：优先走 DSH 模型发现（catalog 提供商返回模型+元数据，
+        // 无需网络与 key）；未知提供商回退 OpenAI 兼容 /models 端点查询（仅 id）。
+        // 编辑已配置密钥的提供商时输入框为空，用密钥库中已存 key 兜底。
+        const baseUrl = typeof msg.baseUrl === "string" ? msg.baseUrl.trim().replace(/\/+$/, "") : "";
+        const providerId = typeof msg.providerId === "string" ? msg.providerId : "";
+        let apiKey = typeof msg.apiKey === "string" ? msg.apiKey.trim() : "";
+        if (!apiKey && providerId !== "") {
+          try {
+            apiKey = (await context.secrets.get(providerSecretKey(providerId))) ?? "";
+            if (!apiKey) apiKey = (await context.secrets.get(SECRET_KEY)) ?? ""; // 旧版全局 key 迁移兜底
+          } catch {
+            apiKey = "";
+          }
+        }
+        const protocol = typeof msg.protocol === "string" ? msg.protocol : "openai-completions";
+        // 1) DSH 模型发现（知名提供商 catalog 免网络；自定义提供商用 baseURL/apiKey 探活）
+        if (providerId !== "") {
+          try {
+            const disc = await deps.discoverModels({
+              provider: providerId,
+              baseURL: baseUrl,
+              api: protocol,
+              apiKey: apiKey || undefined,
+            });
+            if (!disc.error && Array.isArray(disc.models) && disc.models.length > 0) {
+              panel.webview.postMessage({
+                t: "models",
+                models: disc.models.map((m) => ({ id: m.id, name: m.name, contextWindow: m.contextWindow, maxTokens: m.maxTokens })),
+              });
+              break;
+            }
+          } catch {
+            // 发现失败 → 回退网络查询
+          }
+        }
+        // 2) 回退：OpenAI 兼容 /models 端点
+        if (!baseUrl) {
+          panel.webview.postMessage({ t: "models", models: [], error: "missing baseUrl" });
+          break;
+        }
+        try {
+          // 网络查询加超时（10s）：慢端点/无响应时不至于让面板一直停在"查询中…"
+          const ctrl = new AbortController();
+          const timer = setTimeout(() => ctrl.abort(), 10000);
+          let res: Response;
+          try {
+            res = await fetch(`${baseUrl}/models`, {
+              headers: {
+                ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
+                "User-Agent": "ay-dsh-vscode",
+              },
+              signal: ctrl.signal,
+            });
+          } finally {
+            clearTimeout(timer);
+          }
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          const data = (await res.json()) as { data?: { id?: string }[] };
+          const models = (data.data ?? [])
+            .map((m) => m.id)
+            .filter((x): x is string => typeof x === "string")
+            .map((id) => ({ id }));
+          panel.webview.postMessage({ t: "models", models });
+        } catch (e) {
+          panel.webview.postMessage({
+            t: "models",
+            models: [],
+            error: e instanceof Error ? (e.name === "AbortError" ? "timeout" : e.message) : String(e),
+          });
+        }
+        break;
+      }
       case "save": {
         const v = msg.values ?? {};
         // 保存事务开始：扩展侧忽略逐项配置变更事件，等 onSaved 统一处理
         deps.onConfigSaveStart();
+        vscode.window.setStatusBarMessage(zh ? "⏳ 正在保存配置…" : "⏳ Saving settings…", 3000);
         try {
+          // 记录保存前生效的宿主运行参数（判断本次保存是否真的改变了需要重启的配置）
+          const prevC = deps.readConfig();
+          const prevCfg = vscode.workspace.getConfiguration(CONFIG_NS);
+          // 两侧都用同一套归一化逻辑，避免"读到的原始值"与"保存后的归一化值"
+          // 直接比较产生误判（如 maxSteps 未设置时 prev=undefined vs next=100，
+          // 会导致未改动也判定"运行参数变化"而重启宿主）。
+          const prev = {
+            permissionMode: prevC.permissionMode,
+            nodePath: prevC.nodePath,
+            defaultWorkspace: prevCfg.get<string>("defaultWorkspace") ?? "",
+            maxOutputChars: prevCfg.get<number>("maxOutputChars") ?? 40000,
+            maxSteps: Number.isFinite(prevC.maxSteps) && prevC.maxSteps >= 0 ? prevC.maxSteps : 100,
+            subagentMaxDepth: Number.isFinite(prevC.subagentMaxDepth) && prevC.subagentMaxDepth > 0 ? prevC.subagentMaxDepth : 3,
+            maxParallelSubagents: Number.isFinite(prevC.maxParallelSubagents) && prevC.maxParallelSubagents > 0 ? prevC.maxParallelSubagents : 5,
+          };
           // 1. API Key：清除 / 写入密钥库（写入时清空设置项，保持"密钥库优先"策略）
           if (v.clearKey) {
             await context.secrets.delete(SECRET_KEY);
@@ -144,11 +362,15 @@ export function openConfigPanel(context: vscode.ExtensionContext, deps: ConfigPa
               .getConfiguration(CONFIG_NS)
               .update("apiKey", "", vscode.ConfigurationTarget.Global);
           }
-          // 2. 普通配置项（Global）
+          // 2. 普通配置项（Global）。model/baseUrl 已归入提供商管理（面板不再发送）——
+          // 仅当面板显式提供时才更新，避免"保存运行环境配置"把当前模型重置为默认。
           const cfg = vscode.workspace.getConfiguration(CONFIG_NS);
-          const model = typeof v.model === "string" && v.model.trim() !== "" ? v.model.trim() : "deepseek-v4-flash";
-          await cfg.update("model", model, vscode.ConfigurationTarget.Global);
-          await cfg.update("baseUrl", typeof v.baseUrl === "string" ? v.baseUrl.trim() : "", vscode.ConfigurationTarget.Global);
+          if (typeof v.model === "string" && v.model.trim() !== "") {
+            await cfg.update("model", v.model.trim(), vscode.ConfigurationTarget.Global);
+          }
+          if (typeof v.baseUrl === "string") {
+            await cfg.update("baseUrl", v.baseUrl.trim(), vscode.ConfigurationTarget.Global);
+          }
           await cfg.update(
             "permissionMode",
             ["workspace-write", "read-only", "danger-full-access"].includes(v.permissionMode) ? v.permissionMode : "workspace-write",
@@ -176,8 +398,19 @@ export function openConfigPanel(context: vscode.ExtensionContext, deps: ConfigPa
             Number.isFinite(v.maxParallelSubagents) && v.maxParallelSubagents > 0 ? v.maxParallelSubagents : 5,
             vscode.ConfigurationTarget.Global
           );
-          // 3. 应用：所有配置项已写入完成（事务结束点）——由扩展统一按新配置重启宿主
-          deps.onSaved();
+          // 3. 应用：对比保存前后的宿主运行参数——只有确实变化才重启宿主；
+          //    提供商配置（经 llm-pi-ai settings 热生效）与无变化的保存都不重启。
+          const next = {
+            permissionMode: ["workspace-write", "read-only", "danger-full-access"].includes(v.permissionMode) ? v.permissionMode : "workspace-write",
+            nodePath: typeof v.nodePath === "string" ? v.nodePath.trim() : "",
+            defaultWorkspace: typeof v.defaultWorkspace === "string" ? v.defaultWorkspace.trim() : "",
+            maxOutputChars: Number.isFinite(v.maxOutputChars) && v.maxOutputChars > 0 ? v.maxOutputChars : 40000,
+            maxSteps: Number.isFinite(v.maxSteps) && v.maxSteps >= 0 ? v.maxSteps : 100,
+            subagentMaxDepth: Number.isFinite(v.subagentMaxDepth) && v.subagentMaxDepth > 0 ? v.subagentMaxDepth : 3,
+            maxParallelSubagents: Number.isFinite(v.maxParallelSubagents) && v.maxParallelSubagents > 0 ? v.maxParallelSubagents : 5,
+          };
+          const hostChanged = JSON.stringify(prev) !== JSON.stringify(next);
+          deps.onSaved(hostChanged);
           // 保存结果提示显示在 VS Code 状态栏（非阻塞，几秒后自动消失）
           vscode.window.setStatusBarMessage(
             zh ? "✅ 配置已保存，将在下次使用时生效" : "✅ Settings saved; effective on next use",
@@ -214,18 +447,13 @@ export function openConfigPanel(context: vscode.ExtensionContext, deps: ConfigPa
 function renderHtml(webview: vscode.Webview, scriptUri: vscode.Uri, styleUri: vscode.Uri, zh: boolean): string {
   const L = {
     title: zh ? "DSH 配置" : "DSH Settings",
+    navLabel: zh ? "配置分组" : "Settings groups",
     groupModel: zh ? "模型配置" : "Model",
+    providersTitle: zh ? "已接入模型提供商" : "Connected model providers",
+    addProvider: zh ? "＋ 添加提供商" : "+ Add provider",
+    addCustomProvider: zh ? "＋ 自定义提供商" : "+ Custom provider",
     groupRuntime: zh ? "运行环境" : "Runtime",
     groupControl: zh ? "控制参数" : "Control",
-    provider: zh ? "提供商（Provider）" : "Provider",
-    providerHint: zh ? "选择提供商后自动填充其默认 API 地址与模型候选" : "Picking a provider fills its default API endpoint and model list",
-    baseUrl: zh ? "Base URL" : "Base URL",
-    baseUrlHint: zh ? "留空时使用提供商默认 API 地址" : "Leave empty to use the provider's default API endpoint",
-    model: zh ? "模型" : "Model",
-    modelHint: zh ? "模型提供商的候选列表；也可输入任意模型 id" : "Models from the provider; any model id can be typed",
-    apiKey: zh ? "API Key" : "API Key",
-    apiKeyPlaceholder: zh ? "粘贴 API Key；留空表示保持不变" : "Paste API Key; leave empty to keep current",
-    clearKey: zh ? "清除已保存的 API Key" : "Clear saved API Key",
     workspace: zh ? "默认工作目录（未打开文件夹时）" : "Default working directory (when no folder is open)",
     workspaceHint: zh ? "Agent 生成的文件保存位置；留空使用 ~/ay-dsh-workspace" : "Where agent files are saved; empty uses ~/ay-dsh-workspace",
     cwd: zh ? "当前工作目录" : "Current working directory",
@@ -244,7 +472,6 @@ function renderHtml(webview: vscode.Webview, scriptUri: vscode.Uri, styleUri: vs
     maxParallelHint: zh ? "多 Agent 模式下同时派发的子代理数量上限（默认 5）" : "Max concurrently dispatched subagents in multi-agent mode (default 5)",
     browse: zh ? "浏览…" : "Browse…",
     save: zh ? "保存并应用" : "Save & Apply",
-    cancel: zh ? "取消" : "Cancel",
   };
 
   // CSP：与聊天视图同款写法（webview.cspSource 为标准做法）。
@@ -268,103 +495,93 @@ function renderHtml(webview: vscode.Webview, scriptUri: vscode.Uri, styleUri: vs
 <body data-locale="${zh ? "zh" : "en"}">
 <h1>◈ ${L.title}</h1>
 
-<h2 class="section-title">${L.groupModel}</h2>
+<div class="cfg-layout">
+  <nav class="cfg-sidebar" id="cfgSidebar" aria-label="${L.navLabel}">
+    <button type="button" class="cfg-nav active" data-group="model">${L.groupModel}</button>
+    <button type="button" class="cfg-nav" data-group="runtime">${L.groupRuntime}</button>
+    <button type="button" class="cfg-nav" data-group="control">${L.groupControl}</button>
+  </nav>
 
-<div class="field">
-  <label for="cfgProvider">${L.provider}</label>
-  <select id="cfgProvider"></select>
-  <span class="hint">${L.providerHint}</span>
+  <section class="cfg-content">
+    <div class="cfg-group active" data-group="model">
+      <div class="cfg-pane active" data-pane="main">
+        <div class="providers-section">
+          <h3 class="sub-title">${L.providersTitle}</h3>
+          <div class="providers-list" id="providersList"></div>
+          <div class="providers-actions">
+            <button type="button" class="secondary" id="cfgAddProvider">${L.addProvider}</button>
+            <button type="button" class="secondary" id="cfgAddCustomProvider">${L.addCustomProvider}</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="cfg-group" data-group="runtime">
+      <div class="cfg-pane active" data-pane="main">
+        <div class="field">
+          <label for="cfgDefaultWorkspace">${L.workspace}</label>
+          <div class="row">
+            <input type="text" id="cfgDefaultWorkspace" placeholder="~/ay-dsh-workspace" spellcheck="false">
+            <button type="button" class="secondary" id="cfgPickWorkspace">${L.browse}</button>
+          </div>
+          <span class="hint">${L.workspaceHint}</span>
+        </div>
+        <div class="field">
+          <label for="cfgCwd">${L.cwd}</label>
+          <div class="row">
+            <input type="text" id="cfgCwd" readonly spellcheck="false">
+          </div>
+        </div>
+        <div class="field">
+          <label for="cfgNodePath">${L.nodePath}</label>
+          <div class="row">
+            <input type="text" id="cfgNodePath" placeholder="C:\\Program Files\\nodejs\\node.exe" spellcheck="false">
+            <button type="button" class="secondary" id="cfgPickNode">${L.browse}</button>
+          </div>
+          <span class="hint">${L.nodePathHint}</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="cfg-group" data-group="control">
+      <div class="cfg-pane active" data-pane="main">
+        <div class="field">
+          <label for="cfgPermissionMode">${L.permission}</label>
+          <select id="cfgPermissionMode">
+            <option value="workspace-write">${L.pWorkspace}</option>
+            <option value="read-only">${L.pReadonly}</option>
+            <option value="danger-full-access">${L.pFull}</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="cfgMaxOutputChars">${L.maxOutput}</label>
+          <input type="number" id="cfgMaxOutputChars" min="1000" step="1000" value="40000">
+        </div>
+        <div class="field">
+          <label for="cfgMaxSteps">${L.maxSteps}</label>
+          <input type="number" id="cfgMaxSteps" min="0" step="10" value="100">
+          <span class="hint">${L.maxStepsHint}</span>
+        </div>
+        <div class="field">
+          <label for="cfgSubagentDepth">${L.subagentDepth}</label>
+          <input type="number" id="cfgSubagentDepth" min="1" step="1" value="3">
+          <span class="hint">${L.subagentDepthHint}</span>
+        </div>
+        <div class="field">
+          <label for="cfgMaxParallel">${L.maxParallel}</label>
+          <input type="number" id="cfgMaxParallel" min="1" step="1" value="5">
+          <span class="hint">${L.maxParallelHint}</span>
+        </div>
+      </div>
+    </div>
+  </section>
 </div>
 
-<div class="field">
-  <label for="cfgBaseUrl">${L.baseUrl}</label>
-  <input type="text" id="cfgBaseUrl" placeholder="https://api.deepseek.com" spellcheck="false">
-  <span class="hint">${L.baseUrlHint}</span>
-</div>
-
-<div class="field">
-  <label for="cfgModel">${L.model}</label>
-  <input type="text" id="cfgModel" list="modelPresets" placeholder="deepseek-v4-flash" spellcheck="false">
-  <datalist id="modelPresets"></datalist>
-  <span class="hint">${L.modelHint}</span>
-</div>
-
-<div class="field">
-  <label for="cfgApiKey">${L.apiKey}</label>
-  <div class="row">
-    <input type="password" id="cfgApiKey" placeholder="${L.apiKeyPlaceholder}" autocomplete="off" spellcheck="false">
+<div class="cfg-footer">
+  <div class="actions">
+    <button type="button" class="primary" id="cfgSave">${L.save}</button>
   </div>
-  <div class="key-note" id="cfgKeyNote"></div>
-  <label class="checkbox-row">
-    <input type="checkbox" id="cfgClearKey">
-    <span>${L.clearKey}</span>
-  </label>
 </div>
-
-<h2 class="section-title">${L.groupRuntime}</h2>
-
-<div class="field">
-  <label for="cfgDefaultWorkspace">${L.workspace}</label>
-  <div class="row">
-    <input type="text" id="cfgDefaultWorkspace" placeholder="~/ay-dsh-workspace" spellcheck="false">
-    <button type="button" class="secondary" id="cfgPickWorkspace">${L.browse}</button>
-  </div>
-  <span class="hint">${L.workspaceHint}</span>
-</div>
-
-<div class="field">
-  <label for="cfgCwd">${L.cwd}</label>
-  <input type="text" id="cfgCwd" readonly spellcheck="false">
-</div>
-
-<div class="field">
-  <label for="cfgNodePath">${L.nodePath}</label>
-  <div class="row">
-    <input type="text" id="cfgNodePath" placeholder="C:\\Program Files\\nodejs\\node.exe" spellcheck="false">
-    <button type="button" class="secondary" id="cfgPickNode">${L.browse}</button>
-  </div>
-  <span class="hint">${L.nodePathHint}</span>
-</div>
-
-<h2 class="section-title">${L.groupControl}</h2>
-
-<div class="field">
-  <label for="cfgPermissionMode">${L.permission}</label>
-  <select id="cfgPermissionMode">
-    <option value="workspace-write">${L.pWorkspace}</option>
-    <option value="read-only">${L.pReadonly}</option>
-    <option value="danger-full-access">${L.pFull}</option>
-  </select>
-</div>
-
-<div class="field">
-  <label for="cfgMaxOutputChars">${L.maxOutput}</label>
-  <input type="number" id="cfgMaxOutputChars" min="1000" step="1000" value="40000">
-</div>
-
-<div class="field">
-  <label for="cfgMaxSteps">${L.maxSteps}</label>
-  <input type="number" id="cfgMaxSteps" min="0" step="10" value="100">
-  <span class="hint">${L.maxStepsHint}</span>
-</div>
-
-<div class="field">
-  <label for="cfgSubagentDepth">${L.subagentDepth}</label>
-  <input type="number" id="cfgSubagentDepth" min="1" step="1" value="3">
-  <span class="hint">${L.subagentDepthHint}</span>
-</div>
-
-<div class="field">
-  <label for="cfgMaxParallel">${L.maxParallel}</label>
-  <input type="number" id="cfgMaxParallel" min="1" step="1" value="5">
-  <span class="hint">${L.maxParallelHint}</span>
-</div>
-
-<div class="actions">
-  <button type="button" class="primary" id="cfgSave">${L.save}</button>
-  <button type="button" class="secondary" id="cfgCancel">${L.cancel}</button>
-</div>
-<div id="cfgStatus"></div>
 
 <script src="${scriptUri.toString()}"></script>
 </body>

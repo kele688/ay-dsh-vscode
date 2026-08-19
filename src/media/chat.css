@@ -34,7 +34,7 @@ body {
   height: 100vh;
 }
 
-/* ---- topbar（费用 / 上下文占用 / token 用量 / 压缩 —— 单行） ---- */
+/* ---- topbar（上下文占用 + 压缩 / token 用量 —— 单行） ---- */
 #topbar {
   flex: 0 0 auto;
   border-bottom: 1px solid var(--border);
@@ -99,11 +99,11 @@ body {
 }
 
 .composer-tools .hint {
-  /* 极简提示：仅占内容宽度，最长不超过一行可读长度，超长省略号截断；
+  /* 提示区固定最大长度（约 20 字符），超长省略号折叠、不撑开工具行换行；
      hover（title）显示完整信息，完整信息也同步到 VS Code 状态栏 */
   flex: 0 1 auto;
   min-width: 0;
-  max-width: 45%;
+  max-width: 20ch;
 }
 
 .tool-select {
@@ -228,7 +228,7 @@ body {
   padding: 6px 10px;
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 0; /* 记录之间用下边框分割线，不再用间隔空隙 */
 }
 
 .history-empty {
@@ -238,18 +238,39 @@ body {
   font-size: 12.5px;
 }
 
+/* 分组标题（主代理 / 子代理会话） */
+.history-group-title {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--muted);
+  padding: 10px 2px 4px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 2px;
+}
+.history-group-title:first-child {
+  padding-top: 2px;
+}
+
+/* 会话行：无整体边框/背景，仅保留下边框分割线（简洁列表观感） */
 .history-item {
   display: flex;
   align-items: center;
   gap: 8px;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  padding: 7px 10px;
-  background: var(--bubble-assistant);
+  border: none;
+  border-bottom: 1px solid var(--border);
+  border-radius: 0;
+  padding: 7px 6px;
+  background: transparent;
+}
+
+.history-item:last-child {
+  border-bottom: none;
 }
 
 .history-item:hover {
-  border-color: var(--accent);
+  background: var(--vscode-list-hoverBackground, rgba(128, 128, 128, 0.15));
 }
 
 .history-main {
@@ -400,10 +421,12 @@ body {
   align-items: flex-start;
 }
 
+/* 错误气泡弱化：不再是刺眼的大红块，改为温和的警示底色 + 中性文字，
+   保持可辨识但不打断阅读（参数类问题宿主已自动适配，这里只兜底真正异常）。 */
 .msg.error .bubble {
-  background: color-mix(in srgb, var(--error) 12%, var(--bg));
-  border: 1px solid var(--error);
-  color: var(--error);
+  background: color-mix(in srgb, var(--error) 7%, var(--bg));
+  border: 1px solid color-mix(in srgb, var(--error) 35%, var(--border));
+  color: color-mix(in srgb, var(--fg) 88%, var(--error));
 }
 
 .bubble {
@@ -593,6 +616,31 @@ body {
 
 .approval-body p {
   margin: 2px 0;
+}
+
+/* 会话重命名内联输入条（在历史会话行下方就近展开） */
+.rename-inline {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 6px 8px;
+  margin-left: 6px;
+}
+.rename-inline-input {
+  flex: 1;
+  min-width: 0;
+  box-sizing: border-box;
+  padding: 5px 8px;
+  font-family: inherit;
+  font-size: 12.5px;
+  color: var(--fg);
+  background: var(--vscode-input-background, #3c3c3c);
+  border: 1px solid var(--vscode-input-border, #555);
+  border-radius: 4px;
+  outline: none;
+}
+.rename-inline-input:focus {
+  border-color: var(--accent);
 }
 
 .approval-reason {

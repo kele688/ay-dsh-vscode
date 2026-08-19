@@ -3,7 +3,10 @@
  * 与 src/configPanel.ts 配对：init 拉取当前配置 → 表单编辑 → save 保存并应用。
  * 消息协议（postMessage）：
  *   panel -> ext: {t:"init"} | {t:"save", values} | {t:"pickFolder", field} | {t:"cancel"}
- *   ext -> panel: {t:"config", config} | {t:"folder", field, path} | {t:"saved", ok, message}
+ *                  | {t:"providerSave", provider, apiKey} | {t:"providerDelete", id}
+ *                  | {t:"fetchModels", baseUrl, apiKey}
+ *   ext -> panel: {t:"config", config, providers} | {t:"folder", field, path}
+ *                  | {t:"saved", ok, message} | {t:"models", models, error?}
  */
 (function () {
   "use strict";
@@ -15,44 +18,80 @@
   const zh = document.body.dataset.locale === "zh";
   const L = {
     title: zh ? "DSH 配置" : "DSH Settings",
-    apiKey: zh ? "API Key（DeepSeek）" : "API Key (DeepSeek)",
-    apiKeyPlaceholder: zh ? "粘贴 API Key；留空表示保持不变" : "Paste API Key; leave empty to keep current",
-    keyConfigured: zh ? "✓ 已配置（存储于 VS Code 密钥库）" : "✓ Configured (stored in VS Code secret store)",
-    keyNotConfigured: zh ? "✗ 未配置" : "✗ Not configured",
-    clearKey: zh ? "清除已保存的 API Key" : "Clear saved API Key",
-    model: zh ? "模型" : "Model",
-    modelHint: zh ? "可输入任意模型 id（如 deepseek-v4-pro）" : "Any model id works (e.g. deepseek-v4-pro)",
-    baseUrl: zh ? "Base URL（可选）" : "Base URL (optional)",
-    baseUrlPlaceholder: zh ? "留空使用 DeepSeek 官方 API" : "Leave empty for the official DeepSeek API",
+    addProvider: zh ? "＋ 添加提供商" : "+ Add provider",
+    addCustomProvider: zh ? "＋ 自定义提供商" : "+ Custom provider",
+    edit: zh ? "编辑" : "Edit",
+    remove: zh ? "删除" : "Remove",
+    noProviders: zh ? "尚未接入任何提供商" : "No providers connected yet",
+    providerName: zh ? "提供商名称" : "Provider name",
+    providerId: zh ? "Provider ID" : "Provider ID",
+    providerIdHint: zh ? "从 DSH 模型路由目录选择；查询不到的选「自定义」" : "Pick from the DSH model routing catalog; choose Custom if absent",
+    customProvider: zh ? "（自定义…）" : "(Custom…)",
+    protocol: zh ? "API 协议" : "API protocol",
+    protocolCompletions: zh ? "OpenAI Completions" : "OpenAI Completions",
+    protocolResponses: zh ? "OpenAI Responses" : "OpenAI Responses",
+    protocolAnthropic: zh ? "Anthropic Messages" : "Anthropic Messages",
+    configureModels: zh ? "配置模型" : "Configure models",
+    modelId: zh ? "模型 ID" : "Model ID",
+    modelDisplayName: zh ? "显示名称" : "Display name",
+    contextWindow: zh ? "上下文窗口" : "Context window",
+    maxOut: zh ? "最大输出" : "Max output",
+    modelEditTitle: zh ? "编辑模型" : "Edit model",
+    tokenSizePlaceholder: zh ? "纯数字 或 带单位，如 200k / 256K / 1m" : "Plain number or unit suffix, e.g. 200k / 256K / 1m",
+    tokenSizeInvalid: zh ? "格式无效：请输入纯数字或带单位（如 200k / 256K / 1m）" : "Invalid format: use a plain number or unit suffix (e.g. 200k / 256K / 1m)",
+    tokenSizeTooSmall: zh ? "不能小于 1k（1k = 1024）：200k = 204800，1m = 1048576" : "Must be at least 1k (1k = 1024): 200k = 204800, 1m = 1048576",
+    modelIdRequired: zh ? "模型 ID 不能为空" : "Model ID is required",
+    modelNameRequired: zh ? "模型名称不能为空" : "Model name is required",
+    modelIdDuplicate: zh ? "该模型 ID 已在本提供商中存在" : "This model ID already exists in this provider",
+    modelNameDuplicate: zh ? "该模型名称已在本提供商中存在" : "This model name already exists in this provider",
+    manualModelsHint: zh ? "自定义提供商：请点击「添加模型」按钮配置要调用的模型" : "Custom provider: click Add model to configure the models to use",
+    optional: zh ? "可选" : "optional",
+    baseUrl: zh ? "Base URL" : "Base URL",
+    apiKeyFor: zh ? "API Key（可选）" : "API Key (optional)",
+    apiKeyPlaceholder: zh ? "填入合法 API Key 后即可查询模型" : "Enter a valid API Key to fetch models",
+    modelsList: zh ? "模型列表（勾选允许使用的模型）" : "Models (check the ones to enable)",
+    chooseModels: zh ? "选择模型" : "Choose models",
+    modelsEmpty: zh ? "（点击上方按钮查询该提供商的模型）" : "(click the button above to fetch models)",
+    fetching: zh ? "查询中…" : "Fetching…",
+    fetchFailed: zh ? "模型查询失败：" : "Failed to fetch models: ",
+    loading: zh ? "加载中" : "Loading",
+    defaultBtn: zh ? "默认" : "Default",
+    addModel: zh ? "添加模型" : "Add model",
+    saveProvider: zh ? "保存" : "Save",
+    workspace: zh ? "默认工作目录（未打开文件夹时）" : "Default working directory (when no folder is open)",
+    workspaceHint: zh ? "Agent 生成的文件保存位置；留空使用 ~/ay-dsh-workspace" : "Where agent files are saved; empty uses ~/ay-dsh-workspace",
+    cwd: zh ? "当前工作目录" : "Current working directory",
+    nodePath: zh ? "Node 可执行文件路径（可选）" : "Node executable path (optional)",
+    nodePathHint: zh ? "留空自动探测（系统 node ≥20，回退 VS Code 内置 Node）" : "Leave empty for auto-detect (system node ≥20, fallback VS Code's Node)",
+    browse: zh ? "浏览…" : "Browse…",
     permission: zh ? "权限模式" : "Permission mode",
     pWorkspace: zh ? "workspace-write — 可写工作区，越界操作弹审批（推荐）" : "workspace-write — write workspace, out-of-scope ops ask approval (recommended)",
     pReadonly: zh ? "read-only — 只读，Agent 不能修改任何文件" : "read-only — agent cannot modify any file",
     pFull: zh ? "danger-full-access — 完全访问，不再审批（谨慎）" : "danger-full-access — full access, no approvals (use with care)",
-    nodePath: zh ? "Node 可执行文件路径（可选）" : "Node executable path (optional)",
-    nodePathHint: zh ? "留空自动探测（系统 node ≥20，回退 VS Code 内置 Node）" : "Leave empty for auto-detect (system node ≥20, fallback VS Code's Node)",
-    browse: zh ? "浏览…" : "Browse…",
-    workspace: zh ? "默认工作目录（未打开文件夹时）" : "Default working directory (when no folder is open)",
-    workspaceHint: zh ? "Agent 生成的文件保存位置；留空使用 ~/ay-dsh-workspace" : "Where agent files are saved; empty uses ~/ay-dsh-workspace",
     maxOutput: zh ? "最大输出字符数（UI 渲染折叠阈值）" : "Max output chars (UI render fold threshold)",
     maxSteps: zh ? "最大思考轮次（0 = 不限制）" : "Max thinking steps (0 = unlimited)",
+    maxStepsHint: zh ? "单次任务达到上限自动停止（防无限循环）；临近上限时 AI 会先总结收尾" : "Task stops at the limit to prevent infinite loops; the AI summarizes before the last step",
     subagentDepth: zh ? "子代理递归深度上限" : "Subagent recursion depth limit",
+    subagentDepthHint: zh ? "多级子代理嵌套的最大深度（默认 3）" : "Max nesting depth of subagents (default 3)",
     maxParallel: zh ? "并行子代理数量上限" : "Max parallel subagents",
-    cwd: zh ? "当前工作目录" : "Current working directory",
+    maxParallelHint: zh ? "多 Agent 模式下同时派发的子代理数量上限（默认 5）" : "Max concurrently dispatched subagents in multi-agent mode (default 5)",
     save: zh ? "保存并应用" : "Save & Apply",
     cancel: zh ? "取消" : "Cancel",
     saved: zh ? "✓ 配置已保存，将在下次使用时生效" : "✓ Settings saved; they take effect on next use",
+    apiKeySet: zh ? "API Key 已配置" : "API Key configured",
+    apiKeySetHint: zh ? "API Key 已配置；留空保持不变" : "API Key is set; leave empty to keep it",
+    confirmDelete: zh ? "确认删除" : "Confirm delete",
+    confirmDeleteProvider: zh ? "将删除该提供商，此操作不可撤销" : "This provider will be removed; this cannot be undone",
+    confirmDeleteModel: zh ? "将删除该模型，此操作不可撤销" : "This model will be removed; this cannot be undone",
+    addProviderTitle: zh ? "添加提供商" : "Add provider",
+    addCustomProviderTitle: zh ? "自定义提供商" : "Custom provider",
+    customMarkTitle: zh ? "自定义提供商：可编辑名称与模型列表" : "Custom provider: name and model list are editable",
+    customListNote: zh ? "* = 自定义提供商（可编辑名称与模型列表）" : "* = custom provider (editable name & model list)",
     saveFailed: zh ? "保存失败：" : "Save failed: ",
     saving: zh ? "保存中…" : "Saving…",
-    statusError: zh ? "状态" : "Status",
   };
 
   const fields = {
-    apiKey: $("cfgApiKey"),
-    clearKey: $("cfgClearKey"),
-    provider: $("cfgProvider"),
-    model: $("cfgModel"),
-    modelPresets: $("modelPresets"),
-    baseUrl: $("cfgBaseUrl"),
     permissionMode: $("cfgPermissionMode"),
     nodePath: $("cfgNodePath"),
     defaultWorkspace: $("cfgDefaultWorkspace"),
@@ -61,76 +100,695 @@
     subagentMaxDepth: $("cfgSubagentDepth"),
     maxParallelSubagents: $("cfgMaxParallel"),
   };
-  const statusEl = $("cfgStatus");
   const saveBtn = $("cfgSave");
   const cwdEl = $("cfgCwd");
-  const keyNoteEl = $("cfgKeyNote");
 
-  /** 当前 Base URL 是否仍是提供商默认值（自动填充的标志，避免覆盖用户手改）。 */
-  let baseUrlIsDefault = true;
-  /** 当前提供商预设列表（init 时注入）。 */
+  /** 知名供应商的公开 API 地址（选择供应商/「默认」按钮使用；DSH 目录不提供 baseUrl）。 */
+  const PROVIDER_DEFAULT_BASEURL = {
+    deepseek: "https://api.deepseek.com",
+    ollama: "http://localhost:11434/v1",
+    openai: "https://api.openai.com/v1",
+    anthropic: "https://api.anthropic.com",
+    groq: "https://api.groq.com/openai/v1",
+    mistral: "https://api.mistral.ai/v1",
+    openrouter: "https://openrouter.ai/api/v1",
+    xai: "https://api.x.ai/v1",
+    cerebras: "https://api.cerebras.ai/v1",
+    fireworks: "https://api.fireworks.ai/inference/v1",
+    nvidia: "https://integrate.api.nvidia.com/v1",
+    together: "https://api.together.xyz/v1",
+  };
+  /** 上次自动填入的 Base URL（用于判断用户是否手改过；切换供应商只在默认值域内更新）。 */
+  let lastAutoBaseUrl = "";
+  /** 目录携带的公开 baseUrl（DSH 目录优先于手写表）。 */
+  let catalogBaseUrlMap = {};
+  /** 目录携带的提供商显示名（id -> 名称；选中 provider 后填入「提供商名称」字段）。 */
+  let catalogNameMap = {};
+  /** 按选中供应商填入默认 Base URL：输入框为空或仍为上次自动值时更新，手改值保留。 */
+  function applyDefaultBaseUrl(pid) {
+    const input = $("pfBaseUrl");
+    if (!input) return;
+    const v = input.value.trim();
+    if (v === "" || v === lastAutoBaseUrl) {
+      input.value = catalogBaseUrlMap[pid] || PROVIDER_DEFAULT_BASEURL[pid] || "";
+      lastAutoBaseUrl = input.value;
+    }
+  }
+  /** 知名模式名称：直接用目录查到的名称（查不到则用 id 全称，防止重复），
+   *  随 provider 切换直接覆盖；该输入框只读（名称由目录决定）。 */
+  function applyAutoName(pid) {
+    const input = $("pfName");
+    if (!input) return;
+    input.value = catalogNameMap[pid] || pid;
+  }
+  /** 提供商显示名兜底：目录无名称时取 Provider ID 第一个 "-" 前部分（首字母大写）。 */
+  function providerDisplayName(item) {
+    if (item.name && item.name !== item.id && String(item.name).trim() !== "") return item.name;
+    const base = String(item.id || "").split("-")[0];
+    return base ? base.charAt(0).toUpperCase() + base.slice(1) : item.id || "";
+  }
+
+  /** 当前提供商列表（init 时注入）。 */
   let providers = [];
+  /** 正在编辑的提供商 id（新增为空）。 */
+  let editingProviderId = null;
+  /** 当前编辑表单的模型元数据暂存：modelId -> {displayName, contextWindow, maxOutput}。 */
+  let currentModelMeta = new Map();
+  /** 当前自定义供应商表单的模型 id 列表（openProviderForm 时初始化）。 */
+  let customModels = [];
 
-  function fillProviders(list) {
-    providers = Array.isArray(list) ? list : [];
-    const fallback = [{ id: "deepseek", name: "DeepSeek", baseUrl: "https://api.deepseek.com", models: [] }];
-    const merged = providers.length > 0 ? providers : fallback;
-    fields.provider.innerHTML = "";
-    for (const p of merged) {
-      const opt = document.createElement("option");
-      opt.value = p.id;
-      opt.textContent = p.name || p.id;
-      fields.provider.appendChild(opt);
-    }
-    // 按已保存的 Base URL 反推提供商（匹配默认地址则选中之），否则默认第一项
-    const b = (fields.baseUrl.value || "").trim().toLowerCase().replace(/\/+$/, "");
-    const matched = merged.find((p) => p.baseUrl && b.startsWith(p.baseUrl.toLowerCase().replace(/\/+$/, "")));
-    fields.provider.value = matched ? matched.id : (merged[0]?.id || "deepseek");
-    applyProviderPreset(true);
+  // ---- 左右布局：左侧菜单切换分组、组内 tab 切换面板（多 tab 预留） ----
+  const sidebar = $("cfgSidebar");
+  sidebar.addEventListener("click", (ev) => {
+    const btn = ev.target.closest(".cfg-nav");
+    if (!btn) return;
+    sidebar.querySelectorAll(".cfg-nav").forEach((b) => b.classList.toggle("active", b === btn));
+    document.querySelectorAll(".cfg-group").forEach((el) => {
+      el.classList.toggle("active", el.dataset.group === btn.dataset.group);
+    });
+  });
+  document.querySelectorAll(".cfg-tabs").forEach((tabs) => {
+    tabs.addEventListener("click", (ev) => {
+      const tab = ev.target.closest(".cfg-tab");
+      if (!tab) return;
+      const group = tabs.closest(".cfg-group");
+      tabs.querySelectorAll(".cfg-tab").forEach((t) => t.classList.toggle("active", t === tab));
+      group.querySelectorAll(".cfg-pane").forEach((p) => {
+        p.classList.toggle("active", p.dataset.pane === tab.dataset.tab);
+      });
+    });
+  });
+
+  // ---- 已接入提供商：列表 + 编辑/删除 + 添加/自定义 ----
+
+  /**
+   * 容量值解析（**与宿主 agent-host.mjs parseTokens 规则完全一致**）：
+   * 输入支持纯数字（= tokens）或带单位后缀（K/k ×1024、M/m ×1024²），
+   * 如 "200"、"200k"、"256K"、"1m"。解析失败返回 undefined（字段将被忽略，
+   * 弹框校验会据此给出红色错误提示，避免"静默丢字段"）。
+   */
+  function parseTokenSize(v) {
+    if (typeof v === "number") return Number.isFinite(v) && v > 0 ? Math.round(v) : undefined;
+    const m = String(v ?? "").trim().match(/^(\d+(?:\.\d+)?)\s*([KkMm]?)$/);
+    if (!m) return undefined;
+    const mult = m[2].toLowerCase() === "k" ? 1024 : m[2].toLowerCase() === "m" ? 1024 * 1024 : 1;
+    return Math.round(parseFloat(m[1]) * mult);
   }
 
-  /** 提供商切换联动：自动填充默认 Base URL（未手改时）、更新模型候选。 */
-  function applyProviderPreset(initial) {
-    const p = providers.find((x) => x.id === fields.provider.value);
-    if (!p) return;
-    if (initial || !fields.baseUrl.value.trim() || baseUrlIsDefault) {
-      fields.baseUrl.value = p.baseUrl || "";
-      baseUrlIsDefault = true;
+  /**
+   * 容量值显示格式化（与查询回填 fmtTokens 一致）：
+   * ≥1M 显示 "X.XM"，≥1K 显示 "XK"，其余原数字（tokens）。
+   * 输入可能本身是字符串（用户手填/回填值），字符串原样返回。
+   */
+  function fmtTokenSize(v) {
+    if (typeof v !== "number" || !Number.isFinite(v) || v <= 0) return v;
+    if (v >= 1048576) return (v / 1048576).toFixed(1).replace(/\.0$/, "") + "M";
+    if (v >= 1024) return (v / 1024).toFixed(0) + "K";
+    return String(v);
+  }
+
+  /** 删除确认弹框（modal 样式；确定后执行 onOk）。 */
+  function confirmModal(title, text, onOk) {
+    const overlay = document.createElement("div");
+    overlay.className = "modal-overlay";
+    const esc = (s) => String(s ?? "").replace(/"/g, "&quot;");
+    overlay.innerHTML = `
+      <div class="modal confirm-modal">
+        <h3>${esc(title)}</h3>
+        <p class="confirm-text">${esc(text)}</p>
+        <div class="row">
+          <button type="button" class="danger" id="cfOk">${L.confirmDelete}</button>
+          <button type="button" class="secondary" id="cfCancel">${L.cancel}</button>
+        </div>
+      </div>`;
+    document.body.appendChild(overlay);
+    overlay.querySelector("#cfOk").addEventListener("click", () => {
+      overlay.remove();
+      onOk();
+    });
+    overlay.querySelector("#cfCancel").addEventListener("click", () => overlay.remove());
+  }
+
+  function renderProviders() {
+    const listEl = $("providersList");
+    listEl.innerHTML = "";
+    if (!Array.isArray(providers) || providers.length === 0) {
+      listEl.innerHTML = `<div class="providers-empty">${L.noProviders}</div>`;
+      return;
     }
-    const models = Array.isArray(p.models) ? p.models : [];
-    fields.modelPresets.innerHTML = "";
-    for (const m of models) {
-      const opt = document.createElement("option");
-      opt.value = m;
-      fields.modelPresets.appendChild(opt);
+    let hasCustom = false;
+    for (const p of providers) {
+      if (p.type === "custom") hasCustom = true;
+      const row = document.createElement("div");
+      row.className = "provider-row";
+      const nameWrap = document.createElement("span");
+      nameWrap.className = "provider-name";
+      const name = document.createElement("span");
+      name.className = "provider-name-text";
+      name.textContent = p.name || p.id;
+      name.title = p.baseUrl || "";
+      nameWrap.append(name);
+      // 自定义提供商：名称后加醒目星号（加大加粗 + hover 提示编辑方式不同）
+      if (p.type === "custom") {
+        const mark = document.createElement("span");
+        mark.className = "custom-mark";
+        mark.textContent = "*";
+        mark.title = L.customMarkTitle;
+        nameWrap.append(mark);
+      }
+      // API Key 已配置提示（只显示状态，不显示密钥本身）
+      if (p.apiKeyConfigured) {
+        const badge = document.createElement("span");
+        badge.className = "key-badge";
+        badge.textContent = "🔑";
+        badge.title = L.apiKeySet;
+        nameWrap.append(badge);
+      }
+      const actions = document.createElement("span");
+      actions.className = "provider-actions";
+      const btnEdit = document.createElement("button");
+      btnEdit.type = "button";
+      btnEdit.className = "secondary small";
+      btnEdit.textContent = L.edit;
+      btnEdit.addEventListener("click", () => openProviderForm(p, p.type === "custom" ? "custom" : "known"));
+      const btnDel = document.createElement("button");
+      btnDel.type = "button";
+      btnDel.className = "danger small";
+      btnDel.textContent = L.remove;
+      btnDel.addEventListener("click", () => {
+        confirmModal(`${L.remove}: ${p.name || p.id}`, L.confirmDeleteProvider, () => {
+          vscode.postMessage({ t: "providerDelete", id: p.id });
+        });
+      });
+      actions.append(btnEdit, btnDel);
+      row.append(nameWrap, actions);
+      listEl.appendChild(row);
+    }
+    // 列表下方注释：说明星号含义（有自定义提供商时显示）
+    if (hasCustom) {
+      const note = document.createElement("div");
+      note.className = "providers-note";
+      note.textContent = L.customListNote;
+      listEl.appendChild(note);
     }
   }
 
-  fields.provider.addEventListener("change", () => applyProviderPreset(false));
-  // 用户手改 Base URL 后，不再自动覆盖（除非再次切换提供商）
-  fields.baseUrl.addEventListener("input", () => {
-    const p = providers.find((x) => x.id === fields.provider.value);
-    baseUrlIsDefault = Boolean(p && fields.baseUrl.value.trim() === (p.baseUrl || ""));
+  /** Provider ID 目录（DSH 查询）到达后的填充回调（openProviderForm 注册）。 */
+  let applyCatalogRef = null;
+
+  /**
+   * 提供商编辑/新增表单（modal 弹框：必须保存或取消才能继续，防信息丢失）。
+   * mode="known"（添加供应商）：DSH 支持的知名供应商——Provider ID 为下拉（DSH 目录，
+   *   选后带默认值），模型走「配置模型」查询勾选；
+   * mode="custom"（自定义供应商）：无法查询——Provider ID 与模型全部为编辑框手填。
+   * 编辑已有提供商时 Provider ID 只读（已配置不可变更），添加时可修改。
+   */
+  function openProviderForm(p, mode) {
+    const isCustom = mode === "custom" || (p && p.type === "custom");
+    const editing = Boolean(p && p.id);
+    editingProviderId = p ? p.id : null;
+    const esc = (s) => String(s ?? "").replace(/"/g, "&quot;");
+    const protocolOpts = [
+      ["openai-completions", L.protocolCompletions],
+      ["openai-responses", L.protocolResponses],
+      ["anthropic-messages", L.protocolAnthropic],
+    ]
+      .map(([v, t]) => `<option value="${v}"${p?.protocol === v ? " selected" : ""}>${t}</option>`)
+      .join("");
+    // Provider ID：编辑模式只读（custom 输入框 readonly；known 下拉 disabled），添加模式可改
+    const pidField = isCustom
+      ? `<input type="text" id="pfProviderId" value="${esc(p?.id)}" placeholder="my-provider" spellcheck="false"${editing ? " readonly" : ""}>`
+      : `<select id="pfProviderId"${editing ? " disabled" : ""}><option value="">${L.loading}…</option></select>`;
+    const modelField = isCustom
+      ? // 自定义模式：按钮放「模型列表」标签右侧；列表框样式与知名一致（勾选 + 空列表占位）
+        `<div class="label-row"><label>${L.modelsList}</label>
+           <button type="button" class="secondary small" id="pfAddModel">${L.addModel}</button>
+         </div>
+         <div class="models-check" id="pfCustomModels"></div>`
+      : `<button type="button" class="secondary small" id="pfToggleModels">▸ ${L.configureModels}</button>
+         <div class="models-check hidden" id="pfModelsCheck"></div>`;
+    const baseUrlField = `<input type="text" id="pfBaseUrl" value="${esc(p?.baseUrl)}" placeholder="https://..." spellcheck="false">`;
+    // 知名模式：「默认」按钮放在标签行右侧（与编辑框解耦，保证编辑框布局与其它字段一致）
+    const baseUrlLabel = isCustom
+      ? `<label>${L.baseUrl}</label>`
+      : `<div class="label-row"><label>${L.baseUrl}</label>
+           <button type="button" class="secondary small" id="pfDefaultBaseUrl">${L.defaultBtn}</button>
+         </div>`;
+    // API Key 已配置提示（不显示密钥值）
+    const apiKeyNote = p?.apiKeyConfigured ? `<div class="key-note configured">${L.apiKeySetHint}</div>` : "";
+
+    const overlay = document.createElement("div");
+    overlay.className = "modal-overlay";
+    const title = editing
+      ? `${L.edit}: ${p.name || p.id}`
+      : isCustom
+        ? L.addCustomProviderTitle
+        : L.addProviderTitle;
+    overlay.innerHTML = `
+      <div class="modal provider-modal">
+        <h3>${esc(title)}</h3>
+        <div class="field">
+          <label>${L.providerId}</label>
+          ${pidField}
+          <span class="hint">${isCustom ? "" : L.providerIdHint}</span>
+        </div>
+        <div class="field">
+          <label>${L.providerName}</label>
+          <!-- 知名模式：名称由目录决定（只读）；自定义模式：手填 -->
+          <input type="text" id="pfName" value="${esc(p?.name)}" spellcheck="false"${isCustom ? "" : " readonly"}>
+        </div>
+        <div class="field">
+          ${baseUrlLabel}
+          ${baseUrlField}
+        </div>
+        <div class="field">
+          <label>${L.protocol}</label>
+          <select id="pfProtocol">${protocolOpts}</select>
+        </div>
+        <div class="field">
+          <label>${L.apiKeyFor}</label>
+          <input type="password" id="pfApiKey" placeholder="${L.apiKeyPlaceholder}" autocomplete="off" spellcheck="false">
+          ${apiKeyNote}
+        </div>
+        <div class="field">
+          ${isCustom ? "" : `<label>${L.modelsList}</label>`}
+          ${modelField}
+        </div>
+        <div class="row">
+          <button type="button" class="primary" id="pfSave">${L.saveProvider}</button>
+          <button type="button" class="secondary" id="pfCancel">${L.cancel}</button>
+        </div>
+      </div>`;
+    document.body.appendChild(overlay);
+
+    // 模型元数据（编辑弹框暂存）：modelId -> {displayName, contextWindow, maxOutput}
+    currentModelMeta = new Map();
+    for (const m of p?.models ?? []) {
+      if (m && typeof m === "object" && m.id) currentModelMeta.set(m.id, m);
+    }
+    // 自定义供应商模型 id 列表（行渲染/保存共用）
+    customModels = isCustom
+      ? (p?.models ?? []).map((m) => (typeof m === "string" ? m : m?.id)).filter(Boolean)
+      : [];
+
+    if (!isCustom) {
+      // 知名供应商：Provider ID 下拉 = DSH 目录（不含自定义项）；选中联动填显示名与默认 Base URL
+      const pidSel = $("pfProviderId");
+      applyCatalogRef = (list) => {
+        pidSel.innerHTML = "";
+        catalogBaseUrlMap = {};
+        catalogNameMap = {};
+        for (const item of list || []) {
+          // provider id 是唯一标识：已接入的提供商不可重复添加（只能编辑）。
+          // 添加模式跳过已接入 id；编辑模式靠下方"补原值选项"兜底显示当前项。
+          if (providers.some((x) => x.id === item.id)) continue;
+          const opt = document.createElement("option");
+          opt.value = item.id;
+          // 下拉显示 provider id（与选项值一致，避免"显示名称/值为 id"的混淆）；
+          // 名称存入 catalogNameMap，选中后填入「提供商名称」字段。
+          opt.textContent = item.id;
+          if (item.baseUrl) catalogBaseUrlMap[item.id] = item.baseUrl;
+          catalogNameMap[item.id] = providerDisplayName(item);
+          pidSel.appendChild(opt);
+        }
+        if (editingProviderId) {
+          // 编辑已有提供商：ID 只读。目录缺失该路由（如本地 Ollama）时补一个原值选项，
+          // 绝不回退到目录第一项（否则会把 Ollama 显示成 deepseek）。
+          if (pidSel.querySelector(`option[value="${CSS.escape(editingProviderId)}"]`)) {
+            pidSel.value = editingProviderId;
+          } else {
+            const opt = document.createElement("option");
+            opt.value = editingProviderId;
+            opt.textContent = (providers.find((x) => x.id === editingProviderId)?.name) || editingProviderId;
+            pidSel.appendChild(opt);
+            pidSel.value = editingProviderId;
+          }
+        } else if (pidSel.options.length > 0) {
+          pidSel.value = pidSel.options[0].value;
+        }
+        // 编辑模式：名称保留已接入的原值（readonly 展示）；添加模式：名称跟随目录
+        if (!editingProviderId) applyAutoName(pidSel.value);
+        applyDefaultBaseUrl(pidSel.value);
+      };
+      pidSel.addEventListener("change", () => {
+        // 切换提供商：名称（只读跟随目录）/ Base URL 跟随
+        applyAutoName(pidSel.value);
+        applyDefaultBaseUrl(pidSel.value);
+      });
+      vscode.postMessage({ t: "queryProviders" });
+
+      // 「默认」按钮：恢复该供应商的公开 API 地址（目录值优先，手写表兜底）
+      $("pfDefaultBaseUrl").addEventListener("click", () => {
+        $("pfBaseUrl").value = catalogBaseUrlMap[pidSel.value] || PROVIDER_DEFAULT_BASEURL[pidSel.value] || "";
+        lastAutoBaseUrl = $("pfBaseUrl").value;
+      });
+
+      // 配置模型折叠：点击展开 → 立即查询模型列表（编辑已配置密钥的提供商时，用已存密钥查询）
+      $("pfToggleModels").addEventListener("click", () => {
+        const checkEl = $("pfModelsCheck");
+        if (!checkEl.classList.contains("hidden")) {
+          checkEl.classList.add("hidden");
+          $("pfToggleModels").textContent = `▸ ${L.configureModels}`;
+          return;
+        }
+        checkEl.classList.remove("hidden");
+        checkEl.textContent = L.fetching;
+        $("pfToggleModels").textContent = `▾ ${L.configureModels}`;
+        vscode.postMessage({
+          t: "fetchModels",
+          providerId: editingProviderId || undefined,
+          baseUrl: $("pfBaseUrl").value.trim(),
+          apiKey: $("pfApiKey").value.trim(),
+          protocol: $("pfProtocol").value,
+        });
+      });
+    }
+
+    if (isCustom) {
+      // 自定义供应商模型勾选列表：每行勾选框 + ID/名称 + 编辑/删除，样式与知名一致。
+      // 添加时默认勾选；取消勾选 = 该模型不生效（不出现在可用模型下拉框）。customModels 即"已勾选集合"。
+      const renderCustomModels = () => {
+        const listEl = $("pfCustomModels");
+        if (!listEl) return;
+        listEl.innerHTML = "";
+        if (customModels.length === 0) {
+          // 空列表也显示列表框（占位提示），保持结构均衡
+          listEl.innerHTML = `<div class="providers-empty">${L.manualModelsHint}</div>`;
+          return;
+        }
+        const syncRowState = (row, cb, btn) => {
+          row.classList.toggle("model-selected", cb.checked);
+          btn.disabled = !cb.checked;
+        };
+        for (const id of customModels) {
+          const meta = currentModelMeta.get(id);
+          const row = document.createElement("div");
+          row.className = "model-row";
+          const label = document.createElement("label");
+          label.className = "model-check";
+          const cb = document.createElement("input");
+          cb.type = "checkbox";
+          cb.checked = true; // 添加时默认勾选
+          cb.dataset.model = id;
+          label.append(cb, document.createTextNode(` ${meta?.displayName ? `${meta.displayName} (${id})` : id}`));
+          const actions = document.createElement("span");
+          actions.className = "provider-actions";
+          const btnEdit = document.createElement("button");
+          btnEdit.type = "button";
+          btnEdit.className = "secondary small";
+          btnEdit.textContent = L.edit;
+          btnEdit.addEventListener("click", () => {
+            openModelEditor(id, currentModelMeta.get(id), (meta2) => {
+              currentModelMeta.set(id, { id, displayName: meta2.displayName, contextWindow: meta2.contextWindow, maxOutput: meta2.maxOutput });
+              renderCustomModels();
+            }, true, true);
+          });
+          const btnDel = document.createElement("button");
+          btnDel.type = "button";
+          btnDel.className = "danger small";
+          btnDel.textContent = L.remove;
+          btnDel.addEventListener("click", () => {
+            confirmModal(`${L.remove}: ${id}`, L.confirmDeleteModel, () => {
+              customModels = customModels.filter((x) => x !== id);
+              currentModelMeta.delete(id);
+              renderCustomModels();
+            });
+          });
+          // 勾选状态：取消勾选 = 从生效集合移除（保存时不提交）；重新勾选 = 重新加入
+          cb.addEventListener("change", () => {
+            syncRowState(row, cb, btnEdit);
+            customModels = customModels.filter((x) => x !== id);
+            if (cb.checked) customModels.push(id);
+          });
+          syncRowState(row, cb, btnEdit);
+          actions.append(btnEdit, btnDel);
+          row.append(label, actions);
+          listEl.appendChild(row);
+        }
+      };
+      renderCustomModels();
+      // 「添加模型」→ 弹模型配置窗口（ID 可编辑），保存后加入列表（默认勾选）
+      $("pfAddModel").addEventListener("click", () => {
+        openModelEditor(
+          "",
+          null,
+          (meta) => {
+            if (!meta.id) return;
+            currentModelMeta.set(meta.id, { id: meta.id, displayName: meta.displayName, contextWindow: meta.contextWindow, maxOutput: meta.maxOutput });
+            if (!customModels.includes(meta.id)) customModels.push(meta.id);
+            renderCustomModels();
+          },
+          false,
+          true
+        );
+      });
+    }
+
+    $("pfSave").addEventListener("click", () => {
+      const name = $("pfName").value.trim();
+      const baseUrl = $("pfBaseUrl").value.trim();
+      if (!name || !baseUrl) {
+        (name ? $("pfBaseUrl") : $("pfName")).focus();
+        return;
+      }
+      let models;
+      let providerId;
+      if (isCustom) {
+        models = customModels.map((id) => {
+          const meta = currentModelMeta.get(id);
+          return { id, displayName: meta?.displayName, contextWindow: meta?.contextWindow, maxOutput: meta?.maxOutput };
+        });
+        providerId = editingProviderId || $("pfProviderId").value.trim() || name.toLowerCase().replace(/[^a-z0-9-]/g, "-");
+      } else {
+        models = [...$("pfModelsCheck").querySelectorAll("input[type=checkbox]:checked")].map((cb) => {
+          const meta = currentModelMeta.get(cb.dataset.model);
+          return {
+            id: cb.dataset.model,
+            displayName: meta?.displayName,
+            contextWindow: meta?.contextWindow,
+            maxOutput: meta?.maxOutput,
+          };
+        });
+        providerId = $("pfProviderId").value;
+        // 知名模式必须显式选择提供商（目录未就绪时下拉可能为空，阻止保存）
+        if (!providerId) {
+          $("pfProviderId").focus();
+          return;
+        }
+      }
+      const provider = {
+        id: providerId,
+        name,
+        baseUrl,
+        protocol: $("pfProtocol").value,
+        type: isCustom ? "custom" : p?.type || "known",
+        models,
+      };
+      const apiKey = $("pfApiKey").value.trim() || undefined;
+      // isEdit：区分新增/编辑——新增时若 id 已存在（重复添加）由扩展侧拒绝
+      vscode.postMessage({ t: "providerSave", provider, apiKey, isEdit: Boolean(editingProviderId) });
+      applyCatalogRef = null;
+      overlay.remove();
+    });
+    $("pfCancel").addEventListener("click", () => {
+      applyCatalogRef = null;
+      overlay.remove();
+    });
+  }
+
+  /**
+   * 模型编辑/添加弹框：模型 ID（编辑时只读，添加时可编辑）/ 显示名 / 上下文窗口 /
+   * 最大输出；保存/取消均关闭，保存暂存。idReadonly=false 表示添加新模型（ID 输入框可填）。
+   *
+   * 校验规则（isCustom 决定预填策略，校验规则统一）：
+   * - 模型 ID / 模型名称：必须非空；且在本提供商范围内唯一（id 与 name 都不能与
+   *   其它模型的 id 或 name 重叠）；
+   * - 上下文窗口 / 最大输出：可留空（自定义模型留空 = 不传递该参数，模型用默认值）；
+   *   填了就必须合法（纯数字或 K/M 单位）且 ≥ 1k（1024），最大值不限；
+   * - 知名提供商：以查出的模型能力默认值预填（查不到则留空）；自定义：默认留空。
+   */
+  function openModelEditor(modelId, meta, onSave, idReadonly = true, isCustom = true) {
+    const overlay = document.createElement("div");
+    overlay.className = "modal-overlay";
+    const esc = (s) => String(s ?? "").replace(/"/g, "&quot;");
+    // 预填策略：模型有已存/查出的能力值则回填（fmtTokenSize 数字→K/M）；
+    // 无值（自定义新模型）留空 = 不传参数走模型默认。
+    const ctxVal = fmtTokenSize(meta?.contextWindow) || "";
+    const maxVal = fmtTokenSize(meta?.maxOutput) || "";
+    overlay.innerHTML = `
+      <div class="modal">
+        <h3>${L.modelEditTitle}</h3>
+        <div class="field"><label>${L.modelId}</label><input type="text" id="meId" value="${esc(modelId)}"${idReadonly ? " readonly" : ""} spellcheck="false">
+          <span class="token-note hidden" id="meIdNote"></span></div>
+        <div class="field"><label>${L.modelDisplayName}</label><input type="text" id="meName" value="${esc(meta?.displayName || "")}" spellcheck="false">
+          <span class="token-note hidden" id="meNameNote"></span></div>
+        <div class="field">
+          <label>${L.contextWindow}${isCustom ? `（${L.optional}）` : ""}</label>
+          <input type="text" id="meCtx" value="${esc(ctxVal)}" placeholder="${esc(L.tokenSizePlaceholder)}" spellcheck="false">
+          <span class="token-note hidden" id="meCtxNote"></span>
+        </div>
+        <div class="field">
+          <label>${L.maxOut}${isCustom ? `（${L.optional}）` : ""}</label>
+          <input type="text" id="meMax" value="${esc(maxVal)}" placeholder="${esc(L.tokenSizePlaceholder)}" spellcheck="false">
+          <span class="token-note hidden" id="meMaxNote"></span>
+        </div>
+        <div class="row">
+          <button type="button" class="primary" id="meSave">${L.saveProvider}</button>
+          <button type="button" class="secondary" id="meCancel">${L.cancel}</button>
+        </div>
+      </div>`;
+    document.body.appendChild(overlay);
+    overlay.addEventListener("click", (e) => {
+      if (e.target === overlay) overlay.remove();
+    });
+    const $me = (id) => overlay.querySelector(`#${id}`);
+
+    // 本提供商范围内其它模型的 id / 名称集合（查重用；排除当前编辑的模型自身）
+    const otherIds = new Set();
+    const otherNames = new Set();
+    for (const [mid, m] of currentModelMeta.entries()) {
+      if (mid === modelId) continue;
+      otherIds.add(mid);
+      if (m && typeof m === "object" && m.displayName) otherNames.add(String(m.displayName).trim());
+    }
+    // custom 添加时 currentModelMeta 可能还没含未保存的 id？不——添加流程先编辑后入表，
+    // 此处 currentModelMeta 已含全部已添加模型，id 唯一性据此判断即可。
+
+    const showNote = (noteEl, text, kind) => {
+      const note = $me(noteEl);
+      if (!text) {
+        note.classList.add("hidden");
+        return;
+      }
+      note.textContent = text;
+      note.className = `token-note ${kind}`;
+    };
+
+    /**
+     * 校验 ID：非空 + （可编辑时）提供商内唯一（不与其它 id/name 重叠）。
+     */
+    const validateId = () => {
+      const v = $me("meId").value.trim();
+      if (idReadonly) return { ok: true }; // 只读：已存在模型，无需重复校验
+      if (!v) {
+        showNote("meIdNote", L.modelIdRequired, "error");
+        $me("meId").classList.add("invalid");
+        return { ok: false };
+      }
+      if (otherIds.has(v) || otherNames.has(v)) {
+        showNote("meIdNote", L.modelIdDuplicate, "error");
+        $me("meId").classList.add("invalid");
+        return { ok: false };
+      }
+      showNote("meIdNote", "", "");
+      $me("meId").classList.remove("invalid");
+      return { ok: true };
+    };
+
+    /**
+     * 校验名称：非空 + 提供商内唯一（不与其它 id/name 重叠；自身旧名称除外）。
+     */
+    const validateName = () => {
+      const v = $me("meName").value.trim();
+      const oldName = String(meta?.displayName || "").trim();
+      if (!v) {
+        showNote("meNameNote", L.modelNameRequired, "error");
+        $me("meName").classList.add("invalid");
+        return { ok: false };
+      }
+      if ((otherIds.has(v) || otherNames.has(v)) && v !== oldName) {
+        showNote("meNameNote", L.modelNameDuplicate, "error");
+        $me("meName").classList.add("invalid");
+        return { ok: false };
+      }
+      showNote("meNameNote", "", "");
+      $me("meName").classList.remove("invalid");
+      return { ok: true };
+    };
+
+    /**
+     * 校验容量输入：可留空（=不传参数）；非空必须合法（纯数字或 K/M 单位）
+     * 且 ≥1k（1024）。非法格式与过小均阻止保存（信息不同）。
+     * @returns {{ok: boolean}}
+     */
+    const validateSize = (input, noteEl) => {
+      const raw = input.value.trim();
+      if (raw === "") {
+        showNote(noteEl, "", "");
+        input.classList.remove("invalid", "warn");
+        return { ok: true };
+      }
+      const n = parseTokenSize(raw);
+      if (n === undefined) {
+        showNote(noteEl, L.tokenSizeInvalid, "error");
+        input.classList.add("invalid");
+        return { ok: false };
+      }
+      if (n < 1024) {
+        showNote(noteEl, L.tokenSizeTooSmall, "error");
+        input.classList.add("invalid");
+        return { ok: false };
+      }
+      showNote(noteEl, "", "");
+      input.classList.remove("invalid", "warn");
+      return { ok: true };
+    };
+
+    const checkCtx = () => validateSize($me("meCtx"), "meCtxNote");
+    const checkMax = () => validateSize($me("meMax"), "meMaxNote");
+    $me("meId").addEventListener("input", validateId);
+    $me("meName").addEventListener("input", validateName);
+    $me("meCtx").addEventListener("input", checkCtx);
+    $me("meMax").addEventListener("input", checkMax);
+    // 打开弹框立即校验一次（回填的旧值可能本来就是错的，如 contextWindow=200）
+    validateId();
+    validateName();
+    checkCtx();
+    checkMax();
+
+    $me("meSave").addEventListener("click", () => {
+      const id = idReadonly ? modelId : $me("meId").value.trim();
+      // 全字段校验：任一失败 → 阻止保存并聚焦第一个出错字段
+      const checks = [validateId, validateName, checkCtx, checkMax];
+      const focusMap = ["meId", "meName", "meCtx", "meMax"];
+      for (let i = 0; i < checks.length; i++) {
+        if (!checks[i]().ok) {
+          $me(focusMap[i]).focus();
+          return;
+        }
+      }
+      if (!id) {
+        $me("meId").focus();
+        return;
+      }
+      onSave({
+        id,
+        displayName: $me("meName").value.trim(),
+        contextWindow: $me("meCtx").value.trim() || undefined,
+        maxOutput: $me("meMax").value.trim() || undefined,
+      });
+      overlay.remove();
+    });
+    $me("meCancel").addEventListener("click", () => overlay.remove());
+  }
+
+  $("cfgAddProvider").addEventListener("click", () => {
+    openProviderForm(null, "known");
+  });
+  $("cfgAddCustomProvider").addEventListener("click", () => {
+    openProviderForm({ id: "", name: "", baseUrl: "", protocol: "openai-completions", models: [], type: "custom" }, "custom");
   });
 
   $("cfgPickWorkspace").addEventListener("click", () => vscode.postMessage({ t: "pickFolder", field: "defaultWorkspace" }));
   $("cfgPickNode").addEventListener("click", () => vscode.postMessage({ t: "pickFolder", field: "nodePath" }));
 
   saveBtn.addEventListener("click", () => {
-    const model = fields.model.value.trim();
-    if (!model) {
-      setStatus(L.saveFailed + (zh ? "模型不能为空" : "model must not be empty"), true);
-      return;
-    }
     saveBtn.disabled = true;
-    setStatus(L.saving, false);
+    // 保存中/结果提示统一由扩展显示在 VS Code 状态栏，面板内不再显示任何文字
+    // （避免挤占/移动保存按钮位置）
     vscode.postMessage({
       t: "save",
       values: {
-        clearKey: fields.clearKey.checked,
-        apiKey: fields.apiKey.value.trim() || undefined,
-        model,
-        baseUrl: fields.baseUrl.value.trim(),
         permissionMode: fields.permissionMode.value,
         nodePath: fields.nodePath.value.trim(),
         defaultWorkspace: fields.defaultWorkspace.value.trim(),
@@ -142,26 +800,10 @@
     });
   });
 
-  $("cfgCancel").addEventListener("click", () => vscode.postMessage({ t: "cancel" }));
-
-  // 清空 API Key 时禁用输入框（避免歧义）
-  fields.clearKey.addEventListener("change", () => {
-    fields.apiKey.disabled = fields.clearKey.checked;
-    if (fields.clearKey.checked) fields.apiKey.value = "";
-  });
-
-  function setStatus(text, isError) {
-    statusEl.textContent = text;
-    statusEl.classList.toggle("error", isError);
-    statusEl.classList.toggle("ok", !isError);
-  }
+  // 取消 = 直接关闭配置页面（无"取消"按钮；关闭面板即取消，无需消息）
 
   function fill(c) {
-    fields.apiKey.placeholder = c.keyConfigured ? L.keyConfigured : L.keyNotConfigured;
-    keyNoteEl.textContent = c.keyConfigured ? L.keyConfigured : L.keyNotConfigured;
-    keyNoteEl.classList.toggle("configured", c.keyConfigured);
-    fields.baseUrl.value = c.baseUrl || "";
-    fields.model.value = c.model || "";
+    c = c || {};
     fields.permissionMode.value = c.permissionMode || "workspace-write";
     fields.nodePath.value = c.nodePath || "";
     fields.defaultWorkspace.value = c.defaultWorkspace || "";
@@ -178,7 +820,8 @@
     switch (msg.t) {
       case "config":
         fill(msg.config);
-        fillProviders(msg.providers); // 依赖 baseUrl 已填充（反推选中项）
+        providers = Array.isArray(msg.providers) ? msg.providers : [];
+        renderProviders();
         break;
       case "folder":
         if (msg.path) {
@@ -187,16 +830,76 @@
         }
         break;
       case "saved":
+        // 保存中/成功/失败提示全部由扩展显示在 VS Code 状态栏；
+        // 面板内只负责恢复按钮（绝不显示文字、不挤占按钮位置）。
         saveBtn.disabled = false;
-        // 保存结果提示由扩展显示在 VS Code 状态栏（setStatusBarMessage，见
-        // configPanel.ts）；面板内仅显示表单状态文字，**不自动关闭**——
-        // 由用户自行点击"取消"或关闭面板（保存成功后也可继续调整再保存）。
-        if (msg.ok) {
-          setStatus(L.saved, false);
-        } else {
-          setStatus(L.saveFailed + (msg.message || "unknown error"), true);
+        break;
+      case "providersCatalog":
+        if (applyCatalogRef) {
+          applyCatalogRef(msg.providers);
+          applyCatalogRef = null;
         }
         break;
+      case "models": {
+        // 实时模型查询结果：渲染勾选列表（勾选 + 模型名/ID + 编辑按钮）。
+        // 条目兼容字符串（回退网络查询，仅 id）与对象（DSH 发现，含 contextWindow/maxTokens）。
+        const checkEl = $("pfModelsCheck");
+        if (!checkEl) return;
+        if (msg.error || !Array.isArray(msg.models) || msg.models.length === 0) {
+          // 查询失败：保持展开并显示错误原因，让用户看到失败信息（不静默收起）
+          checkEl.textContent = L.fetchFailed + (msg.error || "empty");
+          const toggle = $("pfToggleModels");
+          if (toggle) toggle.textContent = `▾ ${L.configureModels}`;
+          return;
+        }
+        // 查询到的元数据入暂存：编辑弹框默认值优先用模型自身值（查不到才用 256K/32K 兜底）
+        for (const raw of msg.models) {
+          const m = typeof raw === "string" ? { id: raw } : raw || {};
+          if (!m.id) continue;
+          currentModelMeta.set(m.id, {
+            id: m.id,
+            displayName: m.name,
+            contextWindow: fmtTokenSize(m.contextWindow),
+            maxOutput: fmtTokenSize(m.maxTokens),
+          });
+        }
+        const preselect = new Set(
+          (providers.find((x) => x.id === editingProviderId)?.models ?? [])
+            .map((m) => (typeof m === "string" ? m : m?.id))
+            .filter(Boolean)
+        );
+        checkEl.innerHTML = "";
+        // 勾选状态联动行样式与编辑按钮：未勾选普通色且编辑不可点；勾选后高亮、可编辑
+        const syncRowState = (row, cb, btn) => {
+          row.classList.toggle("model-selected", cb.checked);
+          btn.disabled = !cb.checked;
+        };
+        for (const raw of msg.models) {
+          const m = typeof raw === "string" ? { id: raw } : raw || {};
+          if (!m.id) continue;
+          const row = document.createElement("div");
+          row.className = "model-row";
+          const label = document.createElement("label");
+          label.className = "model-check";
+          const cb = document.createElement("input");
+          cb.type = "checkbox";
+          cb.dataset.model = m.id;
+          cb.checked = preselect.has(m.id);
+          label.append(cb, document.createTextNode(` ${m.name || m.id}`));
+          const btnEdit = document.createElement("button");
+          btnEdit.type = "button";
+          btnEdit.className = "secondary small";
+          btnEdit.textContent = L.edit;
+          btnEdit.addEventListener("click", () => {
+            openModelEditor(m.id, currentModelMeta.get(m.id), (meta) => currentModelMeta.set(m.id, { id: m.id, ...meta }), true, false);
+          });
+          cb.addEventListener("change", () => syncRowState(row, cb, btnEdit));
+          syncRowState(row, cb, btnEdit);
+          row.append(label, btnEdit);
+          checkEl.appendChild(row);
+        }
+        break;
+      }
     }
   });
 

@@ -219,7 +219,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           // 用户从历史面板显式选择会话：会话 id 由随后的宿主 ready 帧统一持久化
           this.host?.resumeSession(msg.id);
           break;
-        case "history":
+        case "viewSession":
+          // 只读浏览子代理会话（不创建 agent、不持久化会话 id）
+          this.host?.viewSession(msg.id);
+          break;
+        case "renameSession":
+          this.host?.renameSession(msg.id, msg.title);
+          break;
         case "historyRefresh": {
           // 宿主可能尚未就绪（首次打开面板即点历史）：先确保宿主可用再请求列表
           void (async () => {
@@ -518,7 +524,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         this.push(this.lastStats);
         break;
       case "modelInfo":
-        this.push({ t: "modelInfo", providers: e.providers, models: e.models, current: e.current });
+        this.push({ t: "modelInfo", providers: e.providers, models: e.models, providerModels: e.providerModels, current: e.current });
         break;
       case "modelChanged":
         this.push({
@@ -544,6 +550,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           10000
         );
         break;
+      case "modelAdapted":
+        // 模型参数自动适配（宿主已剔除/降级不支持的参数）：不插入对话列表、
+        // 不打断任务，仅状态栏温和提示一次（详情见宿主日志）。
+        vscode.window.setStatusBarMessage(
+          loc(
+            `模型 ${e.model} 不支持思考级别 ${e.from}，已自动${e.to ? `调整为 ${e.to}` : "移除（使用模型默认）"}`,
+            `Model ${e.model} does not support effort ${e.from}; auto-${e.to ? `adjusted to ${e.to}` : "removed (model default)"}`
+          ),
+          10000
+        );
+        break;
       case "sessionResumed":
         // 恢复结果通过 history + ready 帧呈现；失败时提示，并清空持久化的会话
         // 记忆（会话已不可用，避免下次 Reload/重启反复尝试恢复同一会话）
@@ -559,6 +576,20 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           });
         }
         break;
+      case "viewSession":
+        // 只读浏览会话成功：透传 webview（前端进入只读模式；不持久化会话 id）
+        this.push({ t: "viewSession", id: e.id });
+        break;
+      case "viewSessionFailed":
+        this.push({
+          t: "event",
+          e: {
+            kind: "error",
+            text: loc(`浏览会话失败：${e.error ?? "未知错误"}`, `Failed to view session: ${e.error ?? "unknown error"}`),
+            ts: Date.now(),
+          },
+        });
+        break;
       case "sessionDeleted":
         // 删除的是当前会话：清空持久化会话记忆（下次 Reload 不再恢复已删会话）
         if (e.ok && e.id === this.storedSessionId) {
@@ -566,14 +597,32 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         }
         this.push({ t: "sessionDeleted", id: e.id, ok: e.ok, error: e.error });
         break;
-      case "sessionExported": {
-        if (e.ok && e.path) {
-          // 在系统浏览器中打开完整历史网页
-          void vscode.env.openExternal(vscode.Uri.file(e.path));
-          vscode.window.showInformationMessage(loc(`已导出完整会话记录：${e.path}`, `Full conversation exported: ${e.path}`));
-        } else {
-          vscode.window.showErrorMessage(loc(`导出会话失败：${e.error ?? "未知错误"}`, `Export failed: ${e.error ?? "unknown error"}`));
+      case "sessionRenamed":
+        // 重命名结果透传 webview（成功时刷新历史列表标题；失败时提示）
+        this.push({ t: "sessionRenamed", id: e.id, ok: e.ok, title: e.title, error: e.error });
+        if (!e.ok) {
+          vscode.window.setStatusBarMessage(
+            loc(`重命名失败：${e.error ?? "未知错误"}`, `Rename failed: ${e.error ?? "unknown error"}`),
+            8000
+          );
         }
+        break;
+      case "sessionExported": {
+        // 导出完成/失败提示走状态栏（不弹通知框）；成功时在系统浏览器中打开完整历史网页
+        if (e.ok && e.path) {
+          void vscode.env.openExternal(vscode.Uri.file(e.path));
+          vscode.window.setStatusBarMessage(
+            loc(`已导出完整会话记录：${e.path}`, `Full conversation exported: ${e.path}`),
+            8000
+          );
+        } else {
+          vscode.window.setStatusBarMessage(
+            loc(`导出会话失败：${e.error ?? "未知错误"}`, `Export failed: ${e.error ?? "unknown error"}`),
+            8000
+          );
+        }
+        // 回发 webview：恢复导出按钮，面板提示区显示结果路径/错误
+        this.push({ t: "sessionExported", ok: e.ok, path: e.path, error: e.error });
         break;
       }
       case "exit":
@@ -706,14 +755,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   </header>
   <div id="topbar" class="hidden">
     <div class="topbar-row">
-      <span id="costStats" class="topbar-stat" title="">—</span>
       <span id="contextPct" class="topbar-stat" title="">—</span>
+      <button id="btnCompact" class="icon-btn small" title="${L.compactTitle}">🗜️</button>
       <span class="spacer"></span>
       <span id="steps" class="token-stat" title="">🔄 0</span>
       <span id="tokensIn" class="token-stat">↗ 0</span>
       <span id="tokensCache" class="token-stat">⇄ 0</span>
       <span id="tokensOut" class="token-stat">↘ 0</span>
-      <button id="btnCompact" class="icon-btn small" title="${L.compactTitle}">🗜️</button>
     </div>
   </div>
   <section id="historyPanel" class="history hidden">

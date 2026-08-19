@@ -13,6 +13,7 @@ import * as readline from "node:readline";
 import type {
   ExtensionFrame,
   HostFrame,
+  ProviderApplyItem,
   SessionEvent,
   SessionStats,
   SessionSummary,
@@ -72,6 +73,9 @@ export type HostEvent =
   | { type: "history"; sessionId: string; events: ViewEvent[]; hasMore?: boolean; nextSeq?: number }
   | { type: "historyMore"; sessionId: string; events: ViewEvent[]; hasMore?: boolean; nextSeq?: number }
   | { type: "sessionResumed"; id: string; ok: boolean; error?: string }
+  | { type: "viewSession"; id: string }
+  | { type: "viewSessionFailed"; id: string; error?: string }
+  | { type: "sessionRenamed"; id: string; ok: boolean; title?: string; error?: string }
   | { type: "sessionDeleted"; id: string; ok: boolean; error?: string }
   | { type: "sessionExported"; id: string; ok: boolean; path?: string; error?: string }
   | { type: "stats"; stats: SessionStats }
@@ -79,12 +83,14 @@ export type HostEvent =
       type: "modelInfo";
       providers: { id: string; name: string }[];
       models: string[];
+      providerModels?: Record<string, { id: string; name: string }[]>;
       current: { provider: string; model: string; reasoningEffort?: string; supportedEfforts?: string[]; defaultEffort?: string };
     }
   | { type: "modelChanged"; provider: string; model: string; reasoningEffort?: string; error?: string }
   | { type: "workModeChanged"; mode: "single" | "multi" }
   | { type: "compactDone"; ok: boolean; text?: string; error?: string }
   | { type: "stepLimit"; maxSteps: number; steps: number }
+  | { type: "modelAdapted"; provider: string; model: string; from: string; to: string }
   | { type: "exit"; code: number; error?: string }
   | { type: "log"; level: string; message: string };
 
@@ -171,6 +177,13 @@ export class AgentHost {
   private eventListeners = new Set<(e: HostEvent) => void>();
   private chatSeq = 0;
   private pendingChat = new Map<number, { resolve: (ok: boolean) => void; timer: NodeJS.Timeout }>();
+  /** 提供商目录查询（配置面板用）：一次性请求-响应。 */
+  private llmSeq = 0;
+  private pendingLlmProviders = new Map<number, { resolve: (p: { id: string; name: string }[]) => void }>();
+  /** 提供商配置同步（providersApply → providersApplied）。 */
+  private pendingProviderApply = new Map<number, { resolve: (err: string | undefined) => void }>();
+  /** 模型发现（discoverModels → discoveredModels）。 */
+  private pendingDiscoverModels = new Map<number, { resolve: (r: { models: { id: string; name?: string; contextWindow?: number; maxTokens?: number }[]; error?: string }) => void }>();
   /** 按 turn 聚合的渲染状态（chunk → 增量 ViewEvent）。 */
   private turns = new Map<number, TurnState>();
   private disposed = false;
@@ -434,6 +447,18 @@ export class AgentHost {
         this.emit({ type: "sessionResumed", id: frame.id, ok: frame.ok, error: frame.error });
         break;
       }
+      case "viewSession": {
+        this.emit({ type: "viewSession", id: frame.id });
+        break;
+      }
+      case "viewSessionFailed": {
+        this.emit({ type: "viewSessionFailed", id: frame.id, error: frame.error });
+        break;
+      }
+      case "sessionRenamed": {
+        this.emit({ type: "sessionRenamed", id: frame.id, ok: frame.ok, title: frame.title, error: frame.error });
+        break;
+      }
       case "sessionDeleted": {
         this.emit({ type: "sessionDeleted", id: frame.id, ok: frame.ok, error: frame.error });
         break;
@@ -447,6 +472,7 @@ export class AgentHost {
           type: "modelInfo",
           providers: frame.providers,
           models: frame.models,
+          providerModels: frame.providerModels,
           current: frame.current,
         });
         break;
@@ -474,8 +500,36 @@ export class AgentHost {
         this.emit({ type: "compactDone", ok: frame.ok, text: frame.text, error: frame.error });
         break;
       }
+      case "llmProviders": {
+        const pending = this.pendingLlmProviders.get(frame.id);
+        if (pending) {
+          this.pendingLlmProviders.delete(frame.id);
+          pending.resolve(frame.providers ?? []);
+        }
+        break;
+      }
+      case "discoveredModels": {
+        const pending = this.pendingDiscoverModels.get(frame.id);
+        if (pending) {
+          this.pendingDiscoverModels.delete(frame.id);
+          pending.resolve({ models: frame.models ?? [], error: frame.error });
+        }
+        break;
+      }
+      case "providersApplied": {
+        const pending = this.pendingProviderApply.get(frame.id);
+        if (pending) {
+          this.pendingProviderApply.delete(frame.id);
+          pending.resolve(frame.ok ? undefined : frame.error ?? "apply failed");
+        }
+        break;
+      }
       case "stepLimit": {
         this.emit({ type: "stepLimit", maxSteps: frame.maxSteps, steps: frame.steps });
+        break;
+      }
+      case "modelAdapted": {
+        this.emit({ type: "modelAdapted", provider: frame.provider, model: frame.model, from: frame.from, to: frame.to });
         break;
       }
       case "exit": {
@@ -705,13 +759,22 @@ export class AgentHost {
     this.send({ t: "resumeSession", id, model });
   }
 
-  /** 请求加载更早的历史事件（向上滚动时分页）。 */
-  loadMoreHistory(beforeSeq: number): void {
-    this.send({ t: "loadMoreHistory", id: ++this.chatSeq, beforeSeq });
+  /** 只读浏览一个会话（子代理会话）：不创建 agent、不改全局宿主状态。 */
+  viewSession(id: string): void {
+    this.send({ t: "viewSession", id });
+  }
+
+  /** 请求加载更早的历史事件（向上滚动时分页；只读浏览子代理会话时带 sessionId）。 */
+  loadMoreHistory(beforeSeq: number, sessionId?: string): void {
+    this.send({ t: "loadMoreHistory", id: ++this.chatSeq, beforeSeq, sessionId });
   }
 
   deleteSession(id: string): void {
     this.send({ t: "deleteSession", id });
+  }
+
+  renameSession(id: string, title: string): void {
+    this.send({ t: "renameSession", id, title });
   }
 
   exportSession(id: string): void {
@@ -736,6 +799,45 @@ export class AgentHost {
   /** 触发一次手动上下文压缩（/compact）。 */
   compact(): void {
     this.send({ t: "compact", id: ++this.chatSeq });
+  }
+
+  /** 查询 DSH 提供商目录（已注册路由 + 可配置目录合并；配置面板 Provider ID 下拉用）。 */
+  llmProviders(): Promise<{ id: string; name: string }[]> {
+    return new Promise((resolve) => {
+      const id = ++this.llmSeq;
+      this.pendingLlmProviders.set(id, { resolve });
+      this.send({ t: "llmProviders", id });
+      setTimeout(() => {
+        if (this.pendingLlmProviders.delete(id)) resolve([]);
+      }, 8000);
+    });
+  }
+
+  /**
+   * 把整套提供商配置同步进 DSH（写入 llm-pi-ai settings + credentials，热生效）。
+   * 返回 undefined 表示成功，否则为错误信息；宿主未就绪时 8s 超时视为失败。
+   */
+  applyProviders(providers: ProviderApplyItem[]): Promise<string | undefined> {
+    return new Promise((resolve) => {
+      const id = ++this.llmSeq;
+      this.pendingProviderApply.set(id, { resolve });
+      this.send({ t: "providersApply", id, providers });
+      setTimeout(() => {
+        if (this.pendingProviderApply.delete(id)) resolve("timeout");
+      }, 8000);
+    });
+  }
+
+  /** 模型发现（catalog 提供商免网络返回模型+元数据；未知提供商探活端点）。 */
+  discoverModels(opts: { provider?: string; baseURL?: string; api?: string; apiKey?: string }): Promise<{ models: { id: string; name?: string; contextWindow?: number; maxTokens?: number }[]; error?: string }> {
+    return new Promise((resolve) => {
+      const id = ++this.llmSeq;
+      this.pendingDiscoverModels.set(id, { resolve });
+      this.send({ t: "discoverModels", id, ...opts });
+      setTimeout(() => {
+        if (this.pendingDiscoverModels.delete(id)) resolve({ models: [], error: "timeout" });
+      }, 8000);
+    });
   }
 
   private send(frame: ExtensionFrame): void {

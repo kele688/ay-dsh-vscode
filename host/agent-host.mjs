@@ -12,14 +12,16 @@
  * 本文件不参与打包（esbuild），作为普通 ESM 由扩展用 Node 直接运行。
  */
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir as osHomedir } from "node:os";
 import { fileURLToPath } from "node:url";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 import { createInterface } from "node:readline";
 import { boot, loadLayeredEnv, loadOverlayPatches } from "@deepseek-ai/dsh-app-boot";
 import { resolveDshHome, dshHomePath } from "@deepseek-ai/dsh-home-paths";
 import { DSH_LAUNCH_ENVIRONMENT_KEY } from "@deepseek-ai/dsh-launch-environment";
+import { credentialRef } from "@deepseek-ai/dsh-credentials";
+import { builtinProviders } from "@earendil-works/pi-ai/providers/all";
 import { createUserMessage } from "@deepseek-ai/dsh-llm";
 import { SessionId } from "@deepseek-ai/dsh-session";
 import { installModelSelection } from "@deepseek-ai/dsh-agent";
@@ -140,12 +142,13 @@ function composePatches(env) {
       },
     },
     // 禁用的插件（对应依赖已从 VSIX 剔除，不加载即不 import）：
-    // - llm-pi-ai：多提供商网关，插件固定使用 deepseek-official 路由，永不激活
     // - session-telemetry-otel：遥测，插件默认关闭
     // - typert-gateway（dsh-api-gateway / host-apiproxy）：web API 网关。它会先于
     //   本插件的监听器拦截 approval/request 并等待 web 客户端响应（插件无 web 客户端），
     //   导致审批请求永久挂起、授权弹框不出现。headless 场景无需该网关。
-    { id: "llm-pi-ai", disabled: true },
+    // llm-pi-ai：多提供商网关（启用）。它提供内置提供商目录（openai/anthropic/gemini/
+    // groq/mistral/openrouter…）与通用适配器；提供商配置经 settings 服务（llm-pi-ai
+    // namespace）写入后即可路由。deepseek 仍由 llm-deepseek 适配器独占路由。
     { id: "session-telemetry-otel", disabled: true },
     { id: "typert-gateway", disabled: true },
   ];
@@ -259,7 +262,10 @@ async function resumeAgent(ctx, resumeSessionId, options, pump, approvals) {
   const base = defaultModel.currentSelection();
   const provider = options.provider ?? base.provider;
   const model = options.model ?? base.model;
-  const selection = { provider, model, reasoningEffort: base.reasoningEffort };
+  // 恢复历史会话时可按 meta 还原当时的思考级别（options.reasoningEffort）
+  const reasoningEffort =
+    normalizeEffort(typeof options.reasoningEffort === "string" ? options.reasoningEffort : "") ?? base.reasoningEffort;
+  const selection = { provider, model, reasoningEffort };
 
   const handle = await agents.resume({
     resumeSessionId: SessionId(resumeSessionId),
@@ -353,6 +359,84 @@ function normalizeEffort(value) {
   if (value === "low") return "high";
   return undefined;
 }
+
+/**
+ * 思考档位强度序（弱 → 强，含 pi-ai/各家厂商扩展档位）。
+ * 面板固定 4 档（off/low/high/max），但模型实际档位各异（如 zai 的
+ * [off, minimal, low, medium, high]）。**匹配按语义强度位置对齐，不按文字**：
+ * 面板的 high 对应模型档位序列里"语义强度相当"的一档（如 zai 的 medium），
+ * 而非简单 high→high（那是模型自己的最高档）。
+ */
+const EFFORT_STRENGTH = { off: 0, minimal: 1, low: 2, medium: 3, high: 4, xhigh: 5, max: 6 };
+
+/** 面板固定四档（弱 → 强；off 为关闭思考）。 */
+const PANEL_EFFORTS = ["off", "low", "high", "max"];
+
+/**
+ * 思考级别参数自动适配：把请求的档位映射到模型真实支持的档位，
+ * 让"模型不支持某参数"不再中断任务（原行为：内核抛 UNSUPPORTED_* → 大红错误）。
+ *
+ * 匹配规则（**按语义强度位置，不按文字**）：
+ * - 请求档位在模型**完整档位序列**（含 off）里的对应位置直接命中 → 原样返回；
+ * - 未命中时按位置比例对齐：面板第 pi 档（0..3，off/low/high/max）→ 模型序列
+ *   中 round(pi * (n-1) / 3) 的位置（如面板 high 对 zai5 → medium、对 deepseek → high）；
+ * - 模型无任何档位（supported 空）→ 剔除参数（undefined，走模型默认），
+ *   此时 off 语义=不传 thinking（关闭思考），其余档位语义=不传 effort 走模型默认。
+ * @param {string|undefined} requested 请求的思考级别（面板四档之一）
+ * @param {string[]} supported 模型真实支持的档位列表（resolveModelInfo.reasoning.efforts[].id）
+ * @returns {{value: string|undefined, adapted: boolean}} value 为最终档位（undefined = 不传），
+ *   adapted 表示是否做了调整（供日志/状态栏提示）
+ */
+function adaptEffort(requested, supported) {
+  if (!requested) return { value: undefined, adapted: false };
+  const list = Array.isArray(supported) ? supported : [];
+  // off（关闭思考）：模型支持 off 就原样用；否则剔除（不传 thinking = 关闭）
+  if (requested === "off") {
+    return list.includes("off") ? { value: "off", adapted: false } : { value: undefined, adapted: true };
+  }
+  // 模型完整档位（含 off），按语义强度升序
+  const seq = [...list].filter(Boolean).sort((a, b) => (EFFORT_STRENGTH[a] ?? 0) - (EFFORT_STRENGTH[b] ?? 0));
+  if (seq.length === 0) return { value: undefined, adapted: true };
+  const pi = PANEL_EFFORTS.indexOf(requested);
+  if (pi < 0) return { value: undefined, adapted: true };
+  // **按语义强度位置对齐**（含 off 的完整序列，不按文字）：
+  // 面板第 pi 档（0..3）→ 模型序列中 round(pi * (n-1) / 3) 的位置。
+  // 例：面板 high(pi=2) 对 deepseek [off,high,max] → round(2*2/3)=1 → high（不越级）；
+  //     对 zai5 [off,minimal,low,medium,high] → round(2*4/3)=3 → medium（不落到模型最高档）。
+  const ti = Math.round((pi * (seq.length - 1)) / (PANEL_EFFORTS.length - 1));
+  const value = seq[ti];
+  return { value, adapted: value !== requested };
+}
+
+/**
+ * 对 agent/request 瀑布的 request 应用思考档位替换。
+ * request 由 dsh-agent-loop buildRequest **深冻结**（deepFreeze）——任何就地
+ * 赋值/删除都会在 ESM 严格模式下抛 TypeError（"Cannot assign to read only
+ * property 'reasoningEffort'"）。必须解构重建新对象，靠瀑布返回值替换原配置
+ * （与 dsh-agent installModelSelection 对同一瀑布的做法一致）。
+ * @param {object} request 内核冻结的请求配置对象
+ * @param {string|undefined} effort 最终档位（undefined = 剔除该参数走模型默认）
+ * @returns {object} 新的请求配置对象
+ */
+function applyEffort(request, effort) {
+  if (effort === undefined) {
+    const { reasoningEffort: _drop, ...rest } = request;
+    return rest;
+  }
+  return { ...request, reasoningEffort: effort };
+}
+
+/** 模型思考能力缓存：`provider|model` -> 支持的档位数组（能力查询免重复开销）。 */
+const effortCapabilityCache = new Map();
+
+/**
+ * 思考级别适配结果缓存：`provider|model|requestedEffort` -> 最终档位。
+ * **每个模型每种档位组合首次请求时查询并适配一次，之后直接复用适配后的参数**，
+ * 不再做 resolveModelInfo / includes 等任何校正工作（模型换不了几个、思考级别
+ * 就 4 档，组合数量级极小）。值为 undefined 表示"该组合被判定为剔除参数
+ * （走模型默认）"，与"未缓存"用 Map.has 区分。
+ */
+const effortAdaptedCache = new Map();
 
 /**
  * 系统提示层收尾引导（**从一开始就注入**，每轮系统提示均携带）：
@@ -560,22 +644,113 @@ function attachAgent(ctx, handle, pump) {
     return gate;
   });
 
-  // 思考级别实际值追踪：agent/request 是每次模型请求配置的**唯一**入口
+  // 思考级别实际值追踪 + 参数自动适配：agent/request 是每次模型请求配置的**唯一**入口
   // （dsh-agent-loop buildRequest 由此消费 provider/model/reasoningEffort），
   // 应答/usage 不回显 effort（dsh-llm-deepseek 类型仅有请求侧定义），因此
   // 此处日志即"AI 实际使用的思考级别"。仅在变化、或用户刚切换思考级别
   // （userEffortChanged）时打印，避免每步刷屏。
-  agent.ctx.on("agent/request", async (_payload, next) => {
-    const request = await next();
-    const actual = request?.reasoningEffort;
+  // 参数适配：请求的 effort 若不被该模型支持，自动降级到最接近的兼容档位
+  // （或剔除参数走模型默认），绝不因参数不支持中断任务——适配动作记日志、
+  // 状态栏提示（modelAdapted 帧），随后继续工作。
+  // 性能：适配结果按 `provider|model|effort` 组合缓存，每个组合仅首次请求
+  // 做一次能力查询+校正，之后每次请求只是查缓存键直接套用，无任何重复开销。
+  // 注意：**必须 prepend**。Cordis waterfall 的监听器按注册顺序组成洋葱——
+  // 先注册的在最外层、最后处理返回值。installModelSelection（内核，在
+  // agents.create 的 setup 里注册）每次请求都会把 selection.reasoningEffort
+  // 无条件写回 request；若不 prepend，本钩子剔除/降级 effort 后会被它在外层
+  // 覆盖（实测 ollama 仍报 UNSUPPORTED_REASONING_EFFORT）。prepend 后本钩子
+  // 成为最外层：先 await next() 拿到 installModelSelection 应用后的完整配置，
+  // 再做适配，最终返回值即适配结果。
+  agent.ctx.on(
+    "agent/request",
+    async (_payload, next) => {
+      let request = await next();
+      if (request && request.provider && request.model && request.reasoningEffort) {
+        const cacheKey = `${request.provider}|${request.model}|${request.reasoningEffort}`;
+        // 诊断日志：cacheHit=false 表示该 provider/model/effort 组合**首次**遇到
+        // （本轮将查询模型能力并做一次适配，结果记入 effortAdaptedCache）；
+        // 之后的相同组合 cacheHit=true，直接复用适配结果，不再查询/校正。
+        const cacheHit = effortAdaptedCache.has(cacheKey);
+        // 诊断日志：仅首次遇到（cacheHit=false）打印——将查询能力并适配一次；
+        // 命中（cacheHit=true）静默复用，避免每步刷屏。
+        if (!cacheHit) {
+          log("debug", `[adapt] ${request.provider}/${request.model} effort=${request.reasoningEffort} cacheHit=false`);
+        }
+        if (cacheHit) {
+          // 该组合已适配过：直接套用记忆的最终档位（undefined = 剔除，走模型默认）。
+          // request 是内核深冻结对象，不能就地改——applyEffort 解构重建，靠瀑布返回值生效。
+          const cached = effortAdaptedCache.get(cacheKey);
+          if (cached !== request.reasoningEffort) request = applyEffort(request, cached);
+        } else {
+          // 首次遇到该组合：查询模型真实能力（能力本身也有缓存）并做一次适配
+          try {
+            const llm = ctx.get("llm");
+            if (llm !== undefined && typeof llm.resolveModelInfo === "function") {
+              const capKey = `${request.provider}|${request.model}`;
+              let supported = effortCapabilityCache.get(capKey);
+              if (supported === undefined) {
+                const info = await llm.resolveModelInfo(request.provider, request.model);
+                supported = (info?.reasoning?.efforts ?? []).map((e) => (typeof e === "string" ? e : e?.id)).filter(Boolean);
+                effortCapabilityCache.set(capKey, supported);
+                log("debug", `[adapt] capability ${capKey} → supported=[${supported.join(", ")}]`);
+              }
+              const from = request.reasoningEffort;
+              const { value, adapted } = adaptEffort(from, supported);
+              effortAdaptedCache.set(cacheKey, value); // 记住该组合的最终档位（含 undefined = 剔除）
+              if (adapted) {
+                request = applyEffort(request, value);
+                log(
+                  "info",
+                  L(
+                    `思考级别按语义强度映射：${request.provider}/${request.model} ${from} → ${
+                      value === undefined ? "不传（模型默认）" : value
+                    }`,
+                    `effort mapped by semantic strength: ${request.provider}/${request.model} ${from} → ${
+                      value === undefined ? "(omit, model default)" : value
+                    }`
+                  )
+                );
+                // 状态栏提示（扩展侧显示为温和提示，不打断对话）
+                post({
+                  t: "modelAdapted",
+                  provider: request.provider,
+                  model: request.model,
+                  from,
+                  to: value ?? "",
+                });
+              }
+            }
+          } catch (error) {
+            // 能力查询失败：不能静默透传原参数（模型可能根本不支持该档位 → 内核
+            // 抛 UNSUPPORTED_* 中断任务）。保守剔除 effort（走模型默认），并记日志；
+            // **把剔除结果也写入适配缓存**（该组合后续请求直接复用，不再重复失败
+            // 查询与重复提示；配置变更时缓存会被清空重新适配）。
+            log(
+              "warn",
+              L(
+                `参数适配：无法查询模型 ${request.provider}/${request.model} 的思考级别能力，已移除思考级别参数（走模型默认）`,
+                `param adapt: cannot probe effort capability of model ${request.provider}/${request.model}; removed effort (model default)`
+              )
+            );
+            const from = request.reasoningEffort;
+            request = applyEffort(request, undefined);
+            effortAdaptedCache.set(cacheKey, undefined); // 记住该组合 = 剔除
+            // 状态栏温和提示（不打断对话）
+            post({ t: "modelAdapted", provider: request.provider, model: request.model, from, to: "" });
+          }
+        }
+      }
+      const actual = request?.reasoningEffort;
     if (actual !== lastLoggedEffort || userEffortChanged) {
       lastLoggedEffort = actual;
       userEffortChanged = false;
       log("info", L(`AI 实际思考级别: ${actual ?? "（未指定）"}`, `AI actual reasoning effort: ${actual ?? "(unset)"}`));
     }
     return request;
-  });
-
+  },
+    // prepend：见上方注释——必须排在内核 installModelSelection 之前（外层）
+    { prepend: true }
+  );
   // 生命周期状态
   agent.ctx.on("agent/status", ({ agent: a, status }) => {
     post({ t: "status", status });
@@ -718,8 +893,77 @@ function migrateLegacySessions() {
 }
 
 /* ------------------------------------------------------------------ */
-/* 会话历史（list / resume / delete）                                   */
+/* 会话历史（list / resume / delete / rename / meta）                   */
 /* ------------------------------------------------------------------ */
+
+/**
+ * 会话附加元数据（标题覆盖 + 模型/思考级别/workMode）持久化。
+ *
+ * 为什么需要：会话标题与模型参数是"用户意图"的一部分，恢复历史会话时应
+ * 还原当时所用的模型/思考级别/工作模式。标题内核有 session/title 事件可写
+ * （sessionTitle.rename，需 live session）；模型选择（provider/model/effort）
+ * 与 workMode 内核没有会话级持久化 API，故宿主自行落盘一份轻量 JSON：
+ *   { [sessionId]: { title?, provider?, model?, reasoningEffort?, workMode? } }
+ * 存于 DSH home 的 sessions-ay-dsh/ 下（与会话日志同根，删会话时一并清理）。
+ */
+const SESSION_META_FILE = "session-meta.json";
+
+function sessionMetaPath() {
+  return join(dshHomePath("sessions-ay-dsh"), SESSION_META_FILE);
+}
+
+/** 读取全部会话元数据（无文件/损坏时返回空对象，不抛错）。 */
+function loadSessionMeta() {
+  try {
+    const raw = readFileSync(sessionMetaPath(), "utf8");
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+/** 写入全部会话元数据（原子写：先写临时文件再 rename）。 */
+function saveSessionMeta(meta) {
+  try {
+    const dir = dirname(sessionMetaPath());
+    mkdirSync(dir, { recursive: true });
+    const tmp = `${sessionMetaPath()}.tmp`;
+    writeFileSync(tmp, JSON.stringify(meta, null, 2), "utf8");
+    renameSync(tmp, sessionMetaPath());
+  } catch (error) {
+    log("warn", "session meta save failed", error instanceof Error ? error.message : String(error));
+  }
+}
+
+/** 读单个会话元数据。 */
+function getSessionMeta(sessionId) {
+  return loadSessionMeta()[sessionId] ?? {};
+}
+
+/** 合并更新单个会话元数据（保留未提及字段）。 */
+function updateSessionMeta(sessionId, patch) {
+  if (!sessionId) return;
+  const meta = loadSessionMeta();
+  meta[sessionId] = { ...(meta[sessionId] ?? {}), ...patch };
+  saveSessionMeta(meta);
+}
+
+/** 删除单个会话元数据（会话被物理删除时同步清理）。 */
+function removeSessionMeta(sessionId) {
+  const meta = loadSessionMeta();
+  if (sessionId in meta) {
+    delete meta[sessionId];
+    saveSessionMeta(meta);
+  }
+}
+
+/** 会话标题：用户显式重命名优先，否则取内核自动标题。 */
+async function sessionDisplayTitle(ctx, sessionId, kernelTitle) {
+  const meta = getSessionMeta(sessionId);
+  if (typeof meta.title === "string" && meta.title.trim() !== "") return meta.title;
+  return kernelTitle;
+}
 
 /**
  * 列出持久化会话（newest-first），附标题。编码规则与
@@ -739,21 +983,38 @@ async function listSessions(ctx) {
   }
   // 完整列出所有持久化/存活的会话，不做任何过滤（不掩盖问题）。
   // 空会话由清理机制移除（见 deleteEmptySessions），列表即真相。
+  // 会话分两类：主代理会话（id 带 dsh-vscode- 前缀，聊天面板可见）与
+  // 子代理会话（裸 UUID，subagent 工具创建）——前端分组展示、同方式管理。
+  const allMeta = loadSessionMeta();
   return records
     .filter((r) => r.persisted || r.live)
-    .map((r) => ({
-      id: r.header.id,
-      cwd: r.header.cwd ?? "",
-      createdAt: r.header.createdAt,
-      title: titles.get(r.header.id)?.title,
-      updatedAt: titles.get(r.header.id)?.updatedAt ?? r.header.createdAt,
-      live: r.live,
-    }));
+    .map((r) => {
+      const meta = allMeta[r.header.id] ?? {};
+      const kernelTitle = titles.get(r.header.id)?.title;
+      return {
+        id: r.header.id,
+        cwd: r.header.cwd ?? "",
+        createdAt: r.header.createdAt,
+        // 用户显式重命名优先于内核自动标题
+        title: typeof meta.title === "string" && meta.title.trim() !== "" ? meta.title : kernelTitle,
+        updatedAt: titles.get(r.header.id)?.updatedAt ?? r.header.createdAt,
+        live: r.live,
+        // 会话类型：主代理（dsh-vscode- 前缀）或子代理（subagent 工具，裸 UUID）
+        kind: String(r.header.id).startsWith(SESSION_PREFIX) ? "main" : "sub",
+        // 会话级模型/思考级别/workMode（恢复时还原用；前端可展示）
+        provider: meta.provider,
+        model: meta.model,
+        reasoningEffort: meta.reasoningEffort,
+        workMode: meta.workMode,
+      };
+    });
 }
 
 /**
  * 计算会话统计快照（分页加载时 host.ts 无法从部分事件累计完整统计，
  * 由宿主侧全量扫描一次：标题 / token 累计 / 上下文窗口）。
+ * 注：仅统计 token，不做费用估算（2026-08-20 owner 决策放弃计费——
+ * 计费标准难统一、非核心功能，见 docs/AY-DSH插件改进方案选取依据.md）。
  */
 function computeSessionStats(events) {
   const stats = { inputTokens: 0, cacheReadTokens: 0, outputTokens: 0, steps: 0 };
@@ -830,6 +1091,7 @@ async function deleteSession(ctx, sessionId) {
       return { ok: false, error: `会话文件不存在: ${dir}` };
     }
     rmSync(dir, { recursive: true, force: true });
+    removeSessionMeta(sessionId);
     return { ok: true };
   } catch (error) {
     return { ok: false, error: error instanceof Error ? error.message : String(error) };
@@ -861,7 +1123,7 @@ function toolResultText(content) {
 
 /**
  * 导出会话为完整 HTML 网页（不截断任何内容，作为 webview 显示限制的补充）。
- * 输出到 DSH home 的 exports/ 目录，返回文件路径。
+ * 输出到**当前工作区的 exports/ 目录**（不放 DSH home——敏感文件区），返回文件路径。
  */
 async function exportSession(ctx, sessionId) {
   try {
@@ -972,7 +1234,9 @@ async function exportSession(ctx, sessionId) {
     parts.push(...body);
     parts.push(`</body></html>`);
 
-    const exportDir = join(dshHomePath("exports"));
+    // 导出到**当前工作区**的 exports/ 目录（用户可见、易管理；不放 DSH home——
+    // 那里含密钥等敏感文件，不轻易留存导出内容）
+    const exportDir = join(process.cwd(), "exports");
     mkdirSync(exportDir, { recursive: true });
     const outPath = join(exportDir, `${sessionId}.html`);
     writeFileSync(outPath, parts.join("\n"), "utf8");
@@ -1119,6 +1383,12 @@ async function main() {
               return;
             }
             // 惰性创建：用户发出第一条消息时才创建会话（绝不预先创建空会话）
+            // 注意：此处**不**写会话 meta——lazy session 策略下，未持久化的
+            // 会话不视为有效会话，提前记录会产生孤儿 meta 条目（会话从未
+            // 落盘时无法随删除清理）。新会话的模型选择已通过 setModel 的
+            // defaultModel.saveSelection 持久化为全局默认，createAgent 即用该
+            // 默认创建；对话中途切换模型则由 setModel/setWorkMode 的
+            // `agent !== undefined` 分支记录 meta（此时会话已真实存在）。
             if (agent === undefined) {
               const created = await createAgent(ctx, { model: msg.model ?? env.DSH_VSCODE_MODEL }, pump, approvals);
               handle = created.handle;
@@ -1200,10 +1470,16 @@ async function main() {
               break;
             }
             if (handle !== undefined) await handle.dispose();
+            // 恢复会话参数：模型/思考级别/workMode 优先取该会话记录的 meta
+            const meta = getSessionMeta(msg.id);
             const resumed = await resumeAgent(
               ctx,
               msg.id,
-              { model: msg.model ?? env.DSH_VSCODE_MODEL },
+              {
+                provider: meta.provider || undefined,
+                model: meta.model || msg.model || env.DSH_VSCODE_MODEL,
+                reasoningEffort: meta.reasoningEffort || undefined,
+              },
               pump,
               approvals
             );
@@ -1211,6 +1487,23 @@ async function main() {
             agent = resumed.agent;
             selection = resumed.selection;
             resetStepBudget = resumed.resetStepBudget;
+            // 恢复工作模式（meta 记录；无则保持当前）
+            if (meta.workMode === "multi" || meta.workMode === "single") {
+              workMode = meta.workMode;
+              post({ t: "workModeChanged", mode: workMode });
+            }
+            // 用户曾重命名过：把标题写回内核（session/title 事件），
+            // 使标题快照与显示一致（即使换机器/重装也保留）。
+            if (typeof meta.title === "string" && meta.title.trim() !== "") {
+              try {
+                const titleSvc = ctx.get("sessionTitle");
+                if (titleSvc !== undefined && typeof titleSvc.rename === "function") {
+                  await titleSvc.rename(agent.session, meta.title);
+                }
+              } catch (error) {
+                log("warn", "session title restore failed", error instanceof Error ? error.message : String(error));
+              }
+            }
             // 重放历史（分页）：首次只取最近 limit 条事件，避免大会话
             // （2.6MB / 数百条）全量传输拖慢恢复；向上滚动时按需补更早的。
             // 同时由宿主侧计算完整统计快照（分页下 host.ts 无法从部分事件累计）。
@@ -1235,25 +1528,114 @@ async function main() {
             post({ t: "sessionResumed", id: msg.id, ok: true });
             break;
           }
+          case "viewSession": {
+            // 只读浏览一个会话（用于子代理会话：不创建 agent、不改全局宿主状态、
+            // 不持久化会话 id——仅把历史与统计推给 UI 浏览）。
+            if (typeof msg.id !== "string" || msg.id.trim() === "") {
+              post({ t: "viewSessionFailed", id: msg.id, error: "invalid session id" });
+              break;
+            }
+            try {
+              const query = ctx.get("sessionQuery");
+              if (query === undefined || typeof query.readSession !== "function") {
+                post({ t: "viewSessionFailed", id: msg.id, error: "sessionQuery unavailable" });
+                break;
+              }
+              const snap = await query.readSession(SessionId(msg.id));
+              const events = (snap.events ?? []).filter(
+                (e) => e.type !== "assistant/chunk" && e.type !== "session/end-seed"
+              );
+              const limit = Number.isInteger(msg.limit) && msg.limit > 0 ? msg.limit : 200;
+              const tail = events.slice(-limit);
+              const hasMore = events.length > tail.length;
+              const nextSeq = hasMore ? tail[0].seq : undefined;
+              const stats = computeSessionStats(events);
+              post({ t: "history", sessionId: msg.id, events: tail, hasMore, nextSeq, stats });
+              post({ t: "viewSession", id: msg.id });
+            } catch (error) {
+              log("error", "viewSession failed", error instanceof Error ? error.message : String(error));
+              post({ t: "viewSessionFailed", id: msg.id, error: error instanceof Error ? error.message : String(error) });
+            }
+            break;
+          }
           case "loadMoreHistory": {
-            // 向上滚动加载更早历史：agent 已 resume（events 在内存中），纯内存分页，很快。
-            if (agent === undefined || !Number.isFinite(msg.beforeSeq)) {
+            // 向上滚动加载更早历史：已 resume 的 agent（events 在内存中）纯内存分页；
+            // 只读浏览模式（viewSession）下 agent 未创建，改从持久化会话读取。
+            if (!Number.isFinite(msg.beforeSeq)) {
               post({ t: "historyMore", sessionId: "", events: [], hasMore: false });
               break;
             }
-            const allEvents = agent.session.events.filter(
-              (e) => e.type !== "assistant/chunk" && e.type !== "session/end-seed"
-            );
             const limit = Number.isInteger(msg.limit) && msg.limit > 0 ? msg.limit : 200;
-            const older = allEvents.filter((e) => e.seq < msg.beforeSeq).slice(-limit);
-            const hasMore = allEvents.some((e) => e.seq < (older[0]?.seq ?? msg.beforeSeq));
-            post({
-              t: "historyMore",
-              sessionId: agent.session.id,
-              events: older,
-              hasMore,
-              nextSeq: hasMore && older.length > 0 ? older[0].seq : undefined,
-            });
+            if (agent !== undefined) {
+              const allEvents = agent.session.events.filter(
+                (e) => e.type !== "assistant/chunk" && e.type !== "session/end-seed"
+              );
+              const older = allEvents.filter((e) => e.seq < msg.beforeSeq).slice(-limit);
+              const hasMore = allEvents.some((e) => e.seq < (older[0]?.seq ?? msg.beforeSeq));
+              post({
+                t: "historyMore",
+                sessionId: agent.session.id,
+                events: older,
+                hasMore,
+                nextSeq: hasMore && older.length > 0 ? older[0].seq : undefined,
+              });
+            } else if (typeof msg.sessionId === "string" && msg.sessionId !== "") {
+              try {
+                const query = ctx.get("sessionQuery");
+                if (query !== undefined && typeof query.readSession === "function") {
+                  const snap = await query.readSession(SessionId(msg.sessionId));
+                  const allEvents = (snap.events ?? []).filter(
+                    (e) => e.type !== "assistant/chunk" && e.type !== "session/end-seed"
+                  );
+                  const older = allEvents.filter((e) => e.seq < msg.beforeSeq).slice(-limit);
+                  const hasMore = allEvents.some((e) => e.seq < (older[0]?.seq ?? msg.beforeSeq));
+                  post({
+                    t: "historyMore",
+                    sessionId: msg.sessionId,
+                    events: older,
+                    hasMore,
+                    nextSeq: hasMore && older.length > 0 ? older[0].seq : undefined,
+                  });
+                } else {
+                  post({ t: "historyMore", sessionId: msg.sessionId, events: [], hasMore: false });
+                }
+              } catch (error) {
+                log("warn", "view loadMoreHistory failed", error instanceof Error ? error.message : String(error));
+                post({ t: "historyMore", sessionId: msg.sessionId, events: [], hasMore: false });
+              }
+            } else {
+              post({ t: "historyMore", sessionId: "", events: [], hasMore: false });
+            }
+            break;
+          }
+          case "renameSession": {
+            // 重命名会话标题：写入会话 meta（title 覆盖，用户显式重命名优先于
+            // 内核自动标题；listSessions 直接读取 meta 展示）。目标是当前 live
+            // 会话时顺带写回内核 session/title 事件（标题快照一致）；历史会话
+            // 无需临时恢复——"继续"该会话时 resumeSession 会把 meta.title 写回
+            // 内核（见 resumeSession 分支），避免这里重复恢复/释放的重操作。
+            if (typeof msg.id !== "string" || msg.id.trim() === "") {
+              post({ t: "sessionRenamed", id: msg.id, ok: false, error: "invalid session id" });
+              break;
+            }
+            const title = typeof msg.title === "string" ? msg.title.trim() : "";
+            if (title === "") {
+              post({ t: "sessionRenamed", id: msg.id, ok: false, error: "title must not be empty" });
+              break;
+            }
+            updateSessionMeta(msg.id, { title });
+            // 当前 live 会话：顺带写回内核标题快照
+            if (agent !== undefined && agent.session.id === msg.id) {
+              try {
+                const titleSvc = ctx.get("sessionTitle");
+                if (titleSvc !== undefined && typeof titleSvc.rename === "function") {
+                  await titleSvc.rename(agent.session, title);
+                }
+              } catch (error) {
+                log("warn", "session title write failed", error instanceof Error ? error.message : String(error));
+              }
+            }
+            post({ t: "sessionRenamed", id: msg.id, ok: true, title });
             break;
           }
           case "deleteSession": {
@@ -1293,7 +1675,35 @@ async function main() {
               }
               const base = defaultModel.currentSelection();
               const provider = typeof msg.provider === "string" && msg.provider !== "" ? msg.provider : base.provider;
-              const model = typeof msg.model === "string" && msg.model !== "" ? msg.model : base.model;
+              let model = typeof msg.model === "string" && msg.model !== "" ? msg.model : base.model;
+              // provider/model 一致性防御：model 必须属于该 provider（前端切提供商时
+              // 默认选中该 provider 第一模型；此处兜底——若传入的 model 不是该 provider
+              // 的模型，自动改用该 provider 模型列表第一项，避免 zai-free+deepseek-v4-flash
+              // 这类错配导致"无法查询模型能力"报错）。
+              if (model !== "") {
+                try {
+                  const llm = ctx.get("llm");
+                  if (llm !== undefined && typeof llm.listModels === "function") {
+                    const listed = await llm.listModels(provider);
+                    const ids = listed.map((m) => m.id);
+                    if (!ids.includes(model)) {
+                      const first = ids[0];
+                      if (first !== undefined && first !== "") {
+                        log(
+                          "warn",
+                          L(
+                            `模型 ${provider}/${model} 不属于该提供商，已自动改用 ${provider}/${first}`,
+                            `model ${provider}/${model} does not belong to provider; auto-switched to ${provider}/${first}`
+                          )
+                        );
+                        model = first;
+                      }
+                    }
+                  }
+                } catch (error) {
+                  log("warn", "setModel provider/model consistency check failed", error instanceof Error ? error.message : String(error));
+                }
+              }
               // 思考等级：统一小写并规范化（low → high，见 normalizeEffort 注释）；
               // 非法/空值回退到当前基线（基线同样规范化，历史遗留的大写/非法值一并修正）
               const baseEffort = normalizeEffort(base.reasoningEffort);
@@ -1310,6 +1720,10 @@ async function main() {
               }
               userEffortChanged = true; // 用户切换思考级别：下一次模型请求打印实际值
               log("info", L(`模型选择 → ${provider}/${model}${reasoningEffort ? `（思考级别=${reasoningEffort}）` : ""}`, `model selection → ${provider}/${model}${reasoningEffort ? ` (effort=${reasoningEffort})` : ""}`));
+              // 记录到当前会话 meta（恢复历史时还原模型/思考级别）
+              if (agent !== undefined) {
+                updateSessionMeta(agent.session.id, { provider, model, reasoningEffort });
+              }
               post({ t: "modelChanged", provider, model, reasoningEffort });
             } catch (error) {
               log("error", "setModel failed", error instanceof Error ? error.message : String(error));
@@ -1320,6 +1734,10 @@ async function main() {
           case "setWorkMode": {
             const mode = msg.mode === "multi" ? "multi" : "single";
             workMode = mode;
+            // 记录到当前会话 meta（恢复历史时还原工作模式）
+            if (agent !== undefined) {
+              updateSessionMeta(agent.session.id, { workMode: mode });
+            }
             log("info", `work mode → ${mode}`);
             post({ t: "workModeChanged", mode });
             break;
@@ -1330,16 +1748,35 @@ async function main() {
               const defaultModel = ctx.get("agentDefaultModel");
               let providers = [];
               if (llm !== undefined && typeof llm.listProviders === "function") {
-                providers = llm.listProviders().map((p) => ({ id: p.id, name: p.name ?? p.id }));
+                // 排除 deepseek-official：它是 llm-deepseek 的内部官方路由，与配置面板的
+                // deepseek 条目（llm-pi-ai 路由）并列会造成"DeepSeek 出现两次"。
+                // 面板的 deepseek 条目经 llm-pi-ai 提供 DeepSeek 选项。
+                providers = llm
+                  .listProviders()
+                  .filter((p) => p.id !== "deepseek-official")
+                  .map((p) => ({ id: p.id, name: p.name ?? p.id }));
               }
+              if (providers.length === 0) {
+                // 兜底：没有任何已配置路由时，至少提供官方 DeepSeek 可选
+                providers = [{ id: "deepseek-official", name: "DeepSeek" }];
+              }
+              // 每个提供商的模型分组（聊天面板按所选提供商过滤模型下拉）。
+              // 条目带 id+name：界面显示名称、内部以 id 传递识别。
+              const providerModels = {};
               let models = [];
               if (llm !== undefined && typeof llm.listModels === "function" && providers.length > 0) {
-                try {
-                  const listed = await llm.listModels(providers[0].id);
-                  models = listed.map((m) => m.id);
-                } catch {
-                  models = [];
+                const merged = new Set();
+                for (const p of providers) {
+                  try {
+                    const listed = await llm.listModels(p.id);
+                    const entries = listed.map((m) => ({ id: m.id, name: m.name || m.id }));
+                    providerModels[p.id] = entries;
+                    for (const e of entries) merged.add(e.id);
+                  } catch {
+                    providerModels[p.id] = [];
+                  }
                 }
+                models = [...merged];
               }
               if (models.length === 0) {
                 // 兜底：现役 DeepSeek 模型（也包含当前选择，保证下拉至少可选回当前模型）。
@@ -1349,8 +1786,18 @@ async function main() {
                 const extra = new Set(["deepseek-v4-flash", "deepseek-v4-pro"]);
                 if (cur?.model) extra.add(cur.model);
                 models = [...extra];
+                for (const p of providers) {
+                  providerModels[p.id] = providerModels[p.id]?.length
+                    ? providerModels[p.id]
+                    : [...extra].map((id) => ({ id, name: id }));
+                }
               }
-              const current = defaultModel?.currentSelection?.() ?? { provider: "", model: "" };
+              // 当前选择：优先取当前 agent 的会话级选择（恢复历史会话后应反映
+              // 该会话记忆的模型/思考级别），未创建 agent 时才回退全局默认。
+              const current =
+                selection !== null && selection.provider && selection.model
+                  ? { provider: selection.provider, model: selection.model, reasoningEffort: selection.reasoningEffort }
+                  : (defaultModel?.currentSelection?.() ?? { provider: "", model: "" });
               // 查询当前模型支持的思考等级与默认档（内核真实能力）。
               // 备忘：DeepSeek 适配器（dsh-llm-deepseek）只声明 off/high/max 三档，
               // 无 low——low 由官方服务端映射为 high。插件向 UI 返回完整四档
@@ -1377,6 +1824,7 @@ async function main() {
                 t: "modelInfo",
                 providers,
                 models,
+                providerModels,
                 current: {
                   provider: current.provider,
                   model: current.model,
@@ -1393,6 +1841,139 @@ async function main() {
                 models: [],
                 current: { provider: "", model: env.DSH_VSCODE_MODEL ?? "" },
               });
+            }
+            break;
+          }
+          case "llmProviders": {
+            // 配置面板：提供商目录（已注册路由 + 可配置目录合并），供 Provider ID 下拉。
+            // 排除 deepseek-official：它是 llm-deepseek 的官方路由（displayName "DeepSeek"），
+            // 与 pi-ai 目录里的 deepseek（OpenAI 兼容知名条目）并列会造成"两个 DeepSeek"混淆；
+            // 面板的 deepseek 条目走 pi-ai 路由，官方路由不需要出现在候选里。
+            try {
+              const llm = ctx.get("llm");
+              const skip = (id) => id === "deepseek-official";
+              // pi-ai 内置目录：提供真实提供商名称与公开 baseUrl（供面板自动填写）
+              const catalogNames = new Map();
+              const catalogBaseUrls = new Map();
+              try {
+                for (const p of builtinProviders()) {
+                  if (p.name) catalogNames.set(p.id, p.name);
+                  if (p.baseUrl) catalogBaseUrls.set(p.id, p.baseUrl);
+                }
+              } catch {
+                // catalog 读取失败不影响目录（名称/地址回退到 id/手填）
+              }
+              const providers = [];
+              if (llm && typeof llm.listProviders === "function") {
+                for (const p of llm.listProviders()) {
+                  if (!skip(p.id)) providers.push({ id: p.id, name: p.name, baseUrl: catalogBaseUrls.get(p.id) });
+                }
+              }
+              if (llm && typeof llm.listConfigurableProviders === "function") {
+                for (const p of llm.listConfigurableProviders()) {
+                  if (p && p.provider && !skip(p.provider) && !providers.some((x) => x.id === p.provider)) {
+                    providers.push({
+                      id: p.provider,
+                      name: catalogNames.get(p.provider) || p.displayName || p.provider,
+                      baseUrl: catalogBaseUrls.get(p.provider),
+                    });
+                  }
+                }
+              }
+              post({ t: "llmProviders", id: msg.id, providers });
+            } catch (error) {
+              log("error", "listProviders failed", error instanceof Error ? error.message : String(error));
+              post({ t: "llmProviders", id: msg.id, providers: [] });
+            }
+            break;
+          }
+          case "discoverModels": {
+            // 模型发现：优先走 llm-pi-ai 的注册发现——catalog 提供商免网络返回模型+元数据
+            // （contextWindow/maxTokens）；未知提供商用 baseURL/apiKey 探活端点。
+            // 失败回退扩展侧 OpenAI /models 查询（仅 id）。
+            try {
+              const llm = ctx.get("llm");
+              if (llm && typeof llm.discoverModels === "function") {
+                const models = await llm.discoverModels("llm-pi-ai", {
+                  provider: typeof msg.provider === "string" ? msg.provider : undefined,
+                  baseURL: typeof msg.baseURL === "string" && msg.baseURL !== "" ? msg.baseURL : undefined,
+                  api: typeof msg.api === "string" && msg.api !== "" ? msg.api : undefined,
+                  apiKey: typeof msg.apiKey === "string" && msg.apiKey !== "" ? msg.apiKey : undefined,
+                });
+                post({ t: "discoveredModels", id: msg.id, models });
+              } else {
+                post({ t: "discoveredModels", id: msg.id, models: [], error: "llm service unavailable" });
+              }
+            } catch (error) {
+              log("warn", "discoverModels failed", error instanceof Error ? error.message : String(error));
+              post({ t: "discoveredModels", id: msg.id, models: [], error: error instanceof Error ? error.message : String(error) });
+            }
+            break;
+          }
+          case "providersApply": {
+            // 配置面板保存/删除提供商后，把整套提供商配置同步进 DSH：
+            // 1) llm-pi-ai settings（providers dict）→ 适配器目录与路由热更新；
+            // 2) API Key 写入 credentials（ref = dsh-vscode:<id>），profile.apiKeyEnv 指向它。
+            try {
+              const list = Array.isArray(msg.providers) ? msg.providers : [];
+              const settings = ctx.get("settings");
+              const credentials = ctx.get("credentials");
+              const section = { providers: {} };
+              const parseTokens = (v) => {
+                if (typeof v === "number") return Number.isFinite(v) && v > 0 ? Math.round(v) : undefined;
+                const m = String(v ?? "").trim().match(/^(\d+(?:\.\d+)?)\s*([KkMm]?)$/);
+                if (!m) return undefined;
+                const mult = m[2].toLowerCase() === "k" ? 1024 : m[2].toLowerCase() === "m" ? 1024 * 1024 : 1;
+                return Math.round(parseFloat(m[1]) * mult);
+              };
+              for (const p of list) {
+                if (!p || !p.id) continue;
+                // deepseek-official 是 llm-deepseek 的官方路由（双注册会冲突），不写入 llm-pi-ai；
+                // 其余提供商（含 deepseek——pi-ai 目录的 OpenAI 兼容知名条目）统一走 llm-pi-ai。
+                if (p.id === "deepseek-official") continue;
+                // credentials ref 必须匹配 /^[A-Za-z_][A-Za-z0-9_]*$/（连字符/冒号非法），
+                // 且 provider id 可能含 "-"（zai-free、amazon-bedrock），统一清洗。
+                const ref = `dshVscode_${p.id.replace(/[^A-Za-z0-9_]/g, "_")}`;
+                const profile = {
+                  displayName: p.name || p.id,
+                  api: p.protocol || "openai-completions",
+                  baseURL: p.baseUrl || undefined,
+                  models: Array.isArray(p.models)
+                    ? p.models
+                        .map((m) => {
+                          const mid = typeof m === "string" ? m : m?.id;
+                          if (!mid) return undefined;
+                          const out = { id: mid };
+                          if (m && typeof m === "object") {
+                            if (m.displayName) out.name = m.displayName;
+                            const ctxWin = parseTokens(m.contextWindow);
+                            if (ctxWin !== undefined) out.contextWindow = ctxWin;
+                            const maxTok = parseTokens(m.maxOutput);
+                            if (maxTok !== undefined) out.maxTokens = maxTok;
+                          }
+                          return out;
+                        })
+                        .filter(Boolean)
+                    : [],
+                };
+                if (typeof p.apiKey === "string" && p.apiKey !== "") {
+                  profile.apiKeyEnv = ref;
+                  if (credentials) await credentials.set(credentialRef(ref), p.apiKey);
+                } else if (credentials) {
+                  await credentials.unset(credentialRef(ref));
+                }
+                section.providers[p.id] = profile;
+              }
+              if (settings && typeof settings.replace === "function") {
+                await settings.replace("llm-pi-ai", section, undefined);
+              }
+              // 配置变更：模型能力可能变化，清空思考级别适配缓存（下次请求重新查询/适配）
+              effortCapabilityCache.clear();
+              effortAdaptedCache.clear();
+              post({ t: "providersApplied", id: msg.id, ok: true });
+            } catch (error) {
+              log("error", "providersApply failed", error instanceof Error ? error.message : String(error));
+              post({ t: "providersApplied", id: msg.id, ok: false, error: error instanceof Error ? error.message : String(error) });
             }
             break;
           }

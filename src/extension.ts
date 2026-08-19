@@ -356,21 +356,58 @@ function openSettings(context: vscode.ExtensionContext): void {
     onConfigSaveEnd: () => {
       configSaveTransaction = false;
     },
-    onSaved: () => {
+    onSaved: (restart: boolean) => {
       configSaveTransaction = false;
-      // 记录本次重启时间：抑制 onDidChangeConfiguration 的延迟事件（面板保存
+      // 记录本次保存时间：抑制 onDidChangeConfiguration 的延迟事件（面板保存
       // 的配置事件可能在事务结束后才到达），避免宿主被重复重启
       lastConfigRestartAt = Date.now();
       if (configRestartTimer) clearTimeout(configRestartTimer);
       configRestartTimer = undefined;
-      // 会话 id 已在会话存续期间持久化（storedSessionId），此处只需锁定 UI +
-      // 按新配置重启宿主；重启就绪后自动恢复原会话。
-      // 保存结果提示统一走 VS Code 状态栏（configPanel.ts setStatusBarMessage），
-      // 不弹任何通知/弹框。
-      provider?.noteHostRestart();
-      disposeHost();
-      provider?.restartHost();
+      if (restart) {
+        // 宿主运行参数确实变化：锁定 UI + 按新配置重启宿主（重启就绪后自动恢复原会话）。
+        // 保存结果提示统一走 VS Code 状态栏（configPanel.ts setStatusBarMessage）。
+        provider?.noteHostRestart();
+        disposeHost();
+        provider?.restartHost();
+      }
+      // 无论是否重启都刷新聊天视图（如提供商热生效后的模型列表）
       provider?.pushConfigToView?.();
+    },
+    // 查询 DSH 提供商目录（配置面板 Provider ID 下拉数据源；宿主未运行则先拉起）
+    queryProviders: async (): Promise<{ id: string; name: string }[]> => {
+      try {
+        const h = await ensureHost(context);
+        if (h) return await h.llmProviders();
+      } catch {
+        // 宿主不可用（如缺配置）：返回空，面板按空目录处理（可手动输入/自定义）
+      }
+      return [];
+    },
+    // 把配置面板保存的提供商配置同步进 DSH（llm-pi-ai settings + credentials，热生效）。
+    // 宿主不可用时静默失败（返回错误信息，不影响面板本身）。
+    applyProviders: async (providers): Promise<string | undefined> => {
+      try {
+        const h = await ensureHost(context);
+        if (h) return await h.applyProviders(providers);
+      } catch (e) {
+        return e instanceof Error ? e.message : String(e);
+      }
+      return "host unavailable";
+    },
+    // 模型发现：catalog 提供商免网络返回模型+元数据；未知提供商探活端点。
+    discoverModels: async (opts): Promise<{ models: { id: string; name?: string; contextWindow?: number; maxTokens?: number }[]; error?: string }> => {
+      try {
+        const h = await ensureHost(context);
+        if (h) return await h.discoverModels(opts);
+      } catch {
+        // 宿主不可用：回退网络查询
+      }
+      return { models: [], error: "host unavailable" };
+    },
+    // 提供商配置同步完成后：触发宿主 getModelInfo，让聊天面板底部模型选择器
+    // 立即反映新增/变更的提供商与模型（宿主已通过 llm-pi-ai settings 热生效）。
+    onProvidersSynced: () => {
+      void ensureHost(context).then((h) => h?.getModelInfo());
     },
   });
 }
