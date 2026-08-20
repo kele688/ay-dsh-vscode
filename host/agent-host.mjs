@@ -27,7 +27,7 @@ import { SessionId } from "@deepseek-ai/dsh-session";
 import { installModelSelection } from "@deepseek-ai/dsh-agent";
 
 const NAME = "dsh-vscode-host";
-const CORE_VERSION = "0.2.1";
+const CORE_VERSION = "0.3.0";
 /** 插件会话 id 前缀（也是会话隔离的标识）。 */
 const SESSION_PREFIX = "dsh-vscode-";
 
@@ -473,27 +473,154 @@ function languageDirectiveSection() {
   };
 }
 
-function stepLimitSystemSection(limit) {
+/** 标题时间字段（统一可读格式）：`YYYY-MM-DD_HH-mm-ss.SSS`（下划线代替空格，精确到毫秒）。 */
+function fmtTitleTime(ts) {
+  const d = new Date(ts);
+  const p = (n, w = 2) => String(n).padStart(w, "0");
+  return (
+    `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}_` +
+    `${p(d.getHours())}-${p(d.getMinutes())}-${p(d.getSeconds())}.${p(d.getMilliseconds(), 3)}`
+  );
+}
+
+/** 子代理会话标题：`subsession_<可读时间>_<sessionId>`（sessionId 天然唯一防重叠，可追溯）。 */
+function genSubsessionTitle(sessionId) {
+  return `subsession_${fmtTitleTime(Date.now())}_${sessionId}`;
+}
+
+/** 生成会话静态临时标题：`newsession_<可读时间>_<首条指令前10字>`。
+ *  - 时间精确到毫秒（下划线代空格，可读）；
+ *  - 标题是**静态记录**：创建会话时生成一次，之后仅由用户重命名覆盖；
+ *    列表读取直接走 session-meta.json，不读会话日志。 */
+function genTempTitle(firstInstruction) {
+  const head = String(firstInstruction ?? "")
+    .trim()
+    .replace(/\s+/g, " ")
+    .slice(0, 10);
+  return `newsession_${fmtTitleTime(Date.now())}_${head}`;
+}
+
+/**
+ * 系统提示层：工具调用边界规则（每轮注入）。
+ * 区分"模型推理必需的工具调用"与"替用户完成的工作"：
+ *  - 前者（读文件/搜索/执行能直接产生推理依据的命令）→ 模型发起并处理结果；
+ *  - 后者（编译/打包/部署/全面安全检查等重复性收尾动作、非推理必需的操作）→
+ *    **不调用工具**、不发起不必要的授权请求，改为在最终答复给出操作步骤/命令
+ *    清单由用户自行执行。目的：大幅减少无谓工具调用与授权弹窗，省时间省 token。
+ */
+function toolBoundarySection() {
   if (UI_LANG === "zh") {
     return {
-      name: "step-limit",
+      name: "tool-boundary",
       text:
-        `每轮对话（一条用户消息）的思考步数预算为 ${limit} 步，请在此预算内规划工作节奏。` +
-        "预算用尽后，工具调用将被禁用，你必须立即收尾：停止所有新的工具调用与推理，" +
-        "在回复中给出简洁的最终答复，说明已完成事项、未完成事项，以及用户下一步应发送的命令。" +
-        "预算耗尽后请勿继续工作。",
+        "工具调用边界：工具调用仅用于**模型推理所必需**的信息收集与分析" +
+        "（读文件、搜索、执行能直接产生推理依据的命令）。" +
+        "**替用户完成的工作不要调用工具**——例如编译、打包、部署、每轮结尾的全面安全检查等" +
+        "重复性验证动作，除非用户明确要求，否则不主动执行：改为在最终答复中给出清晰的操作步骤/命令清单，" +
+        "由用户自行执行；也不要发起不必要的权限授权请求。",
     };
   }
   return {
-    name: "step-limit",
+    name: "tool-boundary",
     text:
-      `Each turn (one user message) has a thinking-step budget of ${limit} model steps. ` +
-      "Plan your work to finish within this budget. " +
-      "When the budget is reached, tool calls are disabled and you must wrap up immediately: " +
-      "stop all new tool calls and reasoning, and deliver a concise final answer covering what " +
-      "was accomplished, what remains unfinished, and the next command the user should send. " +
-      "Do not continue working beyond the budget.",
+      "Tool-use boundary: use tools ONLY for information gathering and analysis your reasoning requires " +
+      "(reading files, searching, running commands that directly produce reasoning evidence). " +
+      "Do NOT call tools to do the user's work for them — e.g. compiling, packaging, deploying, or full " +
+      "security sweeps at the end of every turn. Unless the user explicitly asks, don't perform these yourself: " +
+      "instead give a clear step-by-step command list in your final answer for the user to run. " +
+      "Don't raise unnecessary approval requests either.",
   };
+}
+
+/**
+ * 系统提示层：收尾报告规则（独立 section，**文本完全静态**——KV 缓存纪律：
+ * 系统提示不得含任何动态内容）。规则：最终答复首行按固定格式报告本轮统计。
+ * 数字来源：达限时由 [达限警示]（prompt 末尾）提供精确值并数字直拼；自然
+ * 收尾时由模型引用最近的 [本步指引]（含截至当前步的实时数字）或按执行自述。
+ * 遵守率非 100%——owner 决策：不做宿主兜底 UI，未看到报告时由 owner 明确
+ * 要求模型报告（见 docs 2.13）。
+ */
+/**
+ * 系统提示层：单轮思考预算静态规则（每轮注入，**文本完全静态**——KV 缓存纪律）。
+ * 预算 limit 为进程内常量（修改=重启生效），静态安全；规则强调"最少步数/批量
+ * 工具调用/达限收尾"，动态数值（已用/剩余/工具/耗时）由 [本步指引] 每步提供。
+ */
+function stepBudgetSection(limit) {
+  if (UI_LANG === "zh") {
+    return {
+      name: "step-budget",
+      text:
+        `每轮对话（一条用户消息）的思考步数预算为 ${limit} 步，请在此预算内规划工作节奏。` +
+        "请全力发挥能力，以**最少的步数**实现最好的解决效果，提高效率、节省 tokens。" +
+        "效率要点：动手前先简述你的计划与预估步数（写在回复文本中，不消耗工具步），按计划执行减少绕路；" +
+        "需要收集多项信息时，在同一答复中**一次发起多个工具调用**（并行批量收集），" +
+        "一次性拿回所有需要的信息后再分析；仅当调用之间**存在依赖**时才逐个进行。" +
+        "预算用尽后工具调用将被禁用，你必须立即收尾总结（说明已完成/未完成/下一步命令），预算耗尽后请勿继续工作。" +
+        "本轮实时进度由系统每步通过 [本步指引] 提供（专用字段 STEPS_USED/STEPS_REMAIN/TOOLS_USED/ELAPSED_SEC），请引用其数值。",
+    };
+  }
+  return {
+    name: "step-budget",
+    text:
+      `Each turn (one user message) has a thinking-step budget of ${limit} steps. Plan your work to finish within it. ` +
+      "Do your best to achieve the best outcome in the FEWEST steps — be efficient and save tokens. " +
+      "Efficiency guidance: before acting, briefly state your plan and estimated steps in your reply text (costs no tool steps) and follow it to avoid detours; " +
+      "when you need several pieces of information, issue MULTIPLE tool calls in a single reply " +
+      "(parallel batch collection), then analyze once all results are back; go step-by-step only when calls DEPEND on each other. " +
+      "When the budget is exhausted, tool calls are disabled and you must wrap up immediately: deliver a concise final answer " +
+      "(accomplished / unfinished / next command). Do not continue beyond the budget. " +
+      "Real-time progress is provided each step via [Step guide] (named fields STEPS_USED/STEPS_REMAIN/TOOLS_USED/ELAPSED_SEC); quote those values.",
+  };
+}
+
+function wrapUpReportSection() {
+  if (UI_LANG === "zh") {
+    return {
+      name: "wrap-up-report",
+      text:
+        "收尾报告（**强制，非可选项**）：最终答复的**第一行**必须以如下格式开头：" +
+        "`⏱ 本轮统计：STEPS_USED 步思考 / TOOLS_USED 次工具调用 / 耗时 ELAPSED_SEC 秒`" +
+        "——**STEPS_USED / TOOLS_USED / ELAPSED_SEC 取本步 [本步指引] 中同名专用字段的值**；" +
+        "如果你本步还进行了工具调用，则 TOOLS_USED 还必须加上你本步调用工具的次数，" +
+        "ELAPSED_SEC 必须加上你本步的耗时，随后再写总结正文（已完成/未完成/下一步命令）。",
+    };
+  }
+  return {
+    name: "wrap-up-report",
+    text:
+      "Wrap-up report (MANDATORY, not optional): your final answer's FIRST LINE must open with " +
+      "`⏱ Stats this turn: STEPS_USED steps / TOOLS_USED tool calls / ELAPSED_SECs elapsed`" +
+      " — STEPS_USED / TOOLS_USED / ELAPSED_SEC are the values of the SAME NAMED FIELDS in THIS step's " +
+      "[Step guide]; if you issue additional tool calls in this step, ADD them to TOOLS_USED and ADD this " +
+      "step's elapsed time to ELAPSED_SEC, then write the summary body (accomplished / unfinished / next command).",
+  };
+}
+
+/**
+ * 每轮首步注入的 `[本轮指引]` 消息文本（pre-step 注入 → prompt 末尾/历史区，
+ * 模型全程可见、前缀缓存稳定命中；**不进系统提示**——KV 缓存纪律）。
+ * 内容：仅**动态**绩效参考（静态预算/效率规则已移入系统提示 stepBudgetSection）；
+ * 前缀 `[本轮指引]`/`[Round guide]` 供前端过滤。
+ */
+function roundGuideText(perfNoteText) {
+  if (UI_LANG === "zh") {
+    return `[本轮指引] ${perfNoteText || "本轮请以最少步数高效完成任务。"}`;
+  }
+  return `[Round guide] ${perfNoteText || "Complete this round efficiently in as few steps as possible."}`;
+}
+
+/**
+ * 每步注入的 `[本步指引]` 消息文本——**只传动态数据**（执法），规则已立法在
+ * 系统提示（stepBudgetSection / wrapUpReportSection）。**专用字段名**（大写+
+ * 下划线，不易与其他消息混淆）与立法同名呼应：STEPS_USED / STEPS_REMAIN /
+ * TOOLS_USED / ELAPSED_SEC。收尾报告引用同名专用字段值。
+ */
+function stepGuideText(limit, steps, tools, elapsed) {
+  const remaining = Math.max(0, limit - steps);
+  if (UI_LANG === "zh") {
+    return `[本步指引] STEPS_USED=${steps} / STEPS_REMAIN=${remaining} / TOOLS_USED=${tools} / ELAPSED_SEC=${elapsed}`;
+  }
+  return `[Step guide] STEPS_USED=${steps} / STEPS_REMAIN=${remaining} / TOOLS_USED=${tools} / ELAPSED_SEC=${elapsed}`;
 }
 
 /** 工具拦截拒绝文案（tools/pre-execute deny reason，与 UI 语言一致）。 */
@@ -504,31 +631,36 @@ function stepLimitDenyReason(count, limit) {
 }
 
 /**
- * 消息层收尾指令（agent/pre-step 注入的 user 消息，超限后下一步必达）：
+ * 达限警示消息（agent/pre-step 注入的 user 消息，超限后下一步必达）：
  * 对话末尾的 user 消息是模型必须处理的输入，必然引起响应——软性收尾的强
- * 注入点。内容明确：阈值（limit）与当前值（steps）、原因（工具已禁用）、
- * 要求的动作、语气专业坚定且礼貌。该消息会写入会话历史（收尾指令作为对话
- * 痕迹可见），以"[自动提示]/[Auto notice]"开头标明由系统自动注入，并按 UI
- * 语言（zh/en）本地化。注意：纯提示词对模型的约束力有限（实测模型可能继续
- * 执行），真正的收尾保障是 tools/pre-execute 工具拦截（见 attachAgent）。
+ * 注入点。内容：阈值与当前值、原因（工具已禁用）、**数字直拼的收尾报告
+ * 首行格式**（X/Y/Z 直接用系统数据，无需模型查找引用）、要求的动作。
+ * 前缀 `[达限警示]`/`[Limit warning]` 为系统指令标识（前端据此过滤不显示）。
+ * 注意：纯提示词对模型的约束力有限（实测模型可能继续执行），真正的收尾
+ * 保障是 tools/pre-execute 工具拦截（见 attachAgent）。
  */
-function stepLimitWrapUpMessage(limit, steps) {
+function stepLimitWrapUpMessage(limit, steps, tools, elapsedSec) {
   if (UI_LANG === "zh") {
     return (
-      `[自动提示] 本轮思考步数已达上限（${steps}/${limit}），所有工具调用已被禁用。` +
+      `[达限警示] 本轮思考步数已达上限（${steps}/${limit}），已发起 ${tools} 次工具调用，本轮耗时 ${elapsedSec} 秒，` +
+      "所有工具调用已被禁用。" +
       "单轮步数上限用于控制单次请求规模、防止工具循环失控，因此本轮工作到此为止。" +
-      "请立即停止进一步推理，在本回复中给出最终答复：已完成什么、还剩下什么、用户下一步应发送的命令。" +
+      "请立即停止进一步推理，在本回复中给出最终答复，**第一行**必须以如下格式开头：" +
+      "`⏱ 本轮统计：STEPS_USED 步思考 / TOOLS_USED 次工具调用 / 耗时 ELAPSED_SEC 秒`" +
+      `（其中 STEPS_USED=${steps}、TOOLS_USED=${tools}、ELAPSED_SEC=${elapsedSec}，若本答复中还有新的工具调用请一并计入），` +
+      "随后写总结正文（已完成/未完成/下一步命令）。" +
       "预算耗尽后请勿继续工作。本提示由系统自动注入，并非用户输入。谢谢配合收尾。"
     );
   }
   return (
-    `[Auto notice] Step limit reached: ${steps}/${limit} steps used — this turn's thinking budget ` +
-    "is exhausted and all tool calls are now disabled. The per-turn step limit keeps each request " +
-    "bounded and prevents runaway tool loops, so continuing further work is not permitted. " +
-    "Stop further reasoning and deliver your final answer in this reply: what was accomplished, " +
-    "what remains unfinished, and the next command the user should send. " +
-    "Do not continue working after this reply. This notice was injected automatically and is not user input. " +
-    "Thank you for wrapping up cleanly."
+    `[Limit warning] This turn's step limit is reached: ${steps}/${limit} steps used, ${tools} tool calls issued, ` +
+    `${elapsedSec}s elapsed — the thinking budget is exhausted and all tool calls are now disabled. ` +
+    "The per-turn step limit keeps each request bounded and prevents runaway tool loops, so continuing further work is not permitted. " +
+    "Stop further reasoning and deliver your final answer in this reply, opening with a first line in this exact format: " +
+    "`⏱ Stats this turn: STEPS_USED steps / TOOLS_USED tool calls / ELAPSED_SECs elapsed`" +
+    ` (STEPS_USED=${steps}, TOOLS_USED=${tools}, ELAPSED_SEC=${elapsedSec}; count any NEW tool calls in this reply too), ` +
+    "then the summary body (accomplished / unfinished / next command). Do not continue working after this reply. " +
+    "This notice was injected automatically and is not user input. Thank you for wrapping up cleanly."
   );
 }
 
@@ -557,14 +689,70 @@ function attachAgent(ctx, handle, pump) {
   let stepLimitHit = false;
   /** 消息层收尾指令是否已注入（每轮最多注入一次，避免刷屏）。 */
   let wrapUpInjected = false;
+  /** 每轮首步 [本轮指引] 是否已注入（每轮一次，pre-step 末尾消息；不进系统提示）。 */
+  let roundGuideInjected = false;
+  /** 本轮实际执行的工具调用次数（收尾报告用；tools/pre-execute 允许时计数）。 */
+  let toolCallCount = 0;
+  /** 本轮开始时间（耗时统计；resetStepBudget 时刷新）。 */
+  let turnStartAt = Date.now();
+  /** 本轮已耗时（秒）。 */
+  const elapsedSec = () => Math.round((Date.now() - turnStartAt) / 1000);
+  /**
+   * 无状态激励的宿主代理记忆：最近几轮的实际绩效（步数/工具次数/是否达限），
+   * 注入下一轮系统提示作为"绩效参考"，让模型当轮就知道历史表现、
+   * 延续高效模式（批量工具调用等）、改进低效模式。
+   * 持久化到 session-meta（meta[sid].perf，杠杆3）：跨宿主重启保留，跨会话
+   * 延续"效率人设"；进程内仅作内存缓存，每轮结束落盘。
+   */
+  const PERF_KEEP = 5;
+  const PERF_META_KEY = "perf";
+  let perfQueue = []; // {steps, tools, hitLimit}
+  try {
+    const saved = getSessionMeta(agent.session.id)[PERF_META_KEY];
+    if (Array.isArray(saved)) perfQueue = saved.slice(-PERF_KEEP);
+  } catch {
+    perfQueue = [];
+  }
+  /** 组装绩效参考文案（最近 PERF_KEEP 轮；无记录返回空串）。
+   *  杠杆1（行为归因）：同时报步数与工具次数——tools > steps 即"一步多调用"，
+   *  标注"（含并发批量）"让模型看到上轮**为什么**快，而不仅是"用了几步"。 */
+  const perfNote = () => {
+    if (perfQueue.length === 0) return "";
+    const rows = perfQueue.map((p, i) => {
+      const tools = p.tools ?? 0; // 兼容旧持久化格式 {steps, hitLimit}（无 tools 字段）
+      const batchHint = tools > p.steps ? (UI_LANG === "zh" ? "（含并发批量）" : " (with parallel batching)") : "";
+      return UI_LANG === "zh"
+        ? `第${i + 1}轮用了 ${p.steps} 步 / ${tools} 次工具调用${batchHint}${p.hitLimit ? "（达限未完成）" : "（预算内完成）"}`
+        : `Round ${i + 1}: ${p.steps} steps / ${tools} tool calls${batchHint}${p.hitLimit ? " (hit limit, unfinished)" : " (finished within budget)"}`;
+    });
+    return UI_LANG === "zh"
+      ? `绩效参考：你最近完成的轮次：${rows.join("；")}。高效模式通常包括：一步内并发多个工具调用、减少重复搜索与冗余操作、先规划再动手（简述计划与预估步数）。请延续高效模式，在本轮预算内以最少步数圆满完成任务。`
+      : `Performance reference: recent rounds: ${rows.join("; ")}. Efficient patterns usually include: batching multiple tool calls in one step, avoiding repeated searches and redundant operations, and planning before acting (state your plan and estimated steps). Keep the efficient patterns and complete this round within budget in as few steps as possible.`;
+  };
   /** 上次打印过的实际思考级别（仅在变化时打印，避免每步刷屏）。 */
   let lastLoggedEffort;
 
   /** 新一轮用户消息开始时调用：重置本轮步数预算（stepLimit 是单轮上限）。 */
   const resetStepBudget = () => {
+    // 先记录上一轮绩效（无状态激励的宿主代理记忆）：清零前读旧值入队；
+    // **stepCount > 0 才记录**（0 步空轮——首条消息前的重置——不算完成一轮）
+    if (stepLimit > 0 && stepCount > 0) {
+      perfQueue.push({ steps: stepCount, tools: toolCallCount, hitLimit: stepLimitHit });
+      if (perfQueue.length > PERF_KEEP) perfQueue.shift();
+      // 杠杆3：每轮结束落盘到 session-meta，跨重启/跨会话延续绩效参考。
+      // 清理纪律：内存 perfQueue 已截断到 PERF_KEEP；落盘前再强制
+      // slice(-PERF_KEEP) 防御（坏数据/未来 bug 不污染 meta）；会话删除时
+      // removeSessionMeta 整体清除 meta[sid]（含 perf），无孤儿条目。
+      // 因此 perf 不随对话次数增长（每会话恒 ≤5 条），meta 条目数只随
+      // 会话数线性（每会话一条，属正常元数据，删除即清）。
+      updateSessionMeta(agent.session.id, { [PERF_META_KEY]: [...perfQueue].slice(-PERF_KEEP) });
+    }
     stepCount = 0;
     stepLimitHit = false;
     wrapUpInjected = false;
+    roundGuideInjected = false;
+    toolCallCount = 0;
+    turnStartAt = Date.now();
   };
 
   // 会话事件 → 扩展（scope-filtered：仅本 agent 的会话）
@@ -579,8 +767,54 @@ function attachAgent(ctx, handle, pump) {
         post({ t: "stepLimit", maxSteps: stepLimit, steps: stepCount });
       }
     }
+    // 内核标题同步：DSH 生成/更新会话标题（首条消息 fallback 截断或 LLM 总结
+    // provider，source=fallback/provider）时，同步写插件 meta.title——会话列表
+    // 与面板标题栏统一用内核标题，覆盖创建时的静态临时标题（newsession_...）。
+    // 用户显式重命名会 pin 内核标题（session/title source=user，后续自动生成
+    // 被内核 supersede），此处只回写同名值，幂等，不会覆盖用户自定义名。
+    if (
+      event.type === "session/title" &&
+      event.data &&
+      typeof event.data.title === "string" &&
+      event.data.title.trim() !== ""
+    ) {
+      try {
+        const title = event.data.title.trim();
+        updateSessionMeta(agent.session.id, { title });
+        invalidateSessionsCache(); // 列表标题变更，下次读取即新值
+        post({ t: "sessionTitleSynced", id: agent.session.id, title });
+      } catch (error) {
+        log("warn", "session title sync to meta failed", error instanceof Error ? error.message : String(error));
+      }
+    }
     pump.push(event);
   });
+
+  // **统计与日志强同步落盘**（owner 反复强调：日志落盘时统计同步落盘，保证
+  // 一致性）。内核 `session/flush` 是持久化检查点（日志落盘边界）——在此把
+  // 统计写 meta.stats：以 meta 中上次落盘的 stats 为基准，对日志**增量补算**
+  // （computeSessionStats base，只算 seq > lastSeq 的新事件——基于日志权威
+  // 事件、纯函数，无事件流累加 bug），覆盖落盘。崩溃/重启后恢复直读 meta.stats
+  // 即与日志一致；resolveSessionStats 的滞后补算仅兜底未 flush 的极小窗口。
+  agent.ctx.on("session/flush", () => {
+    try {
+      const sid = agent.session.id;
+      const events = agent.session.events.filter(
+        (e) => e.type !== "assistant/chunk" && e.type !== "session/end-seed"
+      );
+      const meta = loadSessionMeta();
+      const prev = meta[sid]?.stats;
+      const stats = computeSessionStats(events, prev && Number.isFinite(prev.lastSeq) ? prev : undefined);
+      meta[sid] = { ...(meta[sid] ?? {}), stats: { ...stats } };
+      saveSessionMeta(meta);
+    } catch (error) {
+      log("warn", "session stats flush failed", error instanceof Error ? error.message : String(error));
+    }
+  });
+
+  // 统计方案（docs 2.27）：恢复/查看走 resolveSessionStats——meta.stats 直读
+  // （合理则用，零遍历）；meta 无 stats（旧会话/机制转换）或异常（转换期坏值）
+  // 则**全量算一次并落盘**（新旧机制平稳转换，之后直读）。压缩只推占比不落盘。
 
   // 收尾引导（系统提示层）：**从一开始就注入**（每轮系统提示均携带单轮预算
   // 约束，让模型预先知晓并规划节奏）；达到上限后提示词继续存在于系统提示，
@@ -590,40 +824,53 @@ function attachAgent(ctx, handle, pump) {
     const sections = [...(assembled.sections ?? [])];
     // 语言一致性指令：每轮注入（思考/输出语言跟随界面语言，见 languageDirectiveSection）
     sections.push(languageDirectiveSection());
-    if (stepLimit > 0) {
-      // 注入单轮步数预算约束（不打印日志：运行成熟后该信息属无意义刷屏）
-      sections.push(stepLimitSystemSection(stepLimit));
-    }
+    // 工具调用边界规则：每轮注入（推理必需 vs 替用户完成，见 toolBoundarySection）
+    sections.push(toolBoundarySection());
+    // 单轮预算静态规则（总预算 + 效率引导；limit 进程内常量，静态安全——KV 缓存纪律）
+    if (stepLimit > 0) sections.push(stepBudgetSection(stepLimit));
+    // 收尾报告规则：独立 section（**静态文本**——系统提示禁止动态内容；动态数值
+    // 由 [本步指引] 每步提供，规则引用其数值）
+    sections.push(wrapUpReportSection());
     return { ...assembled, sections };
   });
 
-  // 收尾引导（对话消息层，最强）：已达上限（stepLimitHit）后，在**下一步**
-  // 的输入 messages 末尾追加一条 user 收尾指令（含明确的阈值与当前值）。
-  // 模型对对话末尾的 user 消息必然响应（它成为该步必须处理的输入），因此
-  // 软性收尾真正生效。仅注入一次（wrapUpInjected），避免每步刷屏；该消息
-  // 会写入会话历史（收尾指令作为对话痕迹可见，属软性收尾的合理表现）。
+  // 系统指令注入（对话消息层，pre-step）：三类系统指令消息——均注入 prompt
+  // **末尾**（历史区），前缀稳定命中 KV 缓存；消息会写入会话历史（模型全程
+  // 可见），前端据前缀**过滤不显示**（见 chat.js isSystemDirective）。
+  //  - [本轮指引]：每轮首步一次（总预算 + 效率引导 + 绩效参考）；
+  //  - [本步指引]：每步一次（动态剩余预算/工具次数/耗时，尽快完成）；
+  //  - [达限警示]：达限后一次（收尾指令 + 数字直拼收尾报告首行）。
   // 注意：agent/request 瀑布改 messages 无效（dsh-agent-loop buildRequest 只
   // 消费 provider/model/effort 等配置字段，request.messages 由外部组装）——
   // 消息层注入只能走 agent/pre-step 的 decision.messages（探针已实证可行）。
   agent.ctx.on("agent/pre-step", async (_payload, next) => {
     const decision = await next();
-    if (stepLimit > 0 && stepLimitHit && !wrapUpInjected && decision.kind === "enter") {
+    if (decision.kind !== "enter") return decision;
+    let messages = decision.messages ?? [];
+    let changed = false;
+    const add = (text) => {
+      // 必须用 createUserMessage 构造（含 id/source 身份字段）——内核处理
+      // user/message 事件会读 message.source.kind，裸对象会崩溃
+      // （"Cannot read properties of undefined (reading 'kind')"）。
+      messages = [...messages, createUserMessage({ content: [{ type: "text", text }], source: { kind: "user" } })];
+      changed = true;
+    };
+    // 达限：注入 [达限警示]（每轮一次），此后不再注入指引
+    if (stepLimit > 0 && stepLimitHit && !wrapUpInjected) {
       wrapUpInjected = true;
-      return {
-        ...decision,
-        messages: [
-          ...(decision.messages ?? []),
-          // 必须用 createUserMessage 构造（含 id/source 身份字段）——内核处理
-          // user/message 事件会读 message.source.kind，裸对象会崩溃
-          // （"Cannot read properties of undefined (reading 'kind')"）。
-          createUserMessage({
-            content: [{ type: "text", text: stepLimitWrapUpMessage(stepLimit, stepCount) }],
-            source: { kind: "user" },
-          }),
-        ],
-      };
+      add(stepLimitWrapUpMessage(stepLimit, stepCount, toolCallCount, elapsedSec()));
+      return { ...decision, messages };
     }
-    return decision;
+    // 每轮首步：注入 [本轮指引]（预算 + 效率 + 绩效）
+    if (!roundGuideInjected) {
+      roundGuideInjected = true;
+      add(roundGuideText(perfNote()));
+    }
+    // 每步：注入 [本步指引]（动态剩余，尽快完成）
+    if (stepLimit > 0) {
+      add(stepGuideText(stepLimit, stepCount, toolCallCount, elapsedSec()));
+    }
+    return changed ? { ...decision, messages } : decision;
   });
 
   // 工具拦截（软性强制收尾的核心保障）：超限后（stepLimitHit），所有工具调用
@@ -635,6 +882,8 @@ function attachAgent(ctx, handle, pump) {
   // 子代理的工具同样被禁（整轮收尾，符合预期）。
   agent.ctx.on("tools/pre-execute", async (exec, next) => {
     const gate = await next();
+    // 工具调用总次数统计（收尾报告用）：实际允许执行的才算一次
+    if (gate.kind === "allow") toolCallCount++;
     if (stepLimit > 0 && stepLimitHit && gate.kind === "allow") {
       return {
         kind: "deny",
@@ -965,60 +1214,147 @@ async function sessionDisplayTitle(ctx, sessionId, kernelTitle) {
   return kernelTitle;
 }
 
+/** 会话日志文件名（与 dsh-session-persistence-jsonl 的 logSuffix 一致）。 */
+const SESSION_LOG_NAMES = ["session.jsonl", "session.jsonl.zstd"];
+
 /**
- * 列出持久化会话（newest-first），附标题。编码规则与
- * dsh-session-persistence-jsonl 的目录布局保持一致（纯函数复制）。
+ * 旧会话（meta 无 title）的静态标题：`oldsession_<mtime>`。
+ * **不读任何日志文件**（列表性能纪律）：标题是纯静态记录，首指令前缀需要
+ * 读日志（zstd 解压），成本高于价值——放弃；用户可随时重命名覆盖。
  */
-async function listSessions(ctx) {
-  const query = ctx.get("sessionQuery");
-  if (query === undefined) return [];
-  const records = await query.listSessions();
-  const ids = records.filter((r) => r.persisted || r.live).map((r) => r.header.id);
-  const titleResults = ids.length > 0 ? await query.readTitleSnapshots(ids) : [];
-  const titles = new Map();
-  for (const r of titleResults) {
-    if (r.status === "fulfilled" && r.value.title !== undefined) {
-      titles.set(r.sessionId, { title: r.value.title.title, updatedAt: r.value.title.updatedAt });
-    }
-  }
-  // 完整列出所有持久化/存活的会话，不做任何过滤（不掩盖问题）。
-  // 空会话由清理机制移除（见 deleteEmptySessions），列表即真相。
-  // 会话分两类：主代理会话（id 带 dsh-vscode- 前缀，聊天面板可见）与
-  // 子代理会话（裸 UUID，subagent 工具创建）——前端分组展示、同方式管理。
-  const allMeta = loadSessionMeta();
-  return records
-    .filter((r) => r.persisted || r.live)
-    .map((r) => {
-      const meta = allMeta[r.header.id] ?? {};
-      const kernelTitle = titles.get(r.header.id)?.title;
-      return {
-        id: r.header.id,
-        cwd: r.header.cwd ?? "",
-        createdAt: r.header.createdAt,
-        // 用户显式重命名优先于内核自动标题
-        title: typeof meta.title === "string" && meta.title.trim() !== "" ? meta.title : kernelTitle,
-        updatedAt: titles.get(r.header.id)?.updatedAt ?? r.header.createdAt,
-        live: r.live,
-        // 会话类型：主代理（dsh-vscode- 前缀）或子代理（subagent 工具，裸 UUID）
-        kind: String(r.header.id).startsWith(SESSION_PREFIX) ? "main" : "sub",
-        // 会话级模型/思考级别/workMode（恢复时还原用；前端可展示）
-        provider: meta.provider,
-        model: meta.model,
-        reasoningEffort: meta.reasoningEffort,
-        workMode: meta.workMode,
-      };
-    });
+function genOldSessionTitle(mtime, sessionId) {
+  return `oldsession_${fmtTitleTime(mtime || Date.now())}_${sessionId}`;
 }
 
 /**
- * 计算会话统计快照（分页加载时 host.ts 无法从部分事件累计完整统计，
- * 由宿主侧全量扫描一次：标题 / token 累计 / 上下文窗口）。
- * 注：仅统计 token，不做费用估算（2026-08-20 owner 决策放弃计费——
- * 计费标准难统一、非核心功能，见 docs/AY-DSH插件改进方案选取依据.md）。
+ * 宿主**自扫持久化目录**拿会话清单（方案 B，零 zstd 解压）。
+ * 目录结构：`sessions-ay-dsh/<projectKey>/<sessionId>/session.jsonl[.zstd]`
+ * readdir 两级，**目录名即会话 id**——完全不读日志内容，避开内核
+ * `query.listSessions()` 逐会话解压读 header（listArtifacts）的性能问题。
+ * @returns {Array<{id:string, logPath:string, project:string}>} 无日志文件的目录跳过
  */
-function computeSessionStats(events) {
-  const stats = { inputTokens: 0, cacheReadTokens: 0, outputTokens: 0, steps: 0 };
+function scanSessionDirs() {
+  const root = dshHomePath("sessions-ay-dsh");
+  const out = [];
+  let projects;
+  try {
+    projects = readdirSync(root, { withFileTypes: true });
+  } catch {
+    return out; // 目录不存在 → 无会话
+  }
+  for (const p of projects) {
+    if (!p.isDirectory()) continue;
+    let sessions;
+    try {
+      sessions = readdirSync(join(root, p.name), { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const s of sessions) {
+      if (!s.isDirectory()) continue;
+      const logPath = SESSION_LOG_NAMES.map((n) => join(root, p.name, s.name, n)).find((p2) => existsSync(p2));
+      if (!logPath) continue; // 无日志文件 → 非会话目录（跳过）
+      out.push({ id: s.name, logPath, project: p.name });
+    }
+  }
+  return out;
+}
+
+/**
+ * 列出持久化会话（newest-first），附标题。
+ *
+ * **方案 B（2026-08-20 owner 定）**：宿主自扫目录（scanSessionDirs，零解压），
+ * **不再调用内核 query.listSessions()**（其 listArtifacts 对每个会话 zstd 解压
+ * 读 header，会话多/日志大时列表很慢——内核无轻量列表 API，宿主绕开）。
+ * 标题为静态记录（meta 单文件；无则生成 `oldsession_<mtime>` 补写，不读日志）。
+ * updatedAt = 日志文件 mtime（stat，不读内容）。
+ * live 标记由调用方（main listSessions case）按当前 agent 补标。
+ * 缓存 TTL 3s：反复打开秒回；创建/删除/重命名/补写时失效（invalidateSessionsCache）。
+ */
+const SESSIONS_CACHE_TTL = 3000;
+let sessionsCache = null;
+let sessionsCacheAt = 0;
+function invalidateSessionsCache() {
+  sessionsCache = null;
+  sessionsCacheAt = 0;
+}
+async function listSessions(ctx) {
+  const now = Date.now();
+  if (sessionsCache !== null && now - sessionsCacheAt < SESSIONS_CACHE_TTL) {
+    return sessionsCache;
+  }
+  const entries = scanSessionDirs();
+  const allMeta = loadSessionMeta();
+  const patch = {};
+  const result = [];
+  for (const e of entries) {
+    const meta = allMeta[e.id] ?? {};
+    let title = meta.title;
+    if (typeof title !== "string" || title.trim() === "") {
+      let mtime = 0;
+      try {
+        const st = statSync(e.logPath);
+        if (st.mtimeMs > 0) mtime = st.mtimeMs;
+      } catch {
+        // 日志文件缺失 → 用当前时间
+      }
+      title = genOldSessionTitle(mtime, e.id);
+      patch[e.id] = { ...meta, title };
+    }
+    let updatedAt = 0;
+    try {
+      const st = statSync(e.logPath);
+      if (st.mtimeMs > 0) updatedAt = st.mtimeMs;
+    } catch {
+      // 日志文件缺失 → 回退当前时间
+    }
+    result.push({
+      id: e.id,
+      cwd: e.project, // 展示用（projectKey 目录名；不反解，恢复/删除走内核不受影响）
+      createdAt: updatedAt || now,
+      title,
+      updatedAt: updatedAt || now,
+      live: false, // 调用方按当前 agent 补标
+      // 会话类型：主代理（dsh-vscode- 前缀）或子代理（subagent 工具，裸 UUID）
+      kind: String(e.id).startsWith(SESSION_PREFIX) ? "main" : "sub",
+      // 会话级模型/思考级别/workMode（恢复时还原用；前端可展示）
+      provider: meta.provider,
+      model: meta.model,
+      reasoningEffort: meta.reasoningEffort,
+      workMode: meta.workMode,
+    });
+  }
+  if (Object.keys(patch).length > 0) {
+    for (const [id, v] of Object.entries(patch)) allMeta[id] = v;
+    saveSessionMeta(allMeta);
+    invalidateSessionsCache(); // meta 变化，丢弃可能存在的旧缓存
+  }
+  result.sort((a, b) => b.updatedAt - a.updatedAt); // newest-first
+  sessionsCache = result;
+  sessionsCacheAt = Date.now();
+  return result;
+}
+
+/**
+ * 计算会话统计快照（token 累计 / 上下文窗口 / steps）。
+ *  - 恢复/查看/压缩统一全量纯算（或经 resolveSessionStats 直读 meta.stats）；
+ *  - 注：仅统计 token，不做费用估算（2026-08-20 owner 决策放弃计费）。
+ * @param {Array} events 会话事件（按 seq 升序）
+ * @param {object|undefined} base 累计基准（可选，seq > base.lastSeq 才计入）
+ */
+function computeSessionStats(events, base) {
+  const stats = {
+    inputTokens: base?.inputTokens ?? 0,
+    cacheReadTokens: base?.cacheReadTokens ?? 0,
+    outputTokens: base?.outputTokens ?? 0,
+    steps: base?.steps ?? 0,
+    lastSeq: base?.lastSeq ?? 0,
+  };
+  if (base?.title) stats.title = base.title;
+  if (base?.contextWindow) stats.contextWindow = base.contextWindow;
+  if (base?.model) stats.model = base.model;
   for (const e of events) {
+    if (base !== undefined && (e.seq ?? 0) <= base.lastSeq) continue; // 已在基准内，跳过
     const d = e.data ?? {};
     if (e.type === "session/title" && typeof d.title === "string" && d.title) {
       stats.title = d.title;
@@ -1038,6 +1374,46 @@ function computeSessionStats(events) {
     } else if (e.type === "step/start") {
       stats.steps = (stats.steps ?? 0) + 1;
     }
+    stats.lastSeq = Math.max(stats.lastSeq, e.seq ?? 0);
+  }
+  return stats;
+}
+
+/**
+ * 解析会话统计（meta.stats 直读 + 崩溃/重启一致性 + 新旧机制转换，docs 2.27）。
+ *  - meta.stats 存在且**同步**（lastSeq == 日志末尾 seq）→ **直读**（零遍历）；
+ *  - meta.stats 存在但**滞后**（lastSeq < 日志末尾——会话中断后未落盘的新事件，
+ *    如崩溃/重启前最后一段对话）→ **直读 + 增量补算尾部**（base 参数只算
+ *    seq > lastSeq 的事件）并落盘更新——保证崩溃/重启后统计与重启前一致；
+ *  - meta 无 stats（旧会话/机制转换前）→ **全量算一次并落盘**（首次迁移）；
+ *  - meta.stats **异常**（转换期坏值：lastSeq 超过日志末尾）→ **重算修复**并落盘。
+ * @param {object|undefined} metaStats 会话 meta 中已存的 stats
+ * @param {Array} events 当前日志事件（过滤后）
+ * @param {string} sessionId 会话 id（落盘用）
+ */
+function resolveSessionStats(metaStats, events, sessionId) {
+  const maxSeq = events.reduce((m, e) => Math.max(m, e.seq ?? 0), 0);
+  if (metaStats && Number.isFinite(metaStats.lastSeq) && metaStats.lastSeq <= maxSeq) {
+    // 有效：直读（同步）或滞后补算（崩溃/重启一致）
+    if (metaStats.lastSeq === maxSeq) return metaStats;
+    const stats = computeSessionStats(events, metaStats); // base 增量：只算尾部
+    try {
+      const meta = loadSessionMeta();
+      meta[sessionId] = { ...(meta[sessionId] ?? {}), stats: { ...stats } };
+      saveSessionMeta(meta);
+    } catch (error) {
+      log("warn", "session stats persist failed", error instanceof Error ? error.message : String(error));
+    }
+    return stats;
+  }
+  // 首次迁移 / 异常修复：全量纯算并落盘，之后直读
+  const stats = computeSessionStats(events);
+  try {
+    const meta = loadSessionMeta();
+    meta[sessionId] = { ...(meta[sessionId] ?? {}), stats: { ...stats } };
+    saveSessionMeta(meta);
+  } catch (error) {
+    log("warn", "session stats persist failed", error instanceof Error ? error.message : String(error));
   }
   return stats;
 }
@@ -1076,15 +1452,21 @@ function projectKey(cwd) {
 /** 删除一个持久化会话（物理删除其会话日志目录，仅限插件独立存储）。 */
 async function deleteSession(ctx, sessionId) {
   try {
-    const query = ctx.get("sessionQuery");
-    let cwd;
-    if (query !== undefined) {
-      const snap = await query.readSession(SessionId(sessionId));
-      cwd = snap.session.cwd ?? process.cwd();
-    } else {
-      cwd = process.cwd();
+    // **零解压定位目录**（scanSessionDirs 只 readdir，不读日志）——原实现用
+    // query.readSession 全量解压拿 cwd，删除大会话时慢（docs 2.25）。
+    let dir = null;
+    for (const entry of scanSessionDirs()) {
+      if (entry.id === sessionId) {
+        dir = dirname(entry.logPath);
+        break;
+      }
     }
-    const dir = join(dshHomePath("sessions-ay-dsh"), projectKey(cwd), encodeSegment(sessionId));
+    if (dir === null) {
+      // 回退：目录扫描未找到（live 会话等）→ 用内核读 cwd 定位
+      const query = ctx.get("sessionQuery");
+      const cwd = query !== undefined ? (await query.readSession(SessionId(sessionId))).session.cwd ?? process.cwd() : process.cwd();
+      dir = join(dshHomePath("sessions-ay-dsh"), projectKey(cwd), encodeSegment(sessionId));
+    }
     const artifacts = ["session.jsonl", "session.jsonl.zstd", "session.jsonl.zst"];
     const hasArtifact = artifacts.some((name) => existsSync(join(dir, name)));
     if (!hasArtifact) {
@@ -1092,6 +1474,7 @@ async function deleteSession(ctx, sessionId) {
     }
     rmSync(dir, { recursive: true, force: true });
     removeSessionMeta(sessionId);
+    invalidateSessionsCache(); // 列表缓存同步失效
     return { ok: true };
   } catch (error) {
     return { ok: false, error: error instanceof Error ? error.message : String(error) };
@@ -1272,6 +1655,24 @@ async function main() {
     installApprovalListener(ctx, approvals);
     log("info", "approval listener installed (root scope, covers all agents)");
 
+    // 子代理会话标题：`agent/created`（内核 announce，覆盖所有 agent）时，
+    // 对**子代理会话**（裸 UUID，非主代理前缀）写静态标题 `newsession_<时间戳>`
+    // ——与会话管理一致（主代理 chat 惰性创建时已写 newsession_；子代理无用户
+    // 指令概念，前缀留空）。避免新子代理会话落入"oldsession_"补写路径。
+    ctx.on("agent/created", ({ agent: createdAgent }) => {
+      try {
+        const sid = createdAgent.session.id;
+        if (String(sid).startsWith(SESSION_PREFIX)) return; // 主代理：chat 分支已写
+        const meta = getSessionMeta(sid);
+        if (typeof meta.title === "string" && meta.title.trim() !== "") return; // 已有
+        updateSessionMeta(sid, { title: genSubsessionTitle(sid) }); // subsession_<时间>_<sessionId>
+        invalidateSessionsCache();
+      } catch (error) {
+        log("warn", "subagent title init failed", error instanceof Error ? error.message : String(error));
+      }
+    });
+    log("info", "subagent title listener installed (agent/created)");
+
     // 会话隔离迁移：把旧共享目录中插件自己的会话搬入独立目录（幂等）
     migrateLegacySessions();
 
@@ -1390,11 +1791,23 @@ async function main() {
             // 默认创建；对话中途切换模型则由 setModel/setWorkMode 的
             // `agent !== undefined` 分支记录 meta（此时会话已真实存在）。
             if (agent === undefined) {
-              const created = await createAgent(ctx, { model: msg.model ?? env.DSH_VSCODE_MODEL }, pump, approvals);
+              // 恢复预览已由 restorePreview 立即 resumeAgent（不等发消息），
+              // 此处仅剩"新会话"的惰性创建（用户发第一条消息才建）。
+              // 注意：**不**用 env.DSH_VSCODE_MODEL（扩展配置的固定 model）覆盖——
+              // 那会让 model 与 agentDefaultModel 持久化的 provider 脱节，拼出
+              // 如 zai-free+deepseek-v4-flash 的错配请求。model 一律取
+              // agentDefaultModel 的持久化默认（createAgent 内部 options.model ??
+              // base.model），与 getModelInfo 展示给 UI 的选择同源。
+              const created = await createAgent(ctx, { model: msg.model }, pump, approvals);
               handle = created.handle;
               agent = created.agent;
               selection = created.selection;
               resetStepBudget = created.resetStepBudget;
+              // 会话已真实创建：立即生成**静态临时标题**写入 meta（标题是静态
+              // 记录，此后仅由用户重命名覆盖）。列表直接读 meta，无需内核折叠
+              // 会话日志推导标题——历史列表因此秒开，与会话内容大小无关。
+              updateSessionMeta(agent.session.id, { title: genTempTitle(text) });
+              invalidateSessionsCache(); // 新会话入列表，丢弃旧缓存
             }
             // 新一轮用户消息：重置本轮思考步数预算（maxSteps 是单轮上限，
             // 不是会话累计上限——会话对话次数一直累加，不作为控制指标）。
@@ -1444,6 +1857,10 @@ async function main() {
               resetStepBudget = null;
             }
             // 惰性：新会话也等第一条消息才真正创建
+            // 同步清空旧 selection：恢复预览的会话可能持有与默认选择不同的
+            // provider/model（如 zai-free），不清空会让 getModelInfo 在
+            // "新会话"下继续显示旧会话的模型（与 deleteSession 分支一致）。
+            selection = null;
             post({
               t: "ready",
               sessionId: "",
@@ -1457,10 +1874,99 @@ async function main() {
           case "listSessions": {
             try {
               const list = await listSessions(ctx);
+              // 方案 B：live 标记由宿主补标（当前主代理会话）
+              if (agent !== undefined) {
+                for (const s of list) s.live = s.id === agent.session.id;
+              }
               post({ t: "sessions", list });
             } catch (error) {
               log("error", "listSessions failed", error instanceof Error ? error.message : String(error));
               post({ t: "sessions", list: [], error: error instanceof Error ? error.message : String(error) });
+            }
+            break;
+          }
+          case "restorePreview": {
+            // 恢复预览（Reload 自动恢复，owner 方案）：**① 只读分页秒显历史 →
+            // ② 立即继续 resumeAgent**（不等用户发消息）。
+            //  - 历史秒显：persistence.inspect 只读（不建 agent），最近 limit 条立即下发；
+            //  - agent 就绪：inspect 后立即 resumeAgent——与 inspect 共享 prepared 缓存
+            //    （SessionPreparations，一次加载），**不重复解压**；用户读历史+输入期间
+            //    agent 已就绪，首条消息零等待；
+            //  - 模型还原：resumeAgent 用会话 meta 的 provider/model → ready 帧后
+            //    前端模型下拉恢复为该会话模型（不再显示全局默认）。
+            if (typeof msg.id !== "string" || msg.id.trim() === "") break;
+            try {
+              const persistence = ctx.get("sessionPersistence");
+              if (persistence !== undefined && typeof persistence.inspect === "function") {
+                const inspected = await persistence.inspect(SessionId(msg.id));
+                const events = (inspected.events ?? []).filter(
+                  (e) => e.type !== "assistant/chunk" && e.type !== "session/end-seed"
+                );
+                const limit = Number.isInteger(msg.limit) && msg.limit > 0 ? msg.limit : 200;
+                const tail = events.slice(-limit);
+                const hasMore = events.length > tail.length;
+                const nextSeq = hasMore ? tail[0].seq : undefined;
+                // 统计：meta.stats 直读（合理则用，零遍历）；无/异常则全量算并落盘
+                const stats = resolveSessionStats(getSessionMeta(msg.id).stats, events, msg.id);
+                post({ t: "history", sessionId: msg.id, events: tail, hasMore, nextSeq, stats });
+              }
+            } catch (error) {
+              log("warn", "restorePreview preview failed", error instanceof Error ? error.message : String(error));
+              // 预览失败帧：前端据此解锁（否则卡"正在恢复"直到 15s 兜底）
+              post({ t: "viewSessionFailed", id: msg.id, error: error instanceof Error ? error.message : String(error) });
+              break;
+            }
+            // ② 立即继续 resumeAgent（历史已秒显；复用 inspect 的 prepared 缓存）
+            try {
+              const meta = getSessionMeta(msg.id);
+              if (handle !== undefined) await handle.dispose();
+              const resumed = await resumeAgent(
+                ctx,
+                msg.id,
+                {
+                  provider: meta.provider || undefined,
+                  // 不把 env.DSH_VSCODE_MODEL 作为 options.model 传入：meta 缺失
+                  // 时由 resumeAgent 内部回退到 agentDefaultModel 的持久化默认，
+                  // 保证 provider/model 同源（避免 meta.provider=zai-free 却拼上
+                  // 扩展配置固定 model 的错配）。
+                  model: meta.model || undefined,
+                  reasoningEffort: meta.reasoningEffort || undefined,
+                },
+                pump,
+                approvals
+              );
+              handle = resumed.handle;
+              agent = resumed.agent;
+              selection = resumed.selection;
+              resetStepBudget = resumed.resetStepBudget;
+              if (meta.workMode === "multi" || meta.workMode === "single") {
+                workMode = meta.workMode;
+                post({ t: "workModeChanged", mode: workMode });
+              }
+              // 标题写回内核（session/title 快照一致；非阻塞）
+              if (typeof meta.title === "string" && meta.title.trim() !== "") {
+                const titleSvc = ctx.get("sessionTitle");
+                if (titleSvc !== undefined && typeof titleSvc.rename === "function") {
+                  Promise.resolve()
+                    .then(() => titleSvc.rename(agent.session, meta.title))
+                    .catch((error) => {
+                      log("warn", "session title restore failed", error instanceof Error ? error.message : String(error));
+                    });
+                }
+              }
+              // ready 帧：前端得知 agent 就绪 + 模型下拉恢复为会话 meta 模型
+              post({
+                t: "ready",
+                sessionId: agent.session.id,
+                cwd: process.cwd(),
+                provider: agent.options.provider,
+                model: agent.options.model,
+                version: CORE_VERSION,
+                sessionTitle: await currentSessionTitle(ctx, agent),
+              });
+            } catch (error) {
+              log("warn", "restorePreview resume failed", error instanceof Error ? error.message : String(error));
+              post({ t: "sessionResumed", id: msg.id, ok: false, error: error instanceof Error ? error.message : String(error) });
             }
             break;
           }
@@ -1469,15 +1975,18 @@ async function main() {
               post({ t: "sessionResumed", id: msg.id, ok: false, error: "invalid session id" });
               break;
             }
-            if (handle !== undefined) await handle.dispose();
             // 恢复会话参数：模型/思考级别/workMode 优先取该会话记录的 meta
             const meta = getSessionMeta(msg.id);
+            if (handle !== undefined) await handle.dispose();
+            // 恢复耗时量化（性能定位：慢在何处，见 docs 2.20）
+            const tResume0 = Date.now();
+            log("info", `resumeSession start: ${msg.id}`);
             const resumed = await resumeAgent(
               ctx,
               msg.id,
               {
                 provider: meta.provider || undefined,
-                model: meta.model || msg.model || env.DSH_VSCODE_MODEL,
+                model: meta.model || msg.model || undefined,
                 reasoningEffort: meta.reasoningEffort || undefined,
               },
               pump,
@@ -1494,19 +2003,25 @@ async function main() {
             }
             // 用户曾重命名过：把标题写回内核（session/title 事件），
             // 使标题快照与显示一致（即使换机器/重装也保留）。
+            // **非阻塞**（fire-and-forget）：不拖慢恢复主链路。
+            // 注意：内核 sessionTitle.rename 是**同步方法**（返回标题快照对象，
+            // 非 Promise）——直接 .catch 链式调用会 TypeError；统一经
+            // Promise.resolve().then() 包装，同步返回值与未来可能的异步
+            // 签名均兼容，同步抛错也能被 catch 捕获。
             if (typeof meta.title === "string" && meta.title.trim() !== "") {
-              try {
-                const titleSvc = ctx.get("sessionTitle");
-                if (titleSvc !== undefined && typeof titleSvc.rename === "function") {
-                  await titleSvc.rename(agent.session, meta.title);
-                }
-              } catch (error) {
-                log("warn", "session title restore failed", error instanceof Error ? error.message : String(error));
+              const titleSvc = ctx.get("sessionTitle");
+              if (titleSvc !== undefined && typeof titleSvc.rename === "function") {
+                Promise.resolve()
+                  .then(() => titleSvc.rename(agent.session, meta.title))
+                  .catch((error) => {
+                    log("warn", "session title restore failed", error instanceof Error ? error.message : String(error));
+                  });
               }
             }
-            // 重放历史（分页）：首次只取最近 limit 条事件，避免大会话
-            // （2.6MB / 数百条）全量传输拖慢恢复；向上滚动时按需补更早的。
-            // 同时由宿主侧计算完整统计快照（分页下 host.ts 无法从部分事件累计）。
+            // 重放历史（分页）：首次只取最近 limit 条事件，避免大会话全量传输；
+            // 统计直读 meta.stats（旧会话无统计则全量算一次并落盘）。
+            // 注意：**单次加载**（只用 resume，不做 readSession 预读）——两阶段
+            // 双份全量加载会拖慢 2 倍（Node 单线程下并行无效），已回滚（docs 2.23）。
             const allEvents = agent.session.events.filter(
               (e) => e.type !== "assistant/chunk" && e.type !== "session/end-seed"
             );
@@ -1514,7 +2029,9 @@ async function main() {
             const tail = allEvents.slice(-limit);
             const hasMore = allEvents.length > tail.length;
             const nextSeq = hasMore ? tail[0].seq : undefined;
-            const stats = computeSessionStats(allEvents);
+            // 统计：meta.stats 直读（合理则用，零遍历）；无/异常则全量算并落盘
+            // （新旧机制平稳转换，docs 2.27）
+            const stats = resolveSessionStats(meta.stats, allEvents, agent.session.id);
             post({ t: "history", sessionId: agent.session.id, events: tail, hasMore, nextSeq, stats });
             post({
               t: "ready",
@@ -1526,6 +2043,10 @@ async function main() {
               sessionTitle: await currentSessionTitle(ctx, agent),
             });
             post({ t: "sessionResumed", id: msg.id, ok: true });
+            log(
+              "info",
+              `resumeSession done: ${msg.id} in ${Date.now() - tResume0}ms (${allEvents.length} events)`
+            );
             break;
           }
           case "viewSession": {
@@ -1536,20 +2057,24 @@ async function main() {
               break;
             }
             try {
-              const query = ctx.get("sessionQuery");
-              if (query === undefined || typeof query.readSession !== "function") {
-                post({ t: "viewSessionFailed", id: msg.id, error: "sessionQuery unavailable" });
+              // **用 persistence.inspect（与 resume 同源）**——prepared 缓存共享：
+              // 重复查看同一会话秒回（复用已解压结果）；readSession 独立加载
+              // 每次全量解压（docs 2.24 同因）。
+              const persistence = ctx.get("sessionPersistence");
+              if (persistence === undefined || typeof persistence.inspect !== "function") {
+                post({ t: "viewSessionFailed", id: msg.id, error: "sessionPersistence unavailable" });
                 break;
               }
-              const snap = await query.readSession(SessionId(msg.id));
-              const events = (snap.events ?? []).filter(
+              const inspected = await persistence.inspect(SessionId(msg.id));
+              const events = (inspected.events ?? []).filter(
                 (e) => e.type !== "assistant/chunk" && e.type !== "session/end-seed"
               );
               const limit = Number.isInteger(msg.limit) && msg.limit > 0 ? msg.limit : 200;
               const tail = events.slice(-limit);
               const hasMore = events.length > tail.length;
               const nextSeq = hasMore ? tail[0].seq : undefined;
-              const stats = computeSessionStats(events);
+              // 统计：meta.stats 直读（合理则用）；无/异常则全量算（只读浏览不落盘）
+              const stats = resolveSessionStats(getSessionMeta(msg.id).stats, events, msg.id);
               post({ t: "history", sessionId: msg.id, events: tail, hasMore, nextSeq, stats });
               post({ t: "viewSession", id: msg.id });
             } catch (error) {
@@ -1581,10 +2106,12 @@ async function main() {
               });
             } else if (typeof msg.sessionId === "string" && msg.sessionId !== "") {
               try {
-                const query = ctx.get("sessionQuery");
-                if (query !== undefined && typeof query.readSession === "function") {
-                  const snap = await query.readSession(SessionId(msg.sessionId));
-                  const allEvents = (snap.events ?? []).filter(
+                // 用 persistence.inspect（与 viewSession 同源、prepared 缓存共享），
+                // 避免每次滚动都独立全量解压（readSession 无缓存复用）。
+                const persistence = ctx.get("sessionPersistence");
+                if (persistence !== undefined && typeof persistence.inspect === "function") {
+                  const inspected = await persistence.inspect(SessionId(msg.sessionId));
+                  const allEvents = (inspected.events ?? []).filter(
                     (e) => e.type !== "assistant/chunk" && e.type !== "session/end-seed"
                   );
                   const older = allEvents.filter((e) => e.seq < msg.beforeSeq).slice(-limit);
@@ -1624,6 +2151,7 @@ async function main() {
               break;
             }
             updateSessionMeta(msg.id, { title });
+            invalidateSessionsCache(); // 标题变更，列表需刷新
             // 当前 live 会话：顺带写回内核标题快照
             if (agent !== undefined && agent.session.id === msg.id) {
               try {
@@ -1640,6 +2168,7 @@ async function main() {
           }
           case "deleteSession": {
             const result = await deleteSession(ctx, msg.id);
+            if (result.ok) invalidateSessionsCache(); // 会话删除，列表需刷新
             if (result.ok && agent !== undefined && agent.session.id === msg.id) {
               // 删除的是当前会话：重置为"待开始"状态（惰性）——
               // 不立即创建新会话，等用户发出第一条消息才真正创建，
@@ -1674,7 +2203,8 @@ async function main() {
                 break;
               }
               const base = defaultModel.currentSelection();
-              const provider = typeof msg.provider === "string" && msg.provider !== "" ? msg.provider : base.provider;
+              // let：一致性防御在 provider 无可用模型/查询失败时会回退到 base.provider
+              let provider = typeof msg.provider === "string" && msg.provider !== "" ? msg.provider : base.provider;
               let model = typeof msg.model === "string" && msg.model !== "" ? msg.model : base.model;
               // provider/model 一致性防御：model 必须属于该 provider（前端切提供商时
               // 默认选中该 provider 第一模型；此处兜底——若传入的 model 不是该 provider
@@ -1697,11 +2227,33 @@ async function main() {
                           )
                         );
                         model = first;
+                      } else {
+                        // 该 provider 无任何可用模型：回退到当前默认选择，绝不持久化
+                        // 错配组合（如 zai-free+deepseek-v4-flash）。
+                        log(
+                          "warn",
+                          L(
+                            `提供商 ${provider} 无可用模型，已回退到 ${base.provider}/${base.model}`,
+                            `provider ${provider} has no usable model; reverted to ${base.provider}/${base.model}`
+                          )
+                        );
+                        provider = base.provider;
+                        model = base.model;
                       }
                     }
                   }
                 } catch (error) {
-                  log("warn", "setModel provider/model consistency check failed", error instanceof Error ? error.message : String(error));
+                  // 能力查询失败：保守回退到当前默认选择（同上方空列表分支）
+                  log(
+                    "warn",
+                    L(
+                      `无法校验 ${provider}/${model} 的归属，已回退到 ${base.provider}/${base.model}`,
+                      `cannot verify ${provider}/${model}; reverted to ${base.provider}/${base.model}`
+                    ),
+                    error instanceof Error ? error.message : String(error)
+                  );
+                  provider = base.provider;
+                  model = base.model;
                 }
               }
               // 思考等级：统一小写并规范化（low → high，见 normalizeEffort 注释）；
@@ -1999,18 +2551,19 @@ async function main() {
                   ok: true,
                   text: `Compacted ${result.shadowedSeqs.length} history items (~${result.shadowedTokenCount} tokens).`,
                 });
-                // 压缩完成：立即推送刷新后的统计（上下文占用应显著下降）。
-                // lastRequestInput 是最近一次请求输入（含缓存），减去被遮蔽的
-                // token 数即近似当前上下文占用；下一次真实请求会给出精确值。
+                // 压缩完成：只更新**上下文占比**并推送前端（token/轮次是历史
+                // 累计，压缩不触碰）；**不读写 meta.stats 的迁移/落盘**——stats
+                // 的持久化由加载/恢复机制负责，压缩无需关心；若无现有累计
+                // （新会话未迁移）则跳过推送，下次真实请求自动刷新占比。
                 try {
-                  const allEvents = agent.session.events.filter(
-                    (e) => e.type !== "assistant/chunk" && e.type !== "session/end-seed"
-                  );
-                  const stats = computeSessionStats(allEvents);
-                  if (Number.isFinite(stats.lastRequestInput) && stats.lastRequestInput > 0 && result.shadowedTokenCount > 0) {
-                    stats.lastRequestInput = Math.max(0, stats.lastRequestInput - result.shadowedTokenCount);
+                  const currentStats = getSessionMeta(agent.session.id).stats;
+                  if (currentStats && Number.isFinite(currentStats.lastSeq)) {
+                    const adjusted = { ...currentStats };
+                    if (Number.isFinite(adjusted.lastRequestInput) && adjusted.lastRequestInput > 0 && result.shadowedTokenCount > 0) {
+                      adjusted.lastRequestInput = Math.max(0, adjusted.lastRequestInput - result.shadowedTokenCount);
+                    }
+                    post({ t: "stats", stats: adjusted });
                   }
-                  post({ t: "stats", stats });
                 } catch (error) {
                   log("warn", "compact stats refresh failed", error instanceof Error ? error.message : String(error));
                 }

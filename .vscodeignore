@@ -37,29 +37,22 @@ EXPERIENCE-REVIEW.md
 # LICENSE 已被下方裁剪规则排除，本文件是唯一的合规载体）
 !THIRD-PARTY-NOTICES.md
 
-# ── 依赖裁剪：以下包仅被已禁用的插件引用（llm-pi-ai 多提供商网关 / 遥测），
-#    插件固定使用 deepseek-official 路由且不启用遥测，故从 VSIX 剔除以瘦身。
-#    npm install 仍完整安装（保证可重装），打包时剔除。
-node_modules/@earendil-works/**
-node_modules/@anthropic-ai/**
-node_modules/@mistralai/**
-node_modules/@google/**
-node_modules/@aws-sdk/**
-node_modules/@smithy/**
-node_modules/openai/**
-node_modules/typebox/**
-node_modules/@opentelemetry/**
-node_modules/web-streams-polyfill/**
-node_modules/formdata-polyfill/**
-node_modules/fetch-blob/**
-node_modules/node-domexception/**
-node_modules/node-fetch/**
-node_modules/google-auth-library/**
-node_modules/gaxios/**
-node_modules/protobufjs/**
-node_modules/@deepseek-ai/dsh-llm-pi-ai/**
-node_modules/@deepseek-ai/dsh-session-telemetry-otel/**
-node_modules/@deepseek-ai/dsh-session-telemetry/**
+# ⚠️ 原"依赖裁剪"区块（23 条）已全部移除——经逐条核查（release/verdict.mjs，
+#    依据：根 dependencies 闭包 + base/headless cordis.patch.yml 插件行 + 源码 import）
+#    结论是**没有一条可以安全保留**：
+#   - 内核 0.1.0-rc.6 起 dsh-base cordis.patch.yml 将 llm-pi-ai（L95）与
+#     session-telemetry-otel（L148）挂载为 dormant 插件行：boot 时 cordis-plugin-loader
+#     必须 import 它们，缺任意一环即 "Cannot find package …" → host boot failed。
+#   - llm-pi-ai → @earendil-works/pi-ai → 9 个 provider SDK（anthropic/mistral/google/
+#     aws-sdk/smithy/openai/typebox/opentelemetry…）+ 传递闭包（node-fetch、gaxios、
+#     protobufjs、web-streams-polyfill 等 20 条全部命中）。
+#   - dsh-session-telemetry 虽不在 npm 依赖声明中，但被 otel 插件 lib/index.js、
+#     lib/invariant.js 静态 import（隐式依赖，npm 恰好安装），同样必须随包分发。
+#   原注释假设"仅被已禁用插件引用"与 dormant 挂载机制冲突，已失效。
+#   真实瘦身空间仍保留：下方内部裁剪（src/types/test/d.ts/map/文档/许可）不破坏
+#   运行时解析；vsce 本身按 npm list --production 只打包生产依赖，devDependencies 不进 VSIX。
+#   如未来内核再演进，请以 release/closure.mjs（闭包计算）+ release/verdict.mjs（逐条判定）
+#   复核后再动裁剪。
 
 # ── 依赖内部裁剪（agent-host 已 esbuild bundle 成单文件，运行时不再解析
 #    这些源文件；保留 lib/ 编译产物与 package.json / patch 资源即可）：

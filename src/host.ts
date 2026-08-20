@@ -76,6 +76,7 @@ export type HostEvent =
   | { type: "viewSession"; id: string }
   | { type: "viewSessionFailed"; id: string; error?: string }
   | { type: "sessionRenamed"; id: string; ok: boolean; title?: string; error?: string }
+  | { type: "sessionTitleSynced"; id: string; title: string }
   | { type: "sessionDeleted"; id: string; ok: boolean; error?: string }
   | { type: "sessionExported"; id: string; ok: boolean; path?: string; error?: string }
   | { type: "stats"; stats: SessionStats }
@@ -459,6 +460,10 @@ export class AgentHost {
         this.emit({ type: "sessionRenamed", id: frame.id, ok: frame.ok, title: frame.title, error: frame.error });
         break;
       }
+      case "sessionTitleSynced": {
+        this.emit({ type: "sessionTitleSynced", id: frame.id, title: frame.title });
+        break;
+      }
       case "sessionDeleted": {
         this.emit({ type: "sessionDeleted", id: frame.id, ok: frame.ok, error: frame.error });
         break;
@@ -762,6 +767,11 @@ export class AgentHost {
   /** 只读浏览一个会话（子代理会话）：不创建 agent、不改全局宿主状态。 */
   viewSession(id: string): void {
     this.send({ t: "viewSession", id });
+  }
+
+  /** 恢复预览（Reload 自动恢复）：只读分页秒显历史，agent 懒 resume（发消息时）。 */
+  restorePreview(id: string): void {
+    this.send({ t: "restorePreview", id });
   }
 
   /** 请求加载更早的历史事件（向上滚动时分页；只读浏览子代理会话时带 sessionId）。 */

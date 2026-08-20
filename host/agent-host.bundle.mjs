@@ -140052,26 +140052,75 @@ function languageDirectiveSection() {
     text: "Always reply in English, including your reasoning. Use English unless the user explicitly asks for another language."
   };
 }
-function stepLimitSystemSection(limit2) {
+function fmtTitleTime(ts) {
+  const d = new Date(ts);
+  const p = (n, w = 2) => String(n).padStart(w, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}_${p(d.getHours())}-${p(d.getMinutes())}-${p(d.getSeconds())}.${p(d.getMilliseconds(), 3)}`;
+}
+function genSubsessionTitle(sessionId) {
+  return `subsession_${fmtTitleTime(Date.now())}_${sessionId}`;
+}
+function genTempTitle(firstInstruction) {
+  const head = String(firstInstruction ?? "").trim().replace(/\s+/g, " ").slice(0, 10);
+  return `newsession_${fmtTitleTime(Date.now())}_${head}`;
+}
+function toolBoundarySection() {
   if (UI_LANG === "zh") {
     return {
-      name: "step-limit",
-      text: `\u6BCF\u8F6E\u5BF9\u8BDD\uFF08\u4E00\u6761\u7528\u6237\u6D88\u606F\uFF09\u7684\u601D\u8003\u6B65\u6570\u9884\u7B97\u4E3A ${limit2} \u6B65\uFF0C\u8BF7\u5728\u6B64\u9884\u7B97\u5185\u89C4\u5212\u5DE5\u4F5C\u8282\u594F\u3002\u9884\u7B97\u7528\u5C3D\u540E\uFF0C\u5DE5\u5177\u8C03\u7528\u5C06\u88AB\u7981\u7528\uFF0C\u4F60\u5FC5\u987B\u7ACB\u5373\u6536\u5C3E\uFF1A\u505C\u6B62\u6240\u6709\u65B0\u7684\u5DE5\u5177\u8C03\u7528\u4E0E\u63A8\u7406\uFF0C\u5728\u56DE\u590D\u4E2D\u7ED9\u51FA\u7B80\u6D01\u7684\u6700\u7EC8\u7B54\u590D\uFF0C\u8BF4\u660E\u5DF2\u5B8C\u6210\u4E8B\u9879\u3001\u672A\u5B8C\u6210\u4E8B\u9879\uFF0C\u4EE5\u53CA\u7528\u6237\u4E0B\u4E00\u6B65\u5E94\u53D1\u9001\u7684\u547D\u4EE4\u3002\u9884\u7B97\u8017\u5C3D\u540E\u8BF7\u52FF\u7EE7\u7EED\u5DE5\u4F5C\u3002`
+      name: "tool-boundary",
+      text: "\u5DE5\u5177\u8C03\u7528\u8FB9\u754C\uFF1A\u5DE5\u5177\u8C03\u7528\u4EC5\u7528\u4E8E**\u6A21\u578B\u63A8\u7406\u6240\u5FC5\u9700**\u7684\u4FE1\u606F\u6536\u96C6\u4E0E\u5206\u6790\uFF08\u8BFB\u6587\u4EF6\u3001\u641C\u7D22\u3001\u6267\u884C\u80FD\u76F4\u63A5\u4EA7\u751F\u63A8\u7406\u4F9D\u636E\u7684\u547D\u4EE4\uFF09\u3002**\u66FF\u7528\u6237\u5B8C\u6210\u7684\u5DE5\u4F5C\u4E0D\u8981\u8C03\u7528\u5DE5\u5177**\u2014\u2014\u4F8B\u5982\u7F16\u8BD1\u3001\u6253\u5305\u3001\u90E8\u7F72\u3001\u6BCF\u8F6E\u7ED3\u5C3E\u7684\u5168\u9762\u5B89\u5168\u68C0\u67E5\u7B49\u91CD\u590D\u6027\u9A8C\u8BC1\u52A8\u4F5C\uFF0C\u9664\u975E\u7528\u6237\u660E\u786E\u8981\u6C42\uFF0C\u5426\u5219\u4E0D\u4E3B\u52A8\u6267\u884C\uFF1A\u6539\u4E3A\u5728\u6700\u7EC8\u7B54\u590D\u4E2D\u7ED9\u51FA\u6E05\u6670\u7684\u64CD\u4F5C\u6B65\u9AA4/\u547D\u4EE4\u6E05\u5355\uFF0C\u7531\u7528\u6237\u81EA\u884C\u6267\u884C\uFF1B\u4E5F\u4E0D\u8981\u53D1\u8D77\u4E0D\u5FC5\u8981\u7684\u6743\u9650\u6388\u6743\u8BF7\u6C42\u3002"
     };
   }
   return {
-    name: "step-limit",
-    text: `Each turn (one user message) has a thinking-step budget of ${limit2} model steps. Plan your work to finish within this budget. When the budget is reached, tool calls are disabled and you must wrap up immediately: stop all new tool calls and reasoning, and deliver a concise final answer covering what was accomplished, what remains unfinished, and the next command the user should send. Do not continue working beyond the budget.`
+    name: "tool-boundary",
+    text: "Tool-use boundary: use tools ONLY for information gathering and analysis your reasoning requires (reading files, searching, running commands that directly produce reasoning evidence). Do NOT call tools to do the user's work for them \u2014 e.g. compiling, packaging, deploying, or full security sweeps at the end of every turn. Unless the user explicitly asks, don't perform these yourself: instead give a clear step-by-step command list in your final answer for the user to run. Don't raise unnecessary approval requests either."
   };
+}
+function stepBudgetSection(limit2) {
+  if (UI_LANG === "zh") {
+    return {
+      name: "step-budget",
+      text: `\u6BCF\u8F6E\u5BF9\u8BDD\uFF08\u4E00\u6761\u7528\u6237\u6D88\u606F\uFF09\u7684\u601D\u8003\u6B65\u6570\u9884\u7B97\u4E3A ${limit2} \u6B65\uFF0C\u8BF7\u5728\u6B64\u9884\u7B97\u5185\u89C4\u5212\u5DE5\u4F5C\u8282\u594F\u3002\u8BF7\u5168\u529B\u53D1\u6325\u80FD\u529B\uFF0C\u4EE5**\u6700\u5C11\u7684\u6B65\u6570**\u5B9E\u73B0\u6700\u597D\u7684\u89E3\u51B3\u6548\u679C\uFF0C\u63D0\u9AD8\u6548\u7387\u3001\u8282\u7701 tokens\u3002\u6548\u7387\u8981\u70B9\uFF1A\u52A8\u624B\u524D\u5148\u7B80\u8FF0\u4F60\u7684\u8BA1\u5212\u4E0E\u9884\u4F30\u6B65\u6570\uFF08\u5199\u5728\u56DE\u590D\u6587\u672C\u4E2D\uFF0C\u4E0D\u6D88\u8017\u5DE5\u5177\u6B65\uFF09\uFF0C\u6309\u8BA1\u5212\u6267\u884C\u51CF\u5C11\u7ED5\u8DEF\uFF1B\u9700\u8981\u6536\u96C6\u591A\u9879\u4FE1\u606F\u65F6\uFF0C\u5728\u540C\u4E00\u7B54\u590D\u4E2D**\u4E00\u6B21\u53D1\u8D77\u591A\u4E2A\u5DE5\u5177\u8C03\u7528**\uFF08\u5E76\u884C\u6279\u91CF\u6536\u96C6\uFF09\uFF0C\u4E00\u6B21\u6027\u62FF\u56DE\u6240\u6709\u9700\u8981\u7684\u4FE1\u606F\u540E\u518D\u5206\u6790\uFF1B\u4EC5\u5F53\u8C03\u7528\u4E4B\u95F4**\u5B58\u5728\u4F9D\u8D56**\u65F6\u624D\u9010\u4E2A\u8FDB\u884C\u3002\u9884\u7B97\u7528\u5C3D\u540E\u5DE5\u5177\u8C03\u7528\u5C06\u88AB\u7981\u7528\uFF0C\u4F60\u5FC5\u987B\u7ACB\u5373\u6536\u5C3E\u603B\u7ED3\uFF08\u8BF4\u660E\u5DF2\u5B8C\u6210/\u672A\u5B8C\u6210/\u4E0B\u4E00\u6B65\u547D\u4EE4\uFF09\uFF0C\u9884\u7B97\u8017\u5C3D\u540E\u8BF7\u52FF\u7EE7\u7EED\u5DE5\u4F5C\u3002\u672C\u8F6E\u5B9E\u65F6\u8FDB\u5EA6\u7531\u7CFB\u7EDF\u6BCF\u6B65\u901A\u8FC7 [\u672C\u6B65\u6307\u5F15] \u63D0\u4F9B\uFF08\u4E13\u7528\u5B57\u6BB5 STEPS_USED/STEPS_REMAIN/TOOLS_USED/ELAPSED_SEC\uFF09\uFF0C\u8BF7\u5F15\u7528\u5176\u6570\u503C\u3002`
+    };
+  }
+  return {
+    name: "step-budget",
+    text: `Each turn (one user message) has a thinking-step budget of ${limit2} steps. Plan your work to finish within it. Do your best to achieve the best outcome in the FEWEST steps \u2014 be efficient and save tokens. Efficiency guidance: before acting, briefly state your plan and estimated steps in your reply text (costs no tool steps) and follow it to avoid detours; when you need several pieces of information, issue MULTIPLE tool calls in a single reply (parallel batch collection), then analyze once all results are back; go step-by-step only when calls DEPEND on each other. When the budget is exhausted, tool calls are disabled and you must wrap up immediately: deliver a concise final answer (accomplished / unfinished / next command). Do not continue beyond the budget. Real-time progress is provided each step via [Step guide] (named fields STEPS_USED/STEPS_REMAIN/TOOLS_USED/ELAPSED_SEC); quote those values.`
+  };
+}
+function wrapUpReportSection() {
+  if (UI_LANG === "zh") {
+    return {
+      name: "wrap-up-report",
+      text: "\u6536\u5C3E\u62A5\u544A\uFF08**\u5F3A\u5236\uFF0C\u975E\u53EF\u9009\u9879**\uFF09\uFF1A\u6700\u7EC8\u7B54\u590D\u7684**\u7B2C\u4E00\u884C**\u5FC5\u987B\u4EE5\u5982\u4E0B\u683C\u5F0F\u5F00\u5934\uFF1A`\u23F1 \u672C\u8F6E\u7EDF\u8BA1\uFF1ASTEPS_USED \u6B65\u601D\u8003 / TOOLS_USED \u6B21\u5DE5\u5177\u8C03\u7528 / \u8017\u65F6 ELAPSED_SEC \u79D2`\u2014\u2014**STEPS_USED / TOOLS_USED / ELAPSED_SEC \u53D6\u672C\u6B65 [\u672C\u6B65\u6307\u5F15] \u4E2D\u540C\u540D\u4E13\u7528\u5B57\u6BB5\u7684\u503C**\uFF1B\u5982\u679C\u4F60\u672C\u6B65\u8FD8\u8FDB\u884C\u4E86\u5DE5\u5177\u8C03\u7528\uFF0C\u5219 TOOLS_USED \u8FD8\u5FC5\u987B\u52A0\u4E0A\u4F60\u672C\u6B65\u8C03\u7528\u5DE5\u5177\u7684\u6B21\u6570\uFF0CELAPSED_SEC \u5FC5\u987B\u52A0\u4E0A\u4F60\u672C\u6B65\u7684\u8017\u65F6\uFF0C\u968F\u540E\u518D\u5199\u603B\u7ED3\u6B63\u6587\uFF08\u5DF2\u5B8C\u6210/\u672A\u5B8C\u6210/\u4E0B\u4E00\u6B65\u547D\u4EE4\uFF09\u3002"
+    };
+  }
+  return {
+    name: "wrap-up-report",
+    text: "Wrap-up report (MANDATORY, not optional): your final answer's FIRST LINE must open with `\u23F1 Stats this turn: STEPS_USED steps / TOOLS_USED tool calls / ELAPSED_SECs elapsed` \u2014 STEPS_USED / TOOLS_USED / ELAPSED_SEC are the values of the SAME NAMED FIELDS in THIS step's [Step guide]; if you issue additional tool calls in this step, ADD them to TOOLS_USED and ADD this step's elapsed time to ELAPSED_SEC, then write the summary body (accomplished / unfinished / next command)."
+  };
+}
+function roundGuideText(perfNoteText) {
+  if (UI_LANG === "zh") {
+    return `[\u672C\u8F6E\u6307\u5F15] ${perfNoteText || "\u672C\u8F6E\u8BF7\u4EE5\u6700\u5C11\u6B65\u6570\u9AD8\u6548\u5B8C\u6210\u4EFB\u52A1\u3002"}`;
+  }
+  return `[Round guide] ${perfNoteText || "Complete this round efficiently in as few steps as possible."}`;
+}
+function stepGuideText(limit2, steps, tools, elapsed) {
+  const remaining = Math.max(0, limit2 - steps);
+  if (UI_LANG === "zh") {
+    return `[\u672C\u6B65\u6307\u5F15] STEPS_USED=${steps} / STEPS_REMAIN=${remaining} / TOOLS_USED=${tools} / ELAPSED_SEC=${elapsed}`;
+  }
+  return `[Step guide] STEPS_USED=${steps} / STEPS_REMAIN=${remaining} / TOOLS_USED=${tools} / ELAPSED_SEC=${elapsed}`;
 }
 function stepLimitDenyReason(count, limit2) {
   return UI_LANG === "zh" ? `\u5DE5\u5177\u8C03\u7528\u5DF2\u7981\u7528\u2014\u2014\u672C\u8F6E\u5DF2\u8FBE\u601D\u8003\u6B65\u6570\u4E0A\u9650\uFF08${count}/${limit2}\uFF09\u3002\u8BF7\u7ACB\u5373\u505C\u6B62\u5DE5\u4F5C\u5E76\u7ED9\u51FA\u6700\u7EC8\u7B54\u590D\u3002` : `Tool calls are disabled \u2014 this turn reached its step limit (${count}/${limit2}). Stop working and deliver your final summary now.`;
 }
-function stepLimitWrapUpMessage(limit2, steps) {
+function stepLimitWrapUpMessage(limit2, steps, tools, elapsedSec) {
   if (UI_LANG === "zh") {
-    return `[\u81EA\u52A8\u63D0\u793A] \u672C\u8F6E\u601D\u8003\u6B65\u6570\u5DF2\u8FBE\u4E0A\u9650\uFF08${steps}/${limit2}\uFF09\uFF0C\u6240\u6709\u5DE5\u5177\u8C03\u7528\u5DF2\u88AB\u7981\u7528\u3002\u5355\u8F6E\u6B65\u6570\u4E0A\u9650\u7528\u4E8E\u63A7\u5236\u5355\u6B21\u8BF7\u6C42\u89C4\u6A21\u3001\u9632\u6B62\u5DE5\u5177\u5FAA\u73AF\u5931\u63A7\uFF0C\u56E0\u6B64\u672C\u8F6E\u5DE5\u4F5C\u5230\u6B64\u4E3A\u6B62\u3002\u8BF7\u7ACB\u5373\u505C\u6B62\u8FDB\u4E00\u6B65\u63A8\u7406\uFF0C\u5728\u672C\u56DE\u590D\u4E2D\u7ED9\u51FA\u6700\u7EC8\u7B54\u590D\uFF1A\u5DF2\u5B8C\u6210\u4EC0\u4E48\u3001\u8FD8\u5269\u4E0B\u4EC0\u4E48\u3001\u7528\u6237\u4E0B\u4E00\u6B65\u5E94\u53D1\u9001\u7684\u547D\u4EE4\u3002\u9884\u7B97\u8017\u5C3D\u540E\u8BF7\u52FF\u7EE7\u7EED\u5DE5\u4F5C\u3002\u672C\u63D0\u793A\u7531\u7CFB\u7EDF\u81EA\u52A8\u6CE8\u5165\uFF0C\u5E76\u975E\u7528\u6237\u8F93\u5165\u3002\u8C22\u8C22\u914D\u5408\u6536\u5C3E\u3002`;
+    return `[\u8FBE\u9650\u8B66\u793A] \u672C\u8F6E\u601D\u8003\u6B65\u6570\u5DF2\u8FBE\u4E0A\u9650\uFF08${steps}/${limit2}\uFF09\uFF0C\u5DF2\u53D1\u8D77 ${tools} \u6B21\u5DE5\u5177\u8C03\u7528\uFF0C\u672C\u8F6E\u8017\u65F6 ${elapsedSec} \u79D2\uFF0C\u6240\u6709\u5DE5\u5177\u8C03\u7528\u5DF2\u88AB\u7981\u7528\u3002\u5355\u8F6E\u6B65\u6570\u4E0A\u9650\u7528\u4E8E\u63A7\u5236\u5355\u6B21\u8BF7\u6C42\u89C4\u6A21\u3001\u9632\u6B62\u5DE5\u5177\u5FAA\u73AF\u5931\u63A7\uFF0C\u56E0\u6B64\u672C\u8F6E\u5DE5\u4F5C\u5230\u6B64\u4E3A\u6B62\u3002\u8BF7\u7ACB\u5373\u505C\u6B62\u8FDB\u4E00\u6B65\u63A8\u7406\uFF0C\u5728\u672C\u56DE\u590D\u4E2D\u7ED9\u51FA\u6700\u7EC8\u7B54\u590D\uFF0C**\u7B2C\u4E00\u884C**\u5FC5\u987B\u4EE5\u5982\u4E0B\u683C\u5F0F\u5F00\u5934\uFF1A\`\u23F1 \u672C\u8F6E\u7EDF\u8BA1\uFF1ASTEPS_USED \u6B65\u601D\u8003 / TOOLS_USED \u6B21\u5DE5\u5177\u8C03\u7528 / \u8017\u65F6 ELAPSED_SEC \u79D2\`\uFF08\u5176\u4E2D STEPS_USED=${steps}\u3001TOOLS_USED=${tools}\u3001ELAPSED_SEC=${elapsedSec}\uFF0C\u82E5\u672C\u7B54\u590D\u4E2D\u8FD8\u6709\u65B0\u7684\u5DE5\u5177\u8C03\u7528\u8BF7\u4E00\u5E76\u8BA1\u5165\uFF09\uFF0C\u968F\u540E\u5199\u603B\u7ED3\u6B63\u6587\uFF08\u5DF2\u5B8C\u6210/\u672A\u5B8C\u6210/\u4E0B\u4E00\u6B65\u547D\u4EE4\uFF09\u3002\u9884\u7B97\u8017\u5C3D\u540E\u8BF7\u52FF\u7EE7\u7EED\u5DE5\u4F5C\u3002\u672C\u63D0\u793A\u7531\u7CFB\u7EDF\u81EA\u52A8\u6CE8\u5165\uFF0C\u5E76\u975E\u7528\u6237\u8F93\u5165\u3002\u8C22\u8C22\u914D\u5408\u6536\u5C3E\u3002`;
   }
-  return `[Auto notice] Step limit reached: ${steps}/${limit2} steps used \u2014 this turn's thinking budget is exhausted and all tool calls are now disabled. The per-turn step limit keeps each request bounded and prevents runaway tool loops, so continuing further work is not permitted. Stop further reasoning and deliver your final answer in this reply: what was accomplished, what remains unfinished, and the next command the user should send. Do not continue working after this reply. This notice was injected automatically and is not user input. Thank you for wrapping up cleanly.`;
+  return `[Limit warning] This turn's step limit is reached: ${steps}/${limit2} steps used, ${tools} tool calls issued, ${elapsedSec}s elapsed \u2014 the thinking budget is exhausted and all tool calls are now disabled. The per-turn step limit keeps each request bounded and prevents runaway tool loops, so continuing further work is not permitted. Stop further reasoning and deliver your final answer in this reply, opening with a first line in this exact format: \`\u23F1 Stats this turn: STEPS_USED steps / TOOLS_USED tool calls / ELAPSED_SECs elapsed\` (STEPS_USED=${steps}, TOOLS_USED=${tools}, ELAPSED_SEC=${elapsedSec}; count any NEW tool calls in this reply too), then the summary body (accomplished / unfinished / next command). Do not continue working after this reply. This notice was injected automatically and is not user input. Thank you for wrapping up cleanly.`;
 }
 function attachAgent(ctx, handle, pump2) {
   const agent = handle.agent;
@@ -140080,11 +140129,41 @@ function attachAgent(ctx, handle, pump2) {
   let stepCount = 0;
   let stepLimitHit = false;
   let wrapUpInjected = false;
+  let roundGuideInjected = false;
+  let toolCallCount = 0;
+  let turnStartAt = Date.now();
+  const elapsedSec = () => Math.round((Date.now() - turnStartAt) / 1e3);
+  const PERF_KEEP = 5;
+  const PERF_META_KEY = "perf";
+  let perfQueue = [];
+  try {
+    const saved = getSessionMeta(agent.session.id)[PERF_META_KEY];
+    if (Array.isArray(saved)) perfQueue = saved.slice(-PERF_KEEP);
+  } catch {
+    perfQueue = [];
+  }
+  const perfNote = () => {
+    if (perfQueue.length === 0) return "";
+    const rows = perfQueue.map((p, i2) => {
+      const tools = p.tools ?? 0;
+      const batchHint = tools > p.steps ? UI_LANG === "zh" ? "\uFF08\u542B\u5E76\u53D1\u6279\u91CF\uFF09" : " (with parallel batching)" : "";
+      return UI_LANG === "zh" ? `\u7B2C${i2 + 1}\u8F6E\u7528\u4E86 ${p.steps} \u6B65 / ${tools} \u6B21\u5DE5\u5177\u8C03\u7528${batchHint}${p.hitLimit ? "\uFF08\u8FBE\u9650\u672A\u5B8C\u6210\uFF09" : "\uFF08\u9884\u7B97\u5185\u5B8C\u6210\uFF09"}` : `Round ${i2 + 1}: ${p.steps} steps / ${tools} tool calls${batchHint}${p.hitLimit ? " (hit limit, unfinished)" : " (finished within budget)"}`;
+    });
+    return UI_LANG === "zh" ? `\u7EE9\u6548\u53C2\u8003\uFF1A\u4F60\u6700\u8FD1\u5B8C\u6210\u7684\u8F6E\u6B21\uFF1A${rows.join("\uFF1B")}\u3002\u9AD8\u6548\u6A21\u5F0F\u901A\u5E38\u5305\u62EC\uFF1A\u4E00\u6B65\u5185\u5E76\u53D1\u591A\u4E2A\u5DE5\u5177\u8C03\u7528\u3001\u51CF\u5C11\u91CD\u590D\u641C\u7D22\u4E0E\u5197\u4F59\u64CD\u4F5C\u3001\u5148\u89C4\u5212\u518D\u52A8\u624B\uFF08\u7B80\u8FF0\u8BA1\u5212\u4E0E\u9884\u4F30\u6B65\u6570\uFF09\u3002\u8BF7\u5EF6\u7EED\u9AD8\u6548\u6A21\u5F0F\uFF0C\u5728\u672C\u8F6E\u9884\u7B97\u5185\u4EE5\u6700\u5C11\u6B65\u6570\u5706\u6EE1\u5B8C\u6210\u4EFB\u52A1\u3002` : `Performance reference: recent rounds: ${rows.join("; ")}. Efficient patterns usually include: batching multiple tool calls in one step, avoiding repeated searches and redundant operations, and planning before acting (state your plan and estimated steps). Keep the efficient patterns and complete this round within budget in as few steps as possible.`;
+  };
   let lastLoggedEffort;
   const resetStepBudget = () => {
+    if (stepLimit > 0 && stepCount > 0) {
+      perfQueue.push({ steps: stepCount, tools: toolCallCount, hitLimit: stepLimitHit });
+      if (perfQueue.length > PERF_KEEP) perfQueue.shift();
+      updateSessionMeta(agent.session.id, { [PERF_META_KEY]: [...perfQueue].slice(-PERF_KEEP) });
+    }
     stepCount = 0;
     stepLimitHit = false;
     wrapUpInjected = false;
+    roundGuideInjected = false;
+    toolCallCount = 0;
+    turnStartAt = Date.now();
   };
   agent.ctx.on("session/event", (_session, event) => {
     if (event.type === "step/start") {
@@ -140094,39 +140173,68 @@ function attachAgent(ctx, handle, pump2) {
         post({ t: "stepLimit", maxSteps: stepLimit, steps: stepCount });
       }
     }
+    if (event.type === "session/title" && event.data && typeof event.data.title === "string" && event.data.title.trim() !== "") {
+      try {
+        const title = event.data.title.trim();
+        updateSessionMeta(agent.session.id, { title });
+        invalidateSessionsCache();
+        post({ t: "sessionTitleSynced", id: agent.session.id, title });
+      } catch (error51) {
+        log("warn", "session title sync to meta failed", error51 instanceof Error ? error51.message : String(error51));
+      }
+    }
     pump2.push(event);
+  });
+  agent.ctx.on("session/flush", () => {
+    try {
+      const sid = agent.session.id;
+      const events = agent.session.events.filter(
+        (e2) => e2.type !== "assistant/chunk" && e2.type !== "session/end-seed"
+      );
+      const meta3 = loadSessionMeta();
+      const prev = meta3[sid]?.stats;
+      const stats = computeSessionStats(events, prev && Number.isFinite(prev.lastSeq) ? prev : void 0);
+      meta3[sid] = { ...meta3[sid] ?? {}, stats: { ...stats } };
+      saveSessionMeta(meta3);
+    } catch (error51) {
+      log("warn", "session stats flush failed", error51 instanceof Error ? error51.message : String(error51));
+    }
   });
   agent.ctx.on("system-prompt/assemble", async (_assembly, _context, next) => {
     const assembled = await next();
     const sections = [...assembled.sections ?? []];
     sections.push(languageDirectiveSection());
-    if (stepLimit > 0) {
-      sections.push(stepLimitSystemSection(stepLimit));
-    }
+    sections.push(toolBoundarySection());
+    if (stepLimit > 0) sections.push(stepBudgetSection(stepLimit));
+    sections.push(wrapUpReportSection());
     return { ...assembled, sections };
   });
   agent.ctx.on("agent/pre-step", async (_payload, next) => {
     const decision = await next();
-    if (stepLimit > 0 && stepLimitHit && !wrapUpInjected && decision.kind === "enter") {
+    if (decision.kind !== "enter") return decision;
+    let messages = decision.messages ?? [];
+    let changed = false;
+    const add = (text) => {
+      messages = [...messages, createUserMessage({ content: [{ type: "text", text }], source: { kind: "user" } })];
+      changed = true;
+    };
+    if (stepLimit > 0 && stepLimitHit && !wrapUpInjected) {
       wrapUpInjected = true;
-      return {
-        ...decision,
-        messages: [
-          ...decision.messages ?? [],
-          // 必须用 createUserMessage 构造（含 id/source 身份字段）——内核处理
-          // user/message 事件会读 message.source.kind，裸对象会崩溃
-          // （"Cannot read properties of undefined (reading 'kind')"）。
-          createUserMessage({
-            content: [{ type: "text", text: stepLimitWrapUpMessage(stepLimit, stepCount) }],
-            source: { kind: "user" }
-          })
-        ]
-      };
+      add(stepLimitWrapUpMessage(stepLimit, stepCount, toolCallCount, elapsedSec()));
+      return { ...decision, messages };
     }
-    return decision;
+    if (!roundGuideInjected) {
+      roundGuideInjected = true;
+      add(roundGuideText(perfNote()));
+    }
+    if (stepLimit > 0) {
+      add(stepGuideText(stepLimit, stepCount, toolCallCount, elapsedSec()));
+    }
+    return changed ? { ...decision, messages } : decision;
   });
   agent.ctx.on("tools/pre-execute", async (exec, next) => {
     const gate = await next();
+    if (gate.kind === "allow") toolCallCount++;
     if (stepLimit > 0 && stepLimitHit && gate.kind === "allow") {
       return {
         kind: "deny",
@@ -140358,43 +140466,112 @@ function removeSessionMeta(sessionId) {
     saveSessionMeta(meta3);
   }
 }
-async function listSessions(ctx) {
-  const query = ctx.get("sessionQuery");
-  if (query === void 0) return [];
-  const records = await query.listSessions();
-  const ids = records.filter((r2) => r2.persisted || r2.live).map((r2) => r2.header.id);
-  const titleResults = ids.length > 0 ? await query.readTitleSnapshots(ids) : [];
-  const titles = /* @__PURE__ */ new Map();
-  for (const r2 of titleResults) {
-    if (r2.status === "fulfilled" && r2.value.title !== void 0) {
-      titles.set(r2.sessionId, { title: r2.value.title.title, updatedAt: r2.value.title.updatedAt });
+var SESSION_LOG_NAMES = ["session.jsonl", "session.jsonl.zstd"];
+function genOldSessionTitle(mtime, sessionId) {
+  return `oldsession_${fmtTitleTime(mtime || Date.now())}_${sessionId}`;
+}
+function scanSessionDirs() {
+  const root = dshHomePath("sessions-ay-dsh");
+  const out = [];
+  let projects;
+  try {
+    projects = readdirSync(root, { withFileTypes: true });
+  } catch {
+    return out;
+  }
+  for (const p of projects) {
+    if (!p.isDirectory()) continue;
+    let sessions;
+    try {
+      sessions = readdirSync(join3(root, p.name), { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const s2 of sessions) {
+      if (!s2.isDirectory()) continue;
+      const logPath = SESSION_LOG_NAMES.map((n) => join3(root, p.name, s2.name, n)).find((p2) => existsSync2(p2));
+      if (!logPath) continue;
+      out.push({ id: s2.name, logPath, project: p.name });
     }
   }
+  return out;
+}
+var SESSIONS_CACHE_TTL = 3e3;
+var sessionsCache = null;
+var sessionsCacheAt = 0;
+function invalidateSessionsCache() {
+  sessionsCache = null;
+  sessionsCacheAt = 0;
+}
+async function listSessions(ctx) {
+  const now = Date.now();
+  if (sessionsCache !== null && now - sessionsCacheAt < SESSIONS_CACHE_TTL) {
+    return sessionsCache;
+  }
+  const entries = scanSessionDirs();
   const allMeta = loadSessionMeta();
-  return records.filter((r2) => r2.persisted || r2.live).map((r2) => {
-    const meta3 = allMeta[r2.header.id] ?? {};
-    const kernelTitle = titles.get(r2.header.id)?.title;
-    return {
-      id: r2.header.id,
-      cwd: r2.header.cwd ?? "",
-      createdAt: r2.header.createdAt,
-      // 用户显式重命名优先于内核自动标题
-      title: typeof meta3.title === "string" && meta3.title.trim() !== "" ? meta3.title : kernelTitle,
-      updatedAt: titles.get(r2.header.id)?.updatedAt ?? r2.header.createdAt,
-      live: r2.live,
+  const patch = {};
+  const result = [];
+  for (const e2 of entries) {
+    const meta3 = allMeta[e2.id] ?? {};
+    let title = meta3.title;
+    if (typeof title !== "string" || title.trim() === "") {
+      let mtime = 0;
+      try {
+        const st = statSync2(e2.logPath);
+        if (st.mtimeMs > 0) mtime = st.mtimeMs;
+      } catch {
+      }
+      title = genOldSessionTitle(mtime, e2.id);
+      patch[e2.id] = { ...meta3, title };
+    }
+    let updatedAt = 0;
+    try {
+      const st = statSync2(e2.logPath);
+      if (st.mtimeMs > 0) updatedAt = st.mtimeMs;
+    } catch {
+    }
+    result.push({
+      id: e2.id,
+      cwd: e2.project,
+      // 展示用（projectKey 目录名；不反解，恢复/删除走内核不受影响）
+      createdAt: updatedAt || now,
+      title,
+      updatedAt: updatedAt || now,
+      live: false,
+      // 调用方按当前 agent 补标
       // 会话类型：主代理（dsh-vscode- 前缀）或子代理（subagent 工具，裸 UUID）
-      kind: String(r2.header.id).startsWith(SESSION_PREFIX) ? "main" : "sub",
+      kind: String(e2.id).startsWith(SESSION_PREFIX) ? "main" : "sub",
       // 会话级模型/思考级别/workMode（恢复时还原用；前端可展示）
       provider: meta3.provider,
       model: meta3.model,
       reasoningEffort: meta3.reasoningEffort,
       workMode: meta3.workMode
-    };
-  });
+    });
+  }
+  if (Object.keys(patch).length > 0) {
+    for (const [id, v] of Object.entries(patch)) allMeta[id] = v;
+    saveSessionMeta(allMeta);
+    invalidateSessionsCache();
+  }
+  result.sort((a, b) => b.updatedAt - a.updatedAt);
+  sessionsCache = result;
+  sessionsCacheAt = Date.now();
+  return result;
 }
-function computeSessionStats(events) {
-  const stats = { inputTokens: 0, cacheReadTokens: 0, outputTokens: 0, steps: 0 };
+function computeSessionStats(events, base) {
+  const stats = {
+    inputTokens: base?.inputTokens ?? 0,
+    cacheReadTokens: base?.cacheReadTokens ?? 0,
+    outputTokens: base?.outputTokens ?? 0,
+    steps: base?.steps ?? 0,
+    lastSeq: base?.lastSeq ?? 0
+  };
+  if (base?.title) stats.title = base.title;
+  if (base?.contextWindow) stats.contextWindow = base.contextWindow;
+  if (base?.model) stats.model = base.model;
   for (const e2 of events) {
+    if (base !== void 0 && (e2.seq ?? 0) <= base.lastSeq) continue;
     const d = e2.data ?? {};
     if (e2.type === "session/title" && typeof d.title === "string" && d.title) {
       stats.title = d.title;
@@ -140414,6 +140591,31 @@ function computeSessionStats(events) {
     } else if (e2.type === "step/start") {
       stats.steps = (stats.steps ?? 0) + 1;
     }
+    stats.lastSeq = Math.max(stats.lastSeq, e2.seq ?? 0);
+  }
+  return stats;
+}
+function resolveSessionStats(metaStats, events, sessionId) {
+  const maxSeq = events.reduce((m2, e2) => Math.max(m2, e2.seq ?? 0), 0);
+  if (metaStats && Number.isFinite(metaStats.lastSeq) && metaStats.lastSeq <= maxSeq) {
+    if (metaStats.lastSeq === maxSeq) return metaStats;
+    const stats2 = computeSessionStats(events, metaStats);
+    try {
+      const meta3 = loadSessionMeta();
+      meta3[sessionId] = { ...meta3[sessionId] ?? {}, stats: { ...stats2 } };
+      saveSessionMeta(meta3);
+    } catch (error51) {
+      log("warn", "session stats persist failed", error51 instanceof Error ? error51.message : String(error51));
+    }
+    return stats2;
+  }
+  const stats = computeSessionStats(events);
+  try {
+    const meta3 = loadSessionMeta();
+    meta3[sessionId] = { ...meta3[sessionId] ?? {}, stats: { ...stats } };
+    saveSessionMeta(meta3);
+  } catch (error51) {
+    log("warn", "session stats persist failed", error51 instanceof Error ? error51.message : String(error51));
   }
   return stats;
 }
@@ -140447,15 +140649,18 @@ function projectKey(cwd) {
 }
 async function deleteSession(ctx, sessionId) {
   try {
-    const query = ctx.get("sessionQuery");
-    let cwd;
-    if (query !== void 0) {
-      const snap = await query.readSession(SessionId(sessionId));
-      cwd = snap.session.cwd ?? process.cwd();
-    } else {
-      cwd = process.cwd();
+    let dir = null;
+    for (const entry of scanSessionDirs()) {
+      if (entry.id === sessionId) {
+        dir = dirname3(entry.logPath);
+        break;
+      }
     }
-    const dir = join3(dshHomePath("sessions-ay-dsh"), projectKey(cwd), encodeSegment(sessionId));
+    if (dir === null) {
+      const query = ctx.get("sessionQuery");
+      const cwd = query !== void 0 ? (await query.readSession(SessionId(sessionId))).session.cwd ?? process.cwd() : process.cwd();
+      dir = join3(dshHomePath("sessions-ay-dsh"), projectKey(cwd), encodeSegment(sessionId));
+    }
     const artifacts = ["session.jsonl", "session.jsonl.zstd", "session.jsonl.zst"];
     const hasArtifact = artifacts.some((name) => existsSync2(join3(dir, name)));
     if (!hasArtifact) {
@@ -140463,6 +140668,7 @@ async function deleteSession(ctx, sessionId) {
     }
     rmSync(dir, { recursive: true, force: true });
     removeSessionMeta(sessionId);
+    invalidateSessionsCache();
     return { ok: true };
   } catch (error51) {
     return { ok: false, error: error51 instanceof Error ? error51.message : String(error51) };
@@ -140615,6 +140821,19 @@ async function main() {
     log("info", "DSH tree booted");
     installApprovalListener(ctx, approvals);
     log("info", "approval listener installed (root scope, covers all agents)");
+    ctx.on("agent/created", ({ agent: createdAgent }) => {
+      try {
+        const sid = createdAgent.session.id;
+        if (String(sid).startsWith(SESSION_PREFIX)) return;
+        const meta3 = getSessionMeta(sid);
+        if (typeof meta3.title === "string" && meta3.title.trim() !== "") return;
+        updateSessionMeta(sid, { title: genSubsessionTitle(sid) });
+        invalidateSessionsCache();
+      } catch (error51) {
+        log("warn", "subagent title init failed", error51 instanceof Error ? error51.message : String(error51));
+      }
+    });
+    log("info", "subagent title listener installed (agent/created)");
     migrateLegacySessions();
     handle = void 0;
     agent = void 0;
@@ -140700,11 +140919,13 @@ async function main() {
             return;
           }
           if (agent === void 0) {
-            const created = await createAgent(ctx, { model: msg.model ?? env2.DSH_VSCODE_MODEL }, pump2, approvals);
+            const created = await createAgent(ctx, { model: msg.model }, pump2, approvals);
             handle = created.handle;
             agent = created.agent;
             selection = created.selection;
             resetStepBudget = created.resetStepBudget;
+            updateSessionMeta(agent.session.id, { title: genTempTitle(text) });
+            invalidateSessionsCache();
           }
           resetStepBudget?.();
           post({
@@ -140747,6 +140968,7 @@ async function main() {
             agent = void 0;
             resetStepBudget = null;
           }
+          selection = null;
           post({
             t: "ready",
             sessionId: "",
@@ -140760,10 +140982,83 @@ async function main() {
         case "listSessions": {
           try {
             const list = await listSessions(ctx);
+            if (agent !== void 0) {
+              for (const s2 of list) s2.live = s2.id === agent.session.id;
+            }
             post({ t: "sessions", list });
           } catch (error51) {
             log("error", "listSessions failed", error51 instanceof Error ? error51.message : String(error51));
             post({ t: "sessions", list: [], error: error51 instanceof Error ? error51.message : String(error51) });
+          }
+          break;
+        }
+        case "restorePreview": {
+          if (typeof msg.id !== "string" || msg.id.trim() === "") break;
+          try {
+            const persistence = ctx.get("sessionPersistence");
+            if (persistence !== void 0 && typeof persistence.inspect === "function") {
+              const inspected = await persistence.inspect(SessionId(msg.id));
+              const events = (inspected.events ?? []).filter(
+                (e2) => e2.type !== "assistant/chunk" && e2.type !== "session/end-seed"
+              );
+              const limit2 = Number.isInteger(msg.limit) && msg.limit > 0 ? msg.limit : 200;
+              const tail = events.slice(-limit2);
+              const hasMore = events.length > tail.length;
+              const nextSeq = hasMore ? tail[0].seq : void 0;
+              const stats = resolveSessionStats(getSessionMeta(msg.id).stats, events, msg.id);
+              post({ t: "history", sessionId: msg.id, events: tail, hasMore, nextSeq, stats });
+            }
+          } catch (error51) {
+            log("warn", "restorePreview preview failed", error51 instanceof Error ? error51.message : String(error51));
+            post({ t: "viewSessionFailed", id: msg.id, error: error51 instanceof Error ? error51.message : String(error51) });
+            break;
+          }
+          try {
+            const meta3 = getSessionMeta(msg.id);
+            if (handle !== void 0) await handle.dispose();
+            const resumed = await resumeAgent(
+              ctx,
+              msg.id,
+              {
+                provider: meta3.provider || void 0,
+                // 不把 env.DSH_VSCODE_MODEL 作为 options.model 传入：meta 缺失
+                // 时由 resumeAgent 内部回退到 agentDefaultModel 的持久化默认，
+                // 保证 provider/model 同源（避免 meta.provider=zai-free 却拼上
+                // 扩展配置固定 model 的错配）。
+                model: meta3.model || void 0,
+                reasoningEffort: meta3.reasoningEffort || void 0
+              },
+              pump2,
+              approvals
+            );
+            handle = resumed.handle;
+            agent = resumed.agent;
+            selection = resumed.selection;
+            resetStepBudget = resumed.resetStepBudget;
+            if (meta3.workMode === "multi" || meta3.workMode === "single") {
+              workMode = meta3.workMode;
+              post({ t: "workModeChanged", mode: workMode });
+            }
+            if (typeof meta3.title === "string" && meta3.title.trim() !== "") {
+              const titleSvc = ctx.get("sessionTitle");
+              if (titleSvc !== void 0 && typeof titleSvc.rename === "function") {
+                Promise.resolve().then(() => titleSvc.rename(agent.session, meta3.title)).catch((error51) => {
+                  log("warn", "session title restore failed", error51 instanceof Error ? error51.message : String(error51));
+                });
+              }
+            }
+            post({
+              t: "ready",
+              sessionId: agent.session.id,
+              cwd: process.cwd(),
+              provider: agent.options.provider,
+              model: agent.options.model,
+              version: CORE_VERSION,
+              sessionTitle: await currentSessionTitle(ctx, agent)
+            });
+          } catch (error51) {
+            log("warn", "restorePreview resume failed", error51 instanceof Error ? error51.message : String(error51));
+            post({ t: "sessionResumed", id: msg.id, ok: false, error: error51 instanceof Error ? error51.message : String(error51) });
           }
           break;
         }
@@ -140772,14 +141067,16 @@ async function main() {
             post({ t: "sessionResumed", id: msg.id, ok: false, error: "invalid session id" });
             break;
           }
-          if (handle !== void 0) await handle.dispose();
           const meta3 = getSessionMeta(msg.id);
+          if (handle !== void 0) await handle.dispose();
+          const tResume0 = Date.now();
+          log("info", `resumeSession start: ${msg.id}`);
           const resumed = await resumeAgent(
             ctx,
             msg.id,
             {
               provider: meta3.provider || void 0,
-              model: meta3.model || msg.model || env2.DSH_VSCODE_MODEL,
+              model: meta3.model || msg.model || void 0,
               reasoningEffort: meta3.reasoningEffort || void 0
             },
             pump2,
@@ -140794,13 +141091,11 @@ async function main() {
             post({ t: "workModeChanged", mode: workMode });
           }
           if (typeof meta3.title === "string" && meta3.title.trim() !== "") {
-            try {
-              const titleSvc = ctx.get("sessionTitle");
-              if (titleSvc !== void 0 && typeof titleSvc.rename === "function") {
-                await titleSvc.rename(agent.session, meta3.title);
-              }
-            } catch (error51) {
-              log("warn", "session title restore failed", error51 instanceof Error ? error51.message : String(error51));
+            const titleSvc = ctx.get("sessionTitle");
+            if (titleSvc !== void 0 && typeof titleSvc.rename === "function") {
+              Promise.resolve().then(() => titleSvc.rename(agent.session, meta3.title)).catch((error51) => {
+                log("warn", "session title restore failed", error51 instanceof Error ? error51.message : String(error51));
+              });
             }
           }
           const allEvents = agent.session.events.filter(
@@ -140810,7 +141105,7 @@ async function main() {
           const tail = allEvents.slice(-limit2);
           const hasMore = allEvents.length > tail.length;
           const nextSeq = hasMore ? tail[0].seq : void 0;
-          const stats = computeSessionStats(allEvents);
+          const stats = resolveSessionStats(meta3.stats, allEvents, agent.session.id);
           post({ t: "history", sessionId: agent.session.id, events: tail, hasMore, nextSeq, stats });
           post({
             t: "ready",
@@ -140822,6 +141117,10 @@ async function main() {
             sessionTitle: await currentSessionTitle(ctx, agent)
           });
           post({ t: "sessionResumed", id: msg.id, ok: true });
+          log(
+            "info",
+            `resumeSession done: ${msg.id} in ${Date.now() - tResume0}ms (${allEvents.length} events)`
+          );
           break;
         }
         case "viewSession": {
@@ -140830,20 +141129,20 @@ async function main() {
             break;
           }
           try {
-            const query = ctx.get("sessionQuery");
-            if (query === void 0 || typeof query.readSession !== "function") {
-              post({ t: "viewSessionFailed", id: msg.id, error: "sessionQuery unavailable" });
+            const persistence = ctx.get("sessionPersistence");
+            if (persistence === void 0 || typeof persistence.inspect !== "function") {
+              post({ t: "viewSessionFailed", id: msg.id, error: "sessionPersistence unavailable" });
               break;
             }
-            const snap = await query.readSession(SessionId(msg.id));
-            const events = (snap.events ?? []).filter(
+            const inspected = await persistence.inspect(SessionId(msg.id));
+            const events = (inspected.events ?? []).filter(
               (e2) => e2.type !== "assistant/chunk" && e2.type !== "session/end-seed"
             );
             const limit2 = Number.isInteger(msg.limit) && msg.limit > 0 ? msg.limit : 200;
             const tail = events.slice(-limit2);
             const hasMore = events.length > tail.length;
             const nextSeq = hasMore ? tail[0].seq : void 0;
-            const stats = computeSessionStats(events);
+            const stats = resolveSessionStats(getSessionMeta(msg.id).stats, events, msg.id);
             post({ t: "history", sessionId: msg.id, events: tail, hasMore, nextSeq, stats });
             post({ t: "viewSession", id: msg.id });
           } catch (error51) {
@@ -140873,10 +141172,10 @@ async function main() {
             });
           } else if (typeof msg.sessionId === "string" && msg.sessionId !== "") {
             try {
-              const query = ctx.get("sessionQuery");
-              if (query !== void 0 && typeof query.readSession === "function") {
-                const snap = await query.readSession(SessionId(msg.sessionId));
-                const allEvents = (snap.events ?? []).filter(
+              const persistence = ctx.get("sessionPersistence");
+              if (persistence !== void 0 && typeof persistence.inspect === "function") {
+                const inspected = await persistence.inspect(SessionId(msg.sessionId));
+                const allEvents = (inspected.events ?? []).filter(
                   (e2) => e2.type !== "assistant/chunk" && e2.type !== "session/end-seed"
                 );
                 const older = allEvents.filter((e2) => e2.seq < msg.beforeSeq).slice(-limit2);
@@ -140911,6 +141210,7 @@ async function main() {
             break;
           }
           updateSessionMeta(msg.id, { title });
+          invalidateSessionsCache();
           if (agent !== void 0 && agent.session.id === msg.id) {
             try {
               const titleSvc = ctx.get("sessionTitle");
@@ -140926,6 +141226,7 @@ async function main() {
         }
         case "deleteSession": {
           const result = await deleteSession(ctx, msg.id);
+          if (result.ok) invalidateSessionsCache();
           if (result.ok && agent !== void 0 && agent.session.id === msg.id) {
             if (handle !== void 0) await handle.dispose();
             handle = void 0;
@@ -140957,7 +141258,7 @@ async function main() {
               break;
             }
             const base = defaultModel.currentSelection();
-            const provider = typeof msg.provider === "string" && msg.provider !== "" ? msg.provider : base.provider;
+            let provider = typeof msg.provider === "string" && msg.provider !== "" ? msg.provider : base.provider;
             let model = typeof msg.model === "string" && msg.model !== "" ? msg.model : base.model;
             if (model !== "") {
               try {
@@ -140976,11 +141277,30 @@ async function main() {
                         )
                       );
                       model = first;
+                    } else {
+                      log(
+                        "warn",
+                        L(
+                          `\u63D0\u4F9B\u5546 ${provider} \u65E0\u53EF\u7528\u6A21\u578B\uFF0C\u5DF2\u56DE\u9000\u5230 ${base.provider}/${base.model}`,
+                          `provider ${provider} has no usable model; reverted to ${base.provider}/${base.model}`
+                        )
+                      );
+                      provider = base.provider;
+                      model = base.model;
                     }
                   }
                 }
               } catch (error51) {
-                log("warn", "setModel provider/model consistency check failed", error51 instanceof Error ? error51.message : String(error51));
+                log(
+                  "warn",
+                  L(
+                    `\u65E0\u6CD5\u6821\u9A8C ${provider}/${model} \u7684\u5F52\u5C5E\uFF0C\u5DF2\u56DE\u9000\u5230 ${base.provider}/${base.model}`,
+                    `cannot verify ${provider}/${model}; reverted to ${base.provider}/${base.model}`
+                  ),
+                  error51 instanceof Error ? error51.message : String(error51)
+                );
+                provider = base.provider;
+                model = base.model;
               }
             }
             const baseEffort = normalizeEffort(base.reasoningEffort);
@@ -141226,14 +141546,14 @@ async function main() {
                 text: `Compacted ${result.shadowedSeqs.length} history items (~${result.shadowedTokenCount} tokens).`
               });
               try {
-                const allEvents = agent.session.events.filter(
-                  (e2) => e2.type !== "assistant/chunk" && e2.type !== "session/end-seed"
-                );
-                const stats = computeSessionStats(allEvents);
-                if (Number.isFinite(stats.lastRequestInput) && stats.lastRequestInput > 0 && result.shadowedTokenCount > 0) {
-                  stats.lastRequestInput = Math.max(0, stats.lastRequestInput - result.shadowedTokenCount);
+                const currentStats = getSessionMeta(agent.session.id).stats;
+                if (currentStats && Number.isFinite(currentStats.lastSeq)) {
+                  const adjusted = { ...currentStats };
+                  if (Number.isFinite(adjusted.lastRequestInput) && adjusted.lastRequestInput > 0 && result.shadowedTokenCount > 0) {
+                    adjusted.lastRequestInput = Math.max(0, adjusted.lastRequestInput - result.shadowedTokenCount);
+                  }
+                  post({ t: "stats", stats: adjusted });
                 }
-                post({ t: "stats", stats });
               } catch (error51) {
                 log("warn", "compact stats refresh failed", error51 instanceof Error ? error51.message : String(error51));
               }
