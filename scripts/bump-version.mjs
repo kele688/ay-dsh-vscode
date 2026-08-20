@@ -1,18 +1,20 @@
 #!/usr/bin/env node
 /**
- * bump-version.mjs — 版本号自动递增（semver）并同步 CHANGELOG。
+ * bump-version.mjs — 版本号自动递增（semver）并同步 CHANGELOG（中英双语文件）。
  *
- * 同步三处版本号：
+ * 同步三处版本号 + 两个 CHANGELOG：
  *   1. package.json 的 version（VSIX 打包/市场版本）
- *   2. host/agent-host.mjs 的 CORE_VERSION（宿主上报 UI 的版本，曾与 package.json
- *      不一致，必须同步）
- *   3. CHANGELOG.md 顶部追加一条版本记录（不存在则创建）
+ *   2. host/agent-host.mjs 的 CORE_VERSION（宿主上报 UI 的版本，必须同步）
+ *   3. CHANGELOG.md（英文版，对外默认）
+ *   4. CHANGELOG.zh-CN.md（中文版，按用户本地语言引用展示）
  *
  * 用法：
- *   node scripts/bump-version.mjs [patch|minor|major] [--message "变更1；变更2"]
- *   node scripts/bump-version.mjs --dry-run ...   # 只打印将写入的内容，不写文件
+ *   node scripts/bump-version.mjs [patch|minor|major] \
+ *     --message-en "change1; change2" --message-zh "变更1；变更2"
+ *   node scripts/bump-version.mjs --dry-run ...   # 只打印，不写文件
  *
- * 说明：摘要默认取 --message；未提供时使用通用文案（建议发布前用 --message 补充）。
+ * 说明：--message-en / --message-zh 分别提供英文、中文摘要；未提供某一语言时
+ *   使用该语言的通用文案（建议发布前都补充）。
  */
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
 import { join, dirname } from "node:path";
@@ -22,11 +24,13 @@ const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const pkgPath = join(root, "package.json");
 const hostPath = join(root, "host", "agent-host.mjs");
 const changelogPath = join(root, "CHANGELOG.md");
+const changelogZhPath = join(root, "CHANGELOG.zh-CN.md");
 
 const args = process.argv.slice(2);
 const level = (args.find((a) => ["patch", "minor", "major"].includes(a)) ?? "patch");
 const dryRun = args.includes("--dry-run");
-const messageArg = args[args.indexOf("--message") + 1];
+const enArg = args[args.indexOf("--message-en") + 1];
+const zhArg = args[args.indexOf("--message-zh") + 1];
 
 function bumpSemver(v, lvl) {
   const m = /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$/.exec(String(v).trim());
@@ -48,17 +52,25 @@ const oldVersion = pkg.version;
 const newVersion = bumpSemver(oldVersion, level);
 const date = now();
 
-// ---- 组装摘要 ----
-const summaryLines = (messageArg ?? "常规更新（bug 修复与体验改进）")
-  .split(/[；;]/)
+// ---- 组装双语摘要 ----
+const enLines = (enArg ?? "Routine update (bug fixes and experience improvements)")
+  .split(/[;；]/)
+  .map((s) => s.trim())
+  .filter(Boolean)
+  .map((s) => `- ${s}`);
+const zhLines = (zhArg ?? "常规更新（bug 修复与体验改进）")
+  .split(/[;；]/)
   .map((s) => s.trim())
   .filter(Boolean)
   .map((s) => `- ${s}`);
 
-// ---- CHANGELOG 条目 ----
-const entry =
+// ---- 双语 CHANGELOG 条目 ----
+const entryEn =
   `## [${newVersion}] - ${date}\n\n` +
-  `${summaryLines.join("\n")}\n\n`;
+  `${enLines.join("\n")}\n\n`;
+const entryZh =
+  `## [${newVersion}] - ${date}\n\n` +
+  `${zhLines.join("\n")}\n\n`;
 
 // ---- 准备写入 ----
 const hostSrc = readFileSync(hostPath, "utf8");
@@ -70,19 +82,24 @@ if (!hostNext.includes(`"${newVersion}"`)) {
   throw new Error(`host/agent-host.mjs 中未找到 CORE_VERSION 常量，无法同步版本`);
 }
 
-let changelog = existsSync(changelogPath) ? readFileSync(changelogPath, "utf8") : "";
-if (!changelog.startsWith("# Changelog")) {
-  changelog = "# Changelog\n\n本文件由 scripts/bump-version.mjs 维护。\n\n" + changelog;
+/** 更新一个 CHANGELOG 文件：不存在则创建（含标题/维护注释），在标题后插入新条目。 */
+function writeChangelog(path, title, note, entry) {
+  let content = existsSync(path) ? readFileSync(path, "utf8") : "";
+  if (!content.startsWith(title)) {
+    content = `${title}\n\n${note}\n\n` + content;
+  }
+  const next = content.replace(
+    new RegExp(`(${title.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}[^\\n]*\\n\\n)`),
+    `$1${entry}`
+  );
+  writeFileSync(path, next, "utf8");
 }
-const changelogNext = changelog.replace(
-  /(# Changelog[^\n]*\n\n)/,
-  `$1${entry}`
-);
 
 if (dryRun) {
   console.log(`[dry-run] package.json  version: ${oldVersion} -> ${newVersion}`);
   console.log(`[dry-run] agent-host.mjs CORE_VERSION: ${oldVersion} -> ${newVersion}`);
-  console.log(`[dry-run] CHANGELOG.md 新增条目:\n${entry.trim()}`);
+  console.log(`[dry-run] CHANGELOG.md 新增条目 (EN):\n${entryEn.trim()}`);
+  console.log(`[dry-run] CHANGELOG.zh-CN.md 新增条目 (ZH):\n${entryZh.trim()}`);
   console.log("[dry-run] 未写入任何文件");
   process.exit(0);
 }
@@ -91,7 +108,13 @@ if (dryRun) {
 pkg.version = newVersion;
 writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + "\n", "utf8");
 writeFileSync(hostPath, hostNext, "utf8");
-writeFileSync(changelogPath, changelogNext, "utf8");
+writeChangelog(changelogPath, "# Changelog", "Maintained by scripts/bump-version.mjs.", entryEn);
+writeChangelog(
+  changelogZhPath,
+  "# 更新日志",
+  "本文件由 scripts/bump-version.mjs 维护；按用户本地语言（zh-CN）引用展示。",
+  entryZh
+);
 
 console.log(`✅ 版本 ${oldVersion} -> ${newVersion}（${level}）`);
-console.log(`   已同步：package.json / host/agent-host.mjs (CORE_VERSION) / CHANGELOG.md`);
+console.log(`   已同步：package.json / host/agent-host.mjs (CORE_VERSION) / CHANGELOG.md (EN) / CHANGELOG.zh-CN.md (ZH)`);

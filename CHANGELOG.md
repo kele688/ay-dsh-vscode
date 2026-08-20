@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.3.0] - 2026-08-20
+
+- Multi-provider LLM routing (DeepSeek/Zhipu/ZAI) with in-session model switching
+- session restore via history preview + immediate agent resume (zero-wait first message)
+- per-turn efficiency system (static rules in system prompt + dynamic STEPS_USED/TOOLS_USED/ELAPSED_SEC fields + mandatory wrap-up report)
+- stats strongly synced to log flush
+- history list & restore speed (zero-decompression scan + shared prepared cache)
+- optimistic delete UX with status-bar hints
+- unified sub-session naming (subsession_ + sessionId)
+- bilingual CHANGELOG (en/zh-CN)
+
 ## [0.2.1] - 2026-08-17
 
 - cross-platform native packaging (one VSIX for win32/linux/darwin)

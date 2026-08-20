@@ -78,11 +78,14 @@
       viewTitle: "只读浏览该子代理会话的历史（不成为对话宿主）",
       viewingSession: (id) => `浏览模式：正在查看子代理会话 ${id}（只读，切换真实会话后恢复）`,
       viewFailed: "浏览会话失败，已恢复原会话",
-      restoring: "正在恢复会话…",
+      restoring: "正在恢复会话…（长会话可能需要几秒）",
       restartingHint: "正在恢复原会话…",
       del: "🗑 删除",
       delTitle: "删除此会话（不可恢复）",
       confirmDel: "确认删除？",
+      deleting: "正在删除会话…",
+      deleted: "已删除会话",
+      deleteFailed: (e) => `删除失败：${e}`,
       loading: "加载中…",
       loadTimeout: "加载超时：宿主未响应，请稍候点 ⟳ 刷新，或查看输出通道日志",
       loadTimeoutHint: "加载超时：宿主正在启动或未响应，请稍候点击 ⟳ 刷新",
@@ -155,11 +158,14 @@
       viewTitle: "Read-only: browse this subagent session history (does not become the host)",
       viewingSession: (id) => `Browsing subagent session ${id} (read-only; resume a real session to continue)`,
       viewFailed: "Failed to browse session — restored the original session",
-      restoring: "Restoring session…",
+      restoring: "Restoring session… (long sessions may take a few seconds)",
       restartingHint: "Restoring the previous session…",
       del: "🗑 Delete",
       delTitle: "Delete this session (cannot be undone)",
       confirmDel: "Confirm delete?",
+      deleting: "Deleting session…",
+      deleted: "Session deleted",
+      deleteFailed: (e) => `Delete failed: ${e}`,
       loading: "Loading…",
       loadTimeout: "Load timed out: host did not respond. Click ⟳ to refresh or check the output channel.",
       loadTimeoutHint: "Load timed out: host is starting or not responding — click ⟳ to retry",
@@ -694,7 +700,24 @@
 
   /* ---------------- 消息渲染 ---------------- */
 
+  /** 系统指令消息前缀（宿主 pre-step 注入的 [本轮指引]/[本步指引]/[达限警示]，
+   *  模型在上下文中可见，但不应显示在对话界面）。 */
+  const SYSTEM_DIRECTIVE_PREFIXES = [
+    "[本轮指引]",
+    "[本步指引]",
+    "[达限警示]",
+    "[Round guide]",
+    "[Step guide]",
+    "[Limit warning]",
+  ];
+  function isSystemDirective(text) {
+    const t = String(text ?? "");
+    return SYSTEM_DIRECTIVE_PREFIXES.some((p) => t.startsWith(p));
+  }
+
   function addUserMessage(text) {
+    // 系统指令（宿主自动注入）：模型可见、界面不渲染
+    if (isSystemDirective(text)) return;
     const wrap = el("div", "msg user");
     const body = el("div", "bubble");
     body.innerHTML = renderMarkdown(text);
@@ -1115,8 +1138,11 @@
     btnDelete.addEventListener("click", () => {
       if (confirmDeleteId === s.id) {
         confirmDeleteId = null;
+        // **乐观移除**：确认后立即清除该行（删除在后台进行，结果状态栏提示）——
+        // 避免删除耗时期间列表仍显示、用户误以为没删而重复点击。
+        row.remove();
+        setHint(t("deleting"));
         vscode.postMessage({ t: "deleteSession", id: s.id });
-        btnDelete.textContent = t("del");
       } else {
         confirmDeleteId = s.id;
         btnDelete.textContent = t("confirmDel");
@@ -1174,7 +1200,9 @@
     historyPanel.classList.remove("hidden");
     historyList.innerHTML = "";
     historyList.appendChild(el("div", "history-empty", t("loading")));
-    vscode.postMessage({ t: "history" });
+    // 注意：必须发 historyRefresh（扩展侧只处理该消息；旧 history 消息已废弃
+    // 无人处理，曾导致列表卡"加载中"直到 3 秒重试兜底）
+    vscode.postMessage({ t: "historyRefresh" });
     // 兜底：15 秒未收到结果则提示失败，避免永远"加载中"
     clearTimeout(historyLoadTimer);
     historyLoadTimer = setTimeout(() => {
@@ -1423,14 +1451,9 @@
       }
       case "sessionDeleted": {
         closeRenameInline();
-        if (msg.ok) {
-          // 刷新列表（若面板仍打开）
-          if (!historyPanel.classList.contains("hidden")) {
-            vscode.postMessage({ t: "historyRefresh" });
-          }
-        } else {
-          addErrorMessage(t("deleteFailed", msg.error ?? "unknown error"));
-        }
+        // 删除结果仅状态栏提示（不弹框）；**不自动刷新列表**——行已乐观移除，
+        // 刷新交给用户主动操作（避免幽灵行/多此一举）
+        setHint(msg.ok ? t("deleted") : t("deleteFailed", msg.error ?? "unknown error"));
         break;
       }
       case "sessionRenamed": {
@@ -1448,6 +1471,19 @@
           }
         } else {
           addErrorMessage(t("renameFailed", msg.error ?? "unknown error"));
+        }
+        break;
+      }
+      case "sessionTitleSynced": {
+        // 内核自动标题同步（fallback 截断 / LLM 总结）：仅更新标题栏与列表，
+        // 不打断正在进行的重命名输入（区别于 sessionRenamed 的 closeRenameInline）。
+        if (msg.id === state.sessionId && msg.title) {
+          sessionTitleEl.textContent = msg.title;
+          sessionTitleEl.title = msg.title;
+          if (state.stats) state.stats = { ...state.stats, title: msg.title };
+        }
+        if (!historyPanel.classList.contains("hidden")) {
+          vscode.postMessage({ t: "historyRefresh" });
         }
         break;
       }

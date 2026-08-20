@@ -64,6 +64,7 @@ export type HostFrame =
   | { t: "viewSession"; id: string }
   | { t: "viewSessionFailed"; id: string; error?: string }
   | { t: "sessionRenamed"; id: string; ok: boolean; title?: string; error?: string }
+  | { t: "sessionTitleSynced"; id: string; title: string }
   | { t: "sessionDeleted"; id: string; ok: boolean; error?: string }
   | { t: "sessionExported"; id: string; ok: boolean; path?: string; error?: string }
   | { t: "modelInfo"; providers: { id: string; name: string }[]; models: string[]; providerModels?: Record<string, { id: string; name: string }[]>; current: { provider: string; model: string; reasoningEffort?: string } }
@@ -86,6 +87,7 @@ export type ExtensionFrame =
   | { t: "newSession"; model?: string }
   | { t: "listSessions" }
   | { t: "resumeSession"; id: string; model?: string; limit?: number }
+  | { t: "restorePreview"; id: string; limit?: number }
   | { t: "viewSession"; id: string; limit?: number }
   | { t: "renameSession"; id: string; title: string }
   | { t: "loadMoreHistory"; id: number; beforeSeq: number; limit?: number; sessionId?: string }
@@ -133,10 +135,10 @@ export type WebviewMessage =
   | { t: "newSession" }
   | { t: "configure" }
   | { t: "openWorkspace" }
-  | { t: "history" }
   | { t: "historyClose" }
   | { t: "historyRefresh" }
   | { t: "resumeSession"; id: string }
+  | { t: "restorePreview"; id: string }
   | { t: "viewSession"; id: string }
   | { t: "renameSession"; id: string; title: string }
   | { t: "loadMoreHistory"; beforeSeq: number; sessionId?: string }
@@ -184,4 +186,5 @@ export type ExtensionToWebview =
   | { t: "viewSession"; id: string }
   | { t: "sessionDeleted"; id: string; ok: boolean; error?: string }
   | { t: "sessionRenamed"; id: string; ok: boolean; title?: string; error?: string }
+  | { t: "sessionTitleSynced"; id: string; title: string }
   | { t: "sessionExported"; ok: boolean; path?: string; error?: string };

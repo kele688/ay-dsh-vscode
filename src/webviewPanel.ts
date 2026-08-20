@@ -449,14 +449,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         this.hostReady = true;
         this.hostState = "ready";
         this.deps.onHostReady?.();
-        // 宿主就绪但会话为空（配置变更重启 / VS Code Reload 后重启）：
-        // 自动恢复原会话（storedSessionId 在会话存续期间恒定，此处直接读取）。
-        // 先推送 restarting（UI 锁定发送、清空旧列表），再发起 resume。
+        // 宿主就绪但会话为空（VS Code Reload / 配置变更重启）：自动恢复上次
+        // 会话——**恢复预览**（只读分页秒显历史，agent 懒 resume 发消息时），
+        // 借鉴 dsh web（inspect 只读 + 懒 resume），不阻塞界面（docs 2.24）。
         if (!e.sessionId && this.storedSessionId) {
           this.push({ t: "restarting" });
-          this.host?.resumeSession(this.storedSessionId);
+          this.host?.restorePreview(this.storedSessionId);
         } else if (e.sessionId) {
-          // 有真实会话：持久化当前会话 id（Reload 后恢复用）
+          // 有真实会话：持久化当前会话 id（Reload 后自动恢复用）
           this.persistSessionId(e.sessionId);
         }
         this.lastBootstrap = {
@@ -606,6 +606,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             8000
           );
         }
+        break;
+      case "sessionTitleSynced":
+        // 内核自动标题同步（fallback/LLM 总结）：轻量透传 webview 更新标题栏
+        // （不同于 sessionRenamed：不打断用户正在进行的重命名输入）
+        this.push({ t: "sessionTitleSynced", id: e.id, title: e.title });
         break;
       case "sessionExported": {
         // 导出完成/失败提示走状态栏（不弹通知框）；成功时在系统浏览器中打开完整历史网页
