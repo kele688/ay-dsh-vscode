@@ -90,6 +90,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
   /** 宿主自动重启计数（连续失败多次后放弃，避免死循环）。 */
   private hostRestartTimer: NodeJS.Timeout | undefined;
+  /**
+   * assistant-delta 微批处理：DSH 宿主以极高频推送文本/思考增量（100+ tok/s 时
+   * 每秒上百条），每条单独 postMessage 在 Remote-SSH 下经远程 IPC + 网络帧传输
+   * 会被明显放大。这里按 ~40ms 聚合为一条消息推送（本地同样受益）。
+   */
+  private pendingDelta: { text: string; reasoning: string } | null = null;
+  private deltaFlushTimer: NodeJS.Timeout | null = null;
+  private readonly DELTA_BATCH_MS = 40;
 
   constructor(private readonly deps: ChatViewDeps) {
     this.approvalStatusItem = undefined;
@@ -478,7 +486,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         break;
       }
       case "view":
-        this.push({ t: "event", e: e.event });
+        // 流式增量做微批处理（Remote-SSH 下消息数量是主要开销）；
+        // 其他事件（含 tool/call、assistant/message、turn/end）到达时先冲刷累积，
+        // 保证"文字先显示，再出现工具块"的时序不被打乱。
+        if (e.event.kind === "assistant-delta") {
+          this.queueDelta(e.event);
+        } else {
+          this.flushDelta();
+          this.push({ t: "event", e: e.event });
+        }
         break;
       case "status":
         this.lastStatus = e.status;
@@ -668,6 +684,28 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   private push(msg: ExtensionToWebview): void {
     void this.view?.webview.postMessage(msg);
+  }
+
+  /** 聚合一条流式增量；未在飞时启动 ~40ms 定时器批量推送。 */
+  private queueDelta(d: { kind: "assistant-delta"; text: string; reasoning: string; ts: number }): void {
+    if (!this.pendingDelta) this.pendingDelta = { text: "", reasoning: "" };
+    this.pendingDelta.text += d.text;
+    this.pendingDelta.reasoning += d.reasoning;
+    if (!this.deltaFlushTimer) {
+      this.deltaFlushTimer = setTimeout(() => this.flushDelta(), this.DELTA_BATCH_MS);
+    }
+  }
+
+  /** 立即推送累积的增量（非 delta 事件到达 / 收尾时调用，确保不丢尾部）。 */
+  private flushDelta(): void {
+    if (this.deltaFlushTimer) {
+      clearTimeout(this.deltaFlushTimer);
+      this.deltaFlushTimer = null;
+    }
+    if (!this.pendingDelta) return;
+    const d = this.pendingDelta;
+    this.pendingDelta = null;
+    this.push({ t: "event", e: { kind: "assistant-delta", text: d.text, reasoning: d.reasoning, ts: Date.now() } });
   }
 
   /** 推送 DSH 升级候选状态到 webview（顶栏横幅；候选变化或 webview 就绪时调用）。 */
