@@ -774,11 +774,14 @@
    * 新的实现：
    * - delta 文本先以文本节点**即时廉价追加**（O(delta)，不阻塞 UI），
    *   保证"文字先出来"，链式流畅；
-   * - markdown 全量格式化交给 rAF（与浏览器帧同步，~16ms 一次）节流执行，
-   *   定时器兜底（webview 不可见时 rAF 暂停，保证不积压过久）。
+   * - markdown 全量格式化交给**间隔节流**（≥80ms 一次）执行，连续输出时
+   *   渲染频率 ≤12.5 次/秒（Remote-SSH 下大幅减少每帧画面传输开销）。
    */
   let streamRenderRaf = null;
   let streamRenderTimer = null;
+  let lastStreamRenderAt = 0;
+  /** 全量 markdown 重渲染的最小间隔（ms）：模型高速输出时把渲染频率压到 ≤12.5 次/秒。 */
+  const STREAM_RENDER_MIN_GAP_MS = 80;
 
   function scheduleStreamRender() {
     if (streamRenderTimer !== null) return; // 已调度
@@ -787,16 +790,16 @@
       streamRenderTimer = null;
       flushStreamRender();
     };
-    if (typeof requestAnimationFrame === "function") {
-      streamRenderRaf = requestAnimationFrame(render);
-      streamRenderTimer = setTimeout(render, 60); // rAF 兜底（视图隐藏时）
-    } else {
-      streamRenderTimer = setTimeout(render, 33);
-    }
+    // 间隔节流：距上次渲染不足 80ms 时推迟到满 80ms 再执行。
+    // 连续输出时文本仍以文本节点即时追加（先出字），全量 markdown 格式化
+    // 低频执行——Remote-SSH 下每次全量 innerHTML 重建都会放大为可见延迟。
+    const delay = Math.max(0, STREAM_RENDER_MIN_GAP_MS - (Date.now() - lastStreamRenderAt));
+    streamRenderTimer = setTimeout(render, delay);
   }
 
   /** 立即执行一次全量 markdown 渲染（finalize / 切换气泡前调用，防丢尾部）。 */
   function flushStreamRender() {
+    lastStreamRenderAt = Date.now();
     if (streamRenderRaf !== null && typeof cancelAnimationFrame === "function") {
       cancelAnimationFrame(streamRenderRaf);
       streamRenderRaf = null;
