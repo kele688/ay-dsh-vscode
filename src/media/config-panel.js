@@ -35,6 +35,10 @@
     modelId: zh ? "模型 ID" : "Model ID",
     modelDisplayName: zh ? "显示名称" : "Display name",
     contextWindow: zh ? "上下文窗口" : "Context window",
+    modalities: zh ? "模态能力" : "Modalities",
+    modText: zh ? "纯文本（text）" : "Text only",
+    modTextImage: zh ? "文本 + 图片（text, image）" : "Text + image",
+    modReadonly: zh ? "知名模型模态能力由系统确定（只读）" : "Modality is provided by the vendor (read-only)",
     maxOut: zh ? "最大输出" : "Max output",
     modelEditTitle: zh ? "编辑模型" : "Edit model",
     tokenSizePlaceholder: zh ? "纯数字 或 带单位，如 200k / 256K / 1m" : "Plain number or unit suffix, e.g. 200k / 256K / 1m",
@@ -179,9 +183,11 @@
     document.querySelectorAll(".cfg-group").forEach((el) => {
       el.classList.toggle("active", el.dataset.group === btn.dataset.group);
     });
-    // "版本升级"组无可保存表单：隐藏底部保存按钮，切走恢复
+    // "模型配置"/"版本升级"组：操作均在各自弹窗/表单内保存，隐藏底部"保存并应用"；
+    // "运行环境"/"控制参数"组保留（有可保存的运行参数）。切走恢复。
     const footer = saveBtn.closest(".cfg-footer");
-    if (footer) footer.style.display = btn.dataset.group === "upgrade" ? "none" : "";
+    const group = btn.dataset.group;
+    if (footer) footer.style.display = group === "upgrade" || group === "model" ? "none" : "";
   });
   document.querySelectorAll(".cfg-tabs").forEach((tabs) => {
     tabs.addEventListener("click", (ev) => {
@@ -517,7 +523,7 @@
           btnEdit.textContent = L.edit;
           btnEdit.addEventListener("click", () => {
             openModelEditor(id, currentModelMeta.get(id), (meta2) => {
-              currentModelMeta.set(id, { id, displayName: meta2.displayName, contextWindow: meta2.contextWindow, maxOutput: meta2.maxOutput });
+              currentModelMeta.set(id, { id, displayName: meta2.displayName, contextWindow: meta2.contextWindow, maxOutput: meta2.maxOutput, inputModalities: meta2.inputModalities });
               renderCustomModels();
             }, true, true);
           });
@@ -552,7 +558,7 @@
           null,
           (meta) => {
             if (!meta.id) return;
-            currentModelMeta.set(meta.id, { id: meta.id, displayName: meta.displayName, contextWindow: meta.contextWindow, maxOutput: meta.maxOutput });
+            currentModelMeta.set(meta.id, { id: meta.id, displayName: meta.displayName, contextWindow: meta.contextWindow, maxOutput: meta.maxOutput, inputModalities: meta.inputModalities });
             if (!customModels.includes(meta.id)) customModels.push(meta.id);
             renderCustomModels();
           },
@@ -585,6 +591,7 @@
             displayName: meta?.displayName,
             contextWindow: meta?.contextWindow,
             maxOutput: meta?.maxOutput,
+            inputModalities: Array.isArray(meta?.inputModalities) ? meta.inputModalities : undefined,
           };
         });
         providerId = $("pfProviderId").value;
@@ -650,6 +657,14 @@
           <input type="text" id="meMax" value="${esc(maxVal)}" placeholder="${esc(L.tokenSizePlaceholder)}" spellcheck="false">
           <span class="token-note hidden" id="meMaxNote"></span>
         </div>
+        <div class="field">
+          <label>${L.modalities}${isCustom ? `（${L.optional}）` : ""}</label>
+          <select id="meModal"${isCustom ? "" : " disabled"}>
+            <option value="text">${L.modText}</option>
+            <option value="text,image">${L.modTextImage}</option>
+          </select>
+          ${isCustom ? "" : `<span class="hint">${L.modReadonly}</span>`}
+        </div>
         <div class="row">
           <button type="button" class="primary" id="meSave">${L.saveProvider}</button>
           <button type="button" class="secondary" id="meCancel">${L.cancel}</button>
@@ -660,6 +675,11 @@
       if (e.target === overlay) overlay.remove();
     });
     const $me = (id) => overlay.querySelector(`#${id}`);
+
+    // 回填模态能力：模型已存/查出的 inputModalities（含 image 则回填"文本+图片"）
+    const mods = Array.isArray(meta?.inputModalities) ? meta.inputModalities : (isCustom ? ["text"] : ["text"]);
+    const modalSel = $me("meModal");
+    if (modalSel) modalSel.value = mods.includes("image") ? "text,image" : "text";
 
     // 本提供商范围内其它模型的 id / 名称集合（查重用；排除当前编辑的模型自身）
     const otherIds = new Set();
@@ -784,6 +804,7 @@
         displayName: $me("meName").value.trim(),
         contextWindow: $me("meCtx").value.trim() || undefined,
         maxOutput: $me("meMax").value.trim() || undefined,
+        inputModalities: ($me("meModal").value || "text").split(","),
       });
       overlay.remove();
     });
@@ -889,6 +910,7 @@
             displayName: m.name,
             contextWindow: fmtTokenSize(m.contextWindow),
             maxOutput: fmtTokenSize(m.maxTokens),
+            inputModalities: Array.isArray(m.inputModalities) ? m.inputModalities : undefined,
           });
         }
         const preselect = new Set(
@@ -914,6 +936,15 @@
           cb.dataset.model = m.id;
           cb.checked = preselect.has(m.id);
           label.append(cb, document.createTextNode(` ${m.name || m.id}`));
+          // 模态标识：知名模型携带的 inputModalities 含 image → 标注多模态
+          const mods = Array.isArray(m.inputModalities) ? m.inputModalities : [];
+          if (mods.includes("image")) {
+            const badge = document.createElement("span");
+            badge.className = "image-badge";
+            badge.textContent = "📷";
+            badge.title = L.modTextImage;
+            label.appendChild(badge);
+          }
           const btnEdit = document.createElement("button");
           btnEdit.type = "button";
           btnEdit.className = "secondary small";

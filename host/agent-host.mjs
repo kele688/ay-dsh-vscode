@@ -647,9 +647,9 @@ function stepLimitWrapUpMessage(limit, steps, tools, elapsedSec) {
       "单轮步数上限用于控制单次请求规模、防止工具循环失控，因此本轮工作到此为止。" +
       "请立即停止进一步推理，在本回复中给出最终答复，**第一行**必须以如下格式开头：" +
       "`⏱ 本轮统计：STEPS_USED 步思考 / TOOLS_USED 次工具调用 / 耗时 ELAPSED_SEC 秒`" +
-      `（其中 STEPS_USED=${steps}、TOOLS_USED=${tools}、ELAPSED_SEC=${elapsedSec}，若本答复中还有新的工具调用请一并计入），` +
+      `（其中 STEPS_USED=${steps}、TOOLS_USED=${tools}、ELAPSED_SEC=${elapsedSec}，若本答复中还有新的工具调用和耗时请一并计入），` +
       "随后写总结正文（已完成/未完成/下一步命令）。" +
-      "预算耗尽后请勿继续工作。本提示由系统自动注入，并非用户输入。谢谢配合收尾。"
+      "预算耗尽后请勿继续工作，请务必严格遵守此规则！"
     );
   }
   return (
@@ -658,9 +658,9 @@ function stepLimitWrapUpMessage(limit, steps, tools, elapsedSec) {
     "The per-turn step limit keeps each request bounded and prevents runaway tool loops, so continuing further work is not permitted. " +
     "Stop further reasoning and deliver your final answer in this reply, opening with a first line in this exact format: " +
     "`⏱ Stats this turn: STEPS_USED steps / TOOLS_USED tool calls / ELAPSED_SECs elapsed`" +
-    ` (STEPS_USED=${steps}, TOOLS_USED=${tools}, ELAPSED_SEC=${elapsedSec}; count any NEW tool calls in this reply too), ` +
+    ` (STEPS_USED=${steps}, TOOLS_USED=${tools}, ELAPSED_SEC=${elapsedSec}; count any NEW tool calls and time used in this reply too), ` +
     "then the summary body (accomplished / unfinished / next command). Do not continue working after this reply. " +
-    "This notice was injected automatically and is not user input. Thank you for wrapping up cleanly."
+    "Please strictly comply with this rule!"
   );
 }
 
@@ -1822,9 +1822,32 @@ async function main() {
               version: CORE_VERSION,
               sessionTitle: await currentSessionTitle(ctx, agent),
             });
+            // 组装用户消息内容：文本块 + 图片块（图片先存入 DSH 附件服务 → 附件引用）。
+            // 内核 serialize 时会把图片附件读回并转 data URL 发给模型（多模态）。
+            let userContent = [{ type: "text", text }];
+            if (Array.isArray(msg.images) && msg.images.length > 0) {
+              try {
+                const attach = ctx.get("attachments");
+                if (!attach) throw new Error("attachment service unavailable");
+                for (const img of msg.images) {
+                  try {
+                    const ref = await attach.saveImage({
+                      data: Buffer.from(String(img?.data ?? ""), "base64"),
+                      mediaType: img?.mediaType,
+                      name: img?.name,
+                    });
+                    userContent.push({ type: "image", attachment: ref });
+                  } catch (imgErr) {
+                    log("warn", "chat image skip: " + (imgErr instanceof Error ? imgErr.message : String(imgErr)));
+                  }
+                }
+              } catch (e) {
+                log("error", "chat image upload failed: " + (e instanceof Error ? e.message : String(e)));
+              }
+            }
             agent.followup(
               createUserMessage({
-                content: [{ type: "text", text }],
+                content: userContent,
                 source: { kind: "user" },
               })
             );
@@ -2320,7 +2343,12 @@ async function main() {
                 for (const p of providers) {
                   try {
                     const listed = await llm.listModels(p.id);
-                    const entries = listed.map((m) => ({ id: m.id, name: m.name || m.id }));
+                    const entries = listed.map((m) => {
+                      const e = { id: m.id, name: m.name || m.id };
+                      // 携带模态信息：前端据此判断当前模型是否支持图片输入
+                      if (Array.isArray(m.inputModalities)) e.inputModalities = m.inputModalities;
+                      return e;
+                    });
                     providerModels[p.id] = entries;
                     for (const e of entries) merged.add(e.id);
                   } catch {
@@ -2458,6 +2486,35 @@ async function main() {
             } catch (error) {
               log("warn", "discoverModels failed", error instanceof Error ? error.message : String(error));
               post({ t: "discoveredModels", id: msg.id, models: [], error: error instanceof Error ? error.message : String(error) });
+            }
+            break;
+          }
+          case "readAttachment": {
+            // 读历史图片附件：attachment ref → base64 图片（本地附件库，不费网络/token）
+            try {
+              const attach = ctx.get("attachments");
+              const ref = msg.ref;
+              if (!attach || !ref) {
+                post({ t: "attachmentResult", id: msg.id, ok: false, error: "attachment service unavailable" });
+                break;
+              }
+              const stored = await attach.readImage({
+                attachmentId: ref.attachmentId,
+                mediaType: ref.mediaType,
+                bytes: typeof ref.bytes === "number" ? ref.bytes : 0,
+                width: typeof ref.width === "number" ? ref.width : 0,
+                height: typeof ref.height === "number" ? ref.height : 0,
+              });
+              post({
+                t: "attachmentResult",
+                id: msg.id,
+                ok: true,
+                mediaType: stored.ref.mediaType,
+                data: Buffer.from(stored.data).toString("base64"),
+              });
+            } catch (error) {
+              log("warn", "readAttachment failed", error instanceof Error ? error.message : String(error));
+              post({ t: "attachmentResult", id: msg.id, ok: false, error: error instanceof Error ? error.message : String(error) });
             }
             break;
           }

@@ -178,6 +178,8 @@ export class AgentHost {
   private eventListeners = new Set<(e: HostEvent) => void>();
   private chatSeq = 0;
   private pendingChat = new Map<number, { resolve: (ok: boolean) => void; timer: NodeJS.Timeout }>();
+  /** 历史图片附件读取（attachment ref → base64）：一次性请求-响应。 */
+  private pendingAttachment = new Map<number, { resolve: (data: string | undefined) => void; timer: NodeJS.Timeout }>();
   /** 提供商目录查询（配置面板用）：一次性请求-响应。 */
   private llmSeq = 0;
   private pendingLlmProviders = new Map<number, { resolve: (p: { id: string; name: string }[]) => void }>();
@@ -398,6 +400,15 @@ export class AgentHost {
         }
         break;
       }
+      case "attachmentResult": {
+        const pending = this.pendingAttachment.get(frame.id);
+        if (pending) {
+          clearTimeout(pending.timer);
+          this.pendingAttachment.delete(frame.id);
+          pending.resolve(frame.ok ? frame.data : undefined);
+        }
+        break;
+      }
       case "stopAck": {
         break;
       }
@@ -610,8 +621,9 @@ export class AgentHost {
         // 实时会话中用户消息由 UI 在发送时本地渲染；历史重放时则需要渲染
         if (!opts?.includeUser) return null;
         const text = blocksToText(d.content);
-        if (!text) return null;
-        return { kind: "user", text, ts: event.time };
+        const images = extractImageRefs(d.content);
+        if (!text && images.length === 0) return null;
+        return { kind: "user", text, images, ts: event.time };
       }
       case "turn/start": {
         const turn = d.turn as number;
@@ -730,8 +742,8 @@ export class AgentHost {
     }
   }
 
-  /** 发送聊天消息；resolve 于该轮完成。 */
-  async chat(text: string): Promise<boolean> {
+  /** 发送聊天消息（可带图片附件：base64+mediaType+name）；resolve 于该轮完成。 */
+  async chat(text: string, images?: { data: string; mediaType: string; name?: string }[]): Promise<boolean> {
     if (!this.child) throw new Error("agent host is not running");
     const id = ++this.chatSeq;
     return new Promise<boolean>((resolve) => {
@@ -740,12 +752,23 @@ export class AgentHost {
         resolve(false);
       }, 30 * 60 * 1000); // 30 分钟兜底
       this.pendingChat.set(id, { resolve, timer });
-      this.send({ t: "chat", id, text });
+      this.send({ t: "chat", id, text, images });
     });
   }
 
   stop(): void {
     this.send({ t: "stop", id: ++this.chatSeq });
+  }
+
+  /** 读取历史图片附件（attachment ref → base64）。 */
+  readAttachment(ref: { attachmentId: string; mediaType: string; bytes?: number; width?: number; height?: number }): Promise<string | undefined> {
+    return new Promise((resolve) => {
+      const id = ++this.chatSeq;
+      this.pendingAttachment.set(id, { resolve, timer: setTimeout(() => {
+        if (this.pendingAttachment.delete(id)) resolve(undefined);
+      }, 8000) });
+      this.send({ t: "readAttachment", id, ref });
+    });
   }
 
   approve(id: number, approve: boolean): void {
@@ -891,6 +914,30 @@ function blocksToText(content: unknown[] | undefined, type: string = "text"): st
     .filter((b) => b && typeof b === "object" && (b as { type?: string }).type === type)
     .map((b) => (b as { text?: string }).text ?? "")
     .join("");
+}
+
+/** 从内容块中提取图片附件引用（image 块的 attachment：{attachmentId, mediaType}）。 */
+function extractImageRefs(content: unknown[] | undefined): { attachmentId: string; mediaType: string; bytes?: number; width?: number; height?: number }[] {
+  if (!Array.isArray(content)) return [];
+  const refs: { attachmentId: string; mediaType: string; bytes?: number; width?: number; height?: number }[] = [];
+  const walk = (blocks: unknown[]): void => {
+    for (const b of blocks) {
+      const blk = b as { type?: string; attachment?: { attachmentId?: string; mediaType?: string; bytes?: number; width?: number; height?: number }; content?: unknown[] };
+      if (blk?.type === "image" && blk.attachment?.attachmentId) {
+        refs.push({
+          attachmentId: blk.attachment.attachmentId,
+          mediaType: blk.attachment.mediaType || "image/png",
+          bytes: blk.attachment.bytes,
+          width: blk.attachment.width,
+          height: blk.attachment.height,
+        });
+      } else if (Array.isArray(blk?.content)) {
+        walk(blk.content as unknown[]);
+      }
+    }
+  };
+  walk(content);
+  return refs;
 }
 
 /** 提取工具结果文本：文本可能直接是 text 块，也可能嵌套在 tool-result 块的 content 里。 */

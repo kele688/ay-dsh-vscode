@@ -441,13 +441,13 @@ function openSettings(context: vscode.ExtensionContext): void {
     // 模型发现：catalog 提供商免网络返回模型+元数据；未知提供商探活端点。
     // deepseek-official 是插件路由（llm-deepseek），模型由其默认公布（含多模态），
     // 不走 pi-ai catalog/网络查询——直接返回官方模型清单（与插件 DEFAULT_MODELS 一致）。
-    discoverModels: async (opts): Promise<{ models: { id: string; name?: string; contextWindow?: number; maxTokens?: number }[]; error?: string }> => {
+    discoverModels: async (opts): Promise<{ models: { id: string; name?: string; contextWindow?: number; maxTokens?: number; inputModalities?: string[] }[]; error?: string }> => {
       if (opts.provider === "deepseek-official") {
         return {
           models: [
-            { id: "deepseek-v4-flash", name: "DeepSeek-V4-Flash", contextWindow: 1000000, maxTokens: 384000 },
-            { id: "deepseek-v4-pro", name: "DeepSeek-V4-Pro", contextWindow: 1000000, maxTokens: 384000 },
-            { id: "deepseek-v4-flash-vision-exp", name: "DeepSeek-V4-Flash-Vision-Exp", contextWindow: 1000000, maxTokens: 384000 },
+            { id: "deepseek-v4-flash", name: "DeepSeek-V4-Flash", contextWindow: 1000000, maxTokens: 384000, inputModalities: ["text"] },
+            { id: "deepseek-v4-pro", name: "DeepSeek-V4-Pro", contextWindow: 1000000, maxTokens: 384000, inputModalities: ["text"] },
+            { id: "deepseek-v4-flash-vision-exp", name: "DeepSeek-V4-Flash-Vision-Exp", contextWindow: 1000000, maxTokens: 384000, inputModalities: ["text", "image"] },
           ],
         };
       }

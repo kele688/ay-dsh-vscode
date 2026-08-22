@@ -56,6 +56,7 @@ export type HostFrame =
   | { t: "approval"; id: number; toolName: string; callId?: string; reason?: string; agentId?: string }
   | { t: "approvalGone"; id: number }
   | { t: "chatDone"; id: number; ok: boolean; error?: string }
+  | { t: "attachmentResult"; id: number; ok: boolean; mediaType?: string; data?: string }
   | { t: "stopAck"; id: number }
   | { t: "sessions"; list: SessionSummary[]; error?: string }
   | { t: "history"; sessionId: string; events: SessionEvent[]; hasMore?: boolean; nextSeq?: number; stats?: SessionStats }
@@ -81,7 +82,8 @@ export type HostFrame =
 
 /** Extension -> Host */
 export type ExtensionFrame =
-  | { t: "chat"; id: number; text: string }
+  | { t: "chat"; id: number; text: string; images?: { data: string; mediaType: string; name?: string }[] }
+  | { t: "readAttachment"; id: number; ref: { attachmentId: string; mediaType: string; bytes?: number; width?: number; height?: number } }
   | { t: "stop"; id: number }
   | { t: "approval:resolve"; id: number; approve: boolean }
   | { t: "newSession"; model?: string }
@@ -118,7 +120,7 @@ export interface ProviderApplyItem {
 
 /** 面向 UI 的渲染事件（webview <-> 扩展之间），由扩展把 SessionEvent 翻译成视图模型。 */
 export type ViewEvent =
-  | { kind: "user"; text: string; ts: number }
+  | { kind: "user"; text: string; ts: number; images?: { attachmentId: string; mediaType: string }[] }
   | { kind: "assistant-delta"; text: string; reasoning: string; ts: number }
   | { kind: "assistant"; text: string; reasoning: string; usage?: Record<string, number>; ts: number }
   | { kind: "error"; text: string; ts: number }
@@ -129,7 +131,8 @@ export type ViewEvent =
 
 /** Webview -> Extension 的消息。 */
 export type WebviewMessage =
-  | { t: "chat"; text: string }
+  | { t: "chat"; text: string; images?: { data: string; mediaType: string; name?: string }[] }
+  | { t: "readAttachment"; id: number; ref: { attachmentId: string; mediaType: string; bytes?: number; width?: number; height?: number } }
   | { t: "stop" }
   | { t: "approval:resolve"; id: number; approve: boolean }
   | { t: "newSession" }
@@ -179,6 +182,7 @@ export type ExtensionToWebview =
   | { t: "workModeChanged"; mode: "single" | "multi" }
   | { t: "compactDone"; ok: boolean; text?: string; error?: string }
   | { t: "sessions"; list: SessionSummary[]; error?: string }
+  | { t: "attachmentResult"; id: number; ok: boolean; mediaType?: string; data?: string }
   | { t: "restarting" }
   | { t: "dshUpdate"; latest?: string; upgrading?: boolean }
   | { t: "history"; sessionId: string; events: ViewEvent[]; hasMore?: boolean; nextSeq?: number }

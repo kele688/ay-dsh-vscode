@@ -140,6 +140,16 @@
       dshIgnore: "忽略",
       dshDetails: "查看发布说明",
       dshUpgrading: (v) => `升级 ${v} 过程中…`,
+      removeImage: (name) => `移除图片 ${name || ""}`,
+      modelNoImage: (name) => `当前模型 ${name || ""} 不支持图片`
+        + "——请切换到支持多模态的模型（如 DeepSeek (Official) 的 vision 模型）后再粘贴图片",
+      imageLimit: (n) => `每条消息最多可包含 ${n} 张图片`,
+      imageAdded: (name) => `已添加图片：${name || "image"}`
+        + "（将随下一条消息发送；点 × 可移除）",
+      imageRef: (idx) => `[图${idx}]`,
+      imageDup: (name) => `已跳过重复图片：${name || "image"}`,
+      fileUnsupported: (name) => `${name || "文件"}：仅支持粘贴 PNG/JPG/WebP/GIF 图片`
+        + "——请粘贴图片内容，或把文件文本复制进输入框",
     },
     en: {
       thinking: "Thinking",
@@ -220,6 +230,16 @@
       dshIgnore: "Ignore",
       dshDetails: "View release notes",
       dshUpgrading: (v) => `Upgrading ${v}…`,
+      removeImage: (name) => `Remove image ${name || ""}`,
+      modelNoImage: (name) => `Model ${name || ""} does not support images`
+        + " — switch to a multimodal model (e.g. DeepSeek (Official) vision) to paste images",
+      imageLimit: (n) => `A message can include up to ${n} images`,
+      imageAdded: (name) => `Image added: ${name || "image"}`
+        + " (it will be sent with the next message; remove with × to cancel)",
+      imageRef: (idx) => `[image${idx}]`,
+      imageDup: (name) => `Skipped duplicate image: ${name || "image"}`,
+      fileUnsupported: (name) => `${name || "File"}: only PNG/JPG/WebP/GIF images can be attached`
+        + " — paste image content, or copy the file text into the input instead",
     },
   };
 
@@ -246,8 +266,7 @@
   /* ---------------- 工具函数 ---------------- */
 
   function el(tag, cls, text) {
-    const node = document.createElement(tag);
-    if (cls) node.className = cls;
+    const node = document.createElement(tag);    if (cls) node.className = cls;
     if (text !== undefined) node.textContent = text;
     return node;
   }
@@ -312,6 +331,17 @@
   // 真正的滚动容器是 #messages（overflow-y: auto）；body 不滚动
   const scrollToBottom = attachStickyScroll(messagesEl);
 
+  // 一键拉到底按钮：回滚超过 1 页时悬浮在消息区右下，点击回到底部并隐藏
+  const btnJumpDown = el("button", "jump-down hidden", "▼");
+  btnJumpDown.type = "button";
+  btnJumpDown.title = "回到最新消息";
+  btnJumpDown.addEventListener("click", () => {
+    // 强制滚到底（不受 sticky 跟随限制）；滚动事件触发后自动恢复贴底跟随
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+    btnJumpDown.classList.add("hidden");
+  });
+  document.body.appendChild(btnJumpDown);
+
   /** 空态占位：无消息时显示欢迎语；有消息时隐藏。 */
   function updateEmptyState() {
     const empty = $("emptyState");
@@ -341,6 +371,11 @@
           sessionId: state.viewSessionId || undefined,
         });
       }, 250);
+    }
+    // 一键拉到底：回滚超过 1 页（距底 > 视口高）时显示向下箭头，贴底隐藏
+    if (btnJumpDown) {
+      const distToBottom = messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight;
+      btnJumpDown.classList.toggle("hidden", distToBottom < messagesEl.clientHeight);
     }
   });
 
@@ -715,12 +750,45 @@
     return SYSTEM_DIRECTIVE_PREFIXES.some((p) => t.startsWith(p));
   }
 
-  function addUserMessage(text) {
+  function addUserMessage(text, images) {
     // 系统指令（宿主自动注入）：模型可见、界面不渲染
     if (isSystemDirective(text)) return;
     const wrap = el("div", "msg user");
     const body = el("div", "bubble");
-    body.innerHTML = renderMarkdown(text);
+    if (Array.isArray(images) && images.length > 0) {
+      // 消息带图片：先渲染缩略图行，再渲染文本（图片以 data URL 即时显示）
+      const rail = el("div", "user-image-rail");
+      for (const img of images) {
+        if (!img) continue;
+        if (img.data) {
+          // 实时：直接显示缩略图（base64 已有）
+          const thumb = document.createElement("img");
+          thumb.className = "user-image-thumb";
+          thumb.src = `data:${img.mediaType || "image/png"};base64,${img.data}`;
+          thumb.alt = img.name || "image";
+          thumb.title = img.name || "image";
+          thumb.addEventListener("click", () => showImageLightbox(img));
+          rail.appendChild(thumb);
+        } else if (img.attachmentId) {
+          // 历史：先显示占位，发 readAttachment 读原图，收到后回填缩略图
+          const ph = document.createElement("div");
+          ph.className = "user-image-thumb user-image-loading";
+          ph.dataset.mediaType = img.mediaType || "image/png";
+          ph.title = "加载图片…";
+          rail.appendChild(ph);
+          const reqId = ++imageRefSeq;
+          imageRefPending[reqId] = { ph, mediaType: img.mediaType || "image/png", name: "history-image" };
+          vscode.postMessage({ t: "readAttachment", id: reqId, ref: { attachmentId: img.attachmentId, mediaType: img.mediaType, bytes: img.bytes, width: img.width, height: img.height } });
+        }
+      }
+      body.appendChild(rail);
+    }
+    if (text) {
+      // 文本用 innerHTML 渲染（renderMarkdown 返回 HTML；el() 的 text 是纯文本会显示标签）
+      const textDiv = document.createElement("div");
+      textDiv.innerHTML = renderMarkdown(text);
+      body.appendChild(textDiv);
+    }
     wrap.appendChild(body);
     messagesEl.appendChild(wrap);
     updateEmptyState();
@@ -751,7 +819,7 @@
     const reasoningBody = el("div", "reasoning-body");
     reasoning.appendChild(summary);
     reasoning.appendChild(reasoningBody);
-    if (!foldReasoning) reasoning.open = true;
+    if (!foldReasoning) reasoning.open = true;  // 实时流式思考自动展开（用户要看思考链）
     const textBody = el("div", "text-body");
     body.appendChild(reasoning);
     body.appendChild(textBody);
@@ -780,21 +848,18 @@
   let streamRenderRaf = null;
   let streamRenderTimer = null;
   let lastStreamRenderAt = 0;
-  /** 全量 markdown 重渲染的最小间隔（ms）：模型高速输出时把渲染频率压到 ≤12.5 次/秒。 */
-  const STREAM_RENDER_MIN_GAP_MS = 80;
+  /** 停顿阈值：无新输出 delta 超过该时长才做一次全量 markdown 排版。 */
+  const STREAM_RENDER_IDLE_MS = 150;
 
   function scheduleStreamRender() {
-    if (streamRenderTimer !== null) return; // 已调度
-    const render = () => {
-      streamRenderRaf = null;
+    // 停顿式格式化：流式期间文本以文本节点**即时追加**（不重排，不闪烁）；
+    // 每次 delta 重置定时器，停顿 150ms 无新输出才做一次全量 markdown 排版。
+    // 这样高速输出时文字连续出现（无"整行往上挤"的屏闪），停顿后才排版。
+    if (streamRenderTimer !== null) clearTimeout(streamRenderTimer);
+    streamRenderTimer = setTimeout(() => {
       streamRenderTimer = null;
       flushStreamRender();
-    };
-    // 间隔节流：距上次渲染不足 80ms 时推迟到满 80ms 再执行。
-    // 连续输出时文本仍以文本节点即时追加（先出字），全量 markdown 格式化
-    // 低频执行——Remote-SSH 下每次全量 innerHTML 重建都会放大为可见延迟。
-    const delay = Math.max(0, STREAM_RENDER_MIN_GAP_MS - (Date.now() - lastStreamRenderAt));
-    streamRenderTimer = setTimeout(render, delay);
+    }, STREAM_RENDER_IDLE_MS);
   }
 
   /** 立即执行一次全量 markdown 渲染（finalize / 切换气泡前调用，防丢尾部）。 */
@@ -818,7 +883,7 @@
   function appendAssistantDelta(text, reasoning) {
     const a = ensureAssistant(false);
     if (reasoning) {
-      // 思考链：纯文本追加（无 markdown 解析，本身廉价），即时显示
+      // 思考链：纯文本追加（无 markdown 解析，本身廉价），即时显示（实时自动展开）
       a.reasoning.classList.remove("hidden");
       a.reasoning.open = true;
       a.reasoningBody.textContent += reasoning;
@@ -1252,7 +1317,7 @@
     const foldReasoning = Boolean(opts && opts.foldReasoning);
     switch (e.kind) {
       case "user":
-        addUserMessage(e.text);
+        addUserMessage(e.text, e.images);
         break;
       case "assistant-delta":
         // 停止后的残留增量一律丢弃（未接收完的输出不再渲染）
@@ -1347,6 +1412,21 @@
       case "modelInfo":
         renderModelInfo(msg);
         break;
+      case "attachmentResult": {
+        const item = imageRefPending[msg.id];
+        if (item && msg.ok && msg.data) {
+          const ph = item.ph;
+          const img = document.createElement("img");
+          img.className = "user-image-thumb";
+          img.src = `data:${msg.mediaType || item.mediaType};base64,${msg.data}`;
+          img.alt = item.name || "image";
+          img.title = item.name || "image";
+          img.addEventListener("click", () => showImageLightbox({ data: msg.data, mediaType: msg.mediaType || item.mediaType, name: item.name }));
+          ph.replaceWith(img);
+        }
+        delete imageRefPending[msg.id];
+        break;
+      }
       case "dshUpdate":
         renderDshUpdate(msg);
         break;
@@ -1559,6 +1639,12 @@
 
   /* ---------------- 输入 ---------------- */
 
+  // 待发图片附件（粘贴收集；发送时转为 base64 随 chat 消息带出）
+  let pendingImages = []; // { data: base64, mediaType, name }
+  // 历史图片读取：readAttachment 请求序号 + 待回填的占位元素（id -> {ph, mediaType, name}）
+  let imageRefSeq = 0;
+  const imageRefPending = {}; // { [reqId]: { ph, mediaType, name } }
+
   function send() {
     const text = inputEl.value.trim();
     // resuming：会话历史恢复中，消息区即将被 history 帧重建，此时发送会
@@ -1568,8 +1654,152 @@
     autoResize();
     // 用户消息**先**同步渲染进消息列表（append），再通知扩展转发给宿主；
     // 之后 AI 应答事件按到达顺序追加在用户消息之后，顺序不会错乱。
-    addUserMessage(text);
-    vscode.postMessage({ t: "chat", text });
+    const images = pendingImages.slice();
+    pendingImages = [];
+    renderImageRail();
+    addUserMessage(text, images);
+    vscode.postMessage({ t: "chat", text, images: images.length ? images : undefined });
+  }
+
+  /** 读取一个 File 为 base64 data（图片用）。 */
+  function fileToBase64(file, cb) {
+    const reader = new FileReader();
+    reader.onload = () => cb(String(reader.result).split(",")[1] || "");
+    reader.onerror = () => cb("");
+    reader.readAsDataURL(file);
+  }
+
+  /** 图片类型白名单（与 DSH 附件服务一致）：PNG/JPG/WebP/GIF。 */
+  const IMAGE_TYPES = ["image/png", "image/jpeg", "image/webp", "image/gif"];
+  const MAX_IMAGES = 20; // 与 DSH 默认 maxImagesPerMessage 一致
+
+  /** 渲染待发图片轨道（缩略图 + 可移除）。 */
+  function renderImageRail() {
+    const rail = $("imageRail");
+    if (!rail) return;
+    rail.innerHTML = "";
+    if (pendingImages.length === 0) {
+      rail.classList.add("hidden");
+      rail.innerHTML = "";
+      return;
+    }
+    rail.classList.remove("hidden");
+    pendingImages.forEach((img, i) => {
+      const item = document.createElement("span");
+      item.className = "image-rail-item";
+      item.title = img.name || img.mediaType;
+      const thumb = document.createElement("img");
+      thumb.src = `data:${img.mediaType};base64,${img.data}`;
+      thumb.alt = img.name || "image";
+      // 点击缩略图 → 放大显示
+      thumb.addEventListener("click", () => showImageLightbox(img));
+      const rm = document.createElement("button");
+      rm.type = "button";
+      rm.className = "image-rail-remove";
+      rm.textContent = "×";
+      rm.title = t("removeImage", img.name || "");
+      rm.addEventListener("click", () => {
+        // 删除缩略图本身；输入框里的引用锚点由用户自行调整（粘贴时生成一次，此后不联动）
+        pendingImages.splice(i, 1);
+        renderImageRail();
+      });
+      item.append(thumb, rm);
+      rail.appendChild(item);
+    });
+  }
+
+  /** 点击缩略图放大显示（lightbox，点击遮罩关闭）。 */
+  function showImageLightbox(img) {
+    if (!img || !img.data) return;
+    const overlay = document.createElement("div");
+    overlay.className = "image-lightbox";
+    const frame = document.createElement("img");
+    frame.src = `data:${img.mediaType || "image/png"};base64,${img.data}`;
+    frame.alt = img.name || "image";
+    frame.addEventListener("click", (e) => e.stopPropagation());
+    overlay.appendChild(frame);
+    overlay.addEventListener("click", () => overlay.remove());
+    document.body.appendChild(overlay);
+  }
+
+  /** 当前选中模型的模态类型（来自模型配置信息 inputModalities；缺省按纯文本）。 */
+  function currentModelModalities() {
+    const provider = selProvider.value;
+    const model = selModel.value;
+    const list = (state.providerModels && state.providerModels[provider]) || [];
+    const entry = list.find((m) => m.id === model);
+    return Array.isArray(entry?.inputModalities) ? entry.inputModalities : ["text"];
+  }
+
+  /** 粘贴处理：先看剪贴板是否含文件；纯文本放行；带文件则按当前模型模态判断。 */
+  function handlePaste(ev) {
+    const cd = ev.clipboardData;
+    if (!cd) return;
+    const items = Array.from(cd.items || []);
+    const files = Array.from(cd.files || []);
+    // 去重：同一个文件可能同时出现在 clipboardData.items 和 .files（重复双击粘贴），
+    // 按 name+type+size 去重，避免同一图片生成两个缩略图。
+    const seen = new Set();
+    const fileList = [];
+    const pushFile = (f) => {
+      const key = `${f.name}|${f.type}|${f.size}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      fileList.push(f);
+    };
+    for (const it of items) {
+      if (it.kind === "file") {
+        const f = it.getAsFile();
+        if (f) pushFile(f);
+      }
+    }
+    for (const f of files) pushFile(f);
+    if (fileList.length === 0) return; // 纯文本粘贴：放行（正常粘贴文字）
+    // 剪贴板含文件 → 按当前模型模态判断（模型配置信息里的 inputModalities）
+    if (!currentModelModalities().includes("image")) {
+      const entry = (state.providerModels?.[selProvider.value] || []).find((m) => m.id === selModel.value);
+      setHint(t("modelNoImage", entry?.name || selModel.value));
+      ev.preventDefault();
+      return;
+    }
+    let imageCount = 0;
+    for (const f of fileList) {
+      if (IMAGE_TYPES.includes(f.type)) {
+        if (pendingImages.length >= MAX_IMAGES) {
+          setHint(t("imageLimit", MAX_IMAGES));
+          continue;
+        }
+        const imgName = f.name || "pasted-image.png";
+        fileToBase64(f, (data) => {
+          if (!data) return;
+          // 内容去重：同一图片（相同 base64）只保留一个缩略图，避免重复粘贴出两个相同图
+          if (pendingImages.some((p) => p.data === data)) {
+            setHint(t("imageDup", imgName));
+            return;
+          }
+          const idx = pendingImages.length + 1; // 序号（随粘贴顺序生成，用户改动自负责）
+          pendingImages.push({ data, mediaType: f.type, name: imgName });
+          renderImageRail();
+          setHint(t("imageAdded", imgName));
+          // 在输入框**光标处**插入序号引用锚点：[图N: 名称]，以**空格**分隔（不自动换行）。
+          // 用户此后如需改顺序/删锚点，自行调整即可（后续改变不再自动联动）。
+          const ref = t("imageRef", idx);
+          const pos = inputEl.selectionStart ?? inputEl.value.length;
+          const pre = inputEl.value.slice(0, pos);
+          const gap = pre && !/\s$/.test(pre) ? " " : "";
+          inputEl.setRangeText(gap + ref.trim(), pos, pos, "end");
+          autoResize();
+        });
+        imageCount++;
+      } else {
+        // 非图片文件：DSH 附件通道仅支持图片，给出明确提示
+        setHint(t("fileUnsupported", f.name || f.type));
+      }
+    }
+    if (imageCount > 0) {
+      // 有图片被接收：不再走默认文本粘贴，交由图片轨道
+      ev.preventDefault();
+    }
   }
 
   /**
@@ -1603,6 +1833,7 @@
   }
 
   inputEl.addEventListener("input", autoResize);
+  inputEl.addEventListener("paste", handlePaste);
   inputEl.addEventListener("keydown", (ev) => {
     if (ev.key === "Enter" && !ev.shiftKey) {
       ev.preventDefault();

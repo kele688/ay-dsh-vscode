@@ -23,6 +23,8 @@ export interface ProviderModel {
   displayName?: string;
   contextWindow?: string;
   maxOutput?: string;
+  /** 模态能力（如 ["text"] / ["text","image"]）；自定义模型由用户选择，知名模型由发现结果携带。 */
+  inputModalities?: string[];
 }
 export interface ProviderInfo {
   id: string;
@@ -74,7 +76,7 @@ export interface ConfigPanelDeps {
   /** 把整套提供商配置同步进 DSH（llm-pi-ai settings + credentials，热生效）。 */
   applyProviders: (providers: ProviderApplyItem[]) => Promise<string | undefined>;
   /** 模型发现（catalog 提供商免网络返回模型+元数据；未知提供商探活端点）。 */
-  discoverModels: (opts: { provider?: string; baseURL?: string; api?: string; apiKey?: string }) => Promise<{ models: { id: string; name?: string; contextWindow?: number; maxTokens?: number }[]; error?: string }>;
+  discoverModels: (opts: { provider?: string; baseURL?: string; api?: string; apiKey?: string }) => Promise<{ models: { id: string; name?: string; contextWindow?: number; maxTokens?: number; inputModalities?: string[] }[]; error?: string }>;
   /** 提供商配置同步完成后回调（扩展侧触发宿主 getModelInfo，刷新聊天面板模型列表）。 */
   onProvidersSynced: () => void;
   /* ---------------- 版本升级（配置面板"版本升级"组） ---------------- */
@@ -355,7 +357,7 @@ export function openConfigPanel(context: vscode.ExtensionContext, deps: ConfigPa
             if (!disc.error && Array.isArray(disc.models) && disc.models.length > 0) {
               panel.webview.postMessage({
                 t: "models",
-                models: disc.models.map((m) => ({ id: m.id, name: m.name, contextWindow: m.contextWindow, maxTokens: m.maxTokens })),
+                models: disc.models.map((m) => ({ id: m.id, name: m.name, contextWindow: m.contextWindow, maxTokens: m.maxTokens, inputModalities: m.inputModalities })),
               });
               break;
             }
