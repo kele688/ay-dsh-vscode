@@ -115,7 +115,7 @@ body {
   padding: 2px 4px;
   /* 固定宽度：避免因选中项/加载占位文本长短变化导致下拉框忽宽忽窄；
      展开的选项列表仍由浏览器按最宽内容自适应 */
-  width: 130px;
+  width: 185px;
   outline: none;
   cursor: pointer;
 }
@@ -130,7 +130,7 @@ body {
 }
 
 .tool-select.provider {
-  width: 110px;
+  width: 135px;
 }
 
 /* 思考级别：固定适配现有选项文字（off/low/high/max）的宽度 */
@@ -836,4 +836,110 @@ body {
 
 .hidden {
   display: none !important;
+}
+
+/* ---- 多模态：待发图片轨道（粘贴图片后显示缩略图，可移除） ---- */
+.image-rail {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 4px 2px 6px;
+}
+.image-rail-item {
+  position: relative;
+  display: inline-block;
+}
+.image-rail-item img {
+  display: block;
+  width: 56px;
+  height: 56px;
+  object-fit: cover;
+  border-radius: 4px;
+  border: 1px solid var(--vscode-widget-border, rgba(128, 128, 128, 0.4));
+}
+.image-rail-remove {
+  position: absolute;
+  top: -6px;
+  right: -6px;
+  width: 18px;
+  height: 18px;
+  line-height: 16px;
+  text-align: center;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: var(--error, #c0392b);
+  color: #fff;
+  font-size: 13px;
+  cursor: pointer;
+}
+.image-rail-remove:hover {
+  opacity: 0.85;
+}
+
+/* ---- 用户消息里的图片缩略图（发送后随消息显示） ---- */
+.user-image-rail {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+.user-image-thumb {
+  width: 48px;
+  height: 48px;
+  object-fit: cover;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+}
+.user-image-thumb.user-image-loading {
+  display: inline-block;
+  background: var(--vscode-editorWidget-border, rgba(128, 128, 128, 0.2));
+  animation: img-pulse 1s ease-in-out infinite;
+}
+@keyframes img-pulse {
+  0%, 100% { opacity: 0.5; }
+  50% { opacity: 1; }
+}
+
+/* ---- 图片放大显示（lightbox，点击缩略图打开、点遮罩关闭） ---- */
+.image-lightbox {
+  position: fixed;
+  inset: 0;
+  z-index: 999;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.8);
+  padding: 24px;
+}
+.image-lightbox img {
+  max-width: 92vw;
+  max-height: 92vh;
+  object-fit: contain;
+  border-radius: 4px;
+  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.5);
+}
+
+/* ---- 一键拉到底：悬浮在消息区右下角（滚动条下方、输入框上方）的向下箭头 ---- */
+button.jump-down {
+  position: fixed;
+  right: 14px;
+  bottom: 110px;
+  z-index: 50;
+  width: 36px;
+  height: 36px;
+  line-height: 34px;
+  text-align: center;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 50%;
+  background: #4a90d9;              /* 浅蓝色 */
+  color: #ffffff;
+  font-size: 18px;
+  cursor: pointer;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.3);
+  opacity: 0.95;
+}
+button.jump-down:hover {
+  opacity: 1;
 }

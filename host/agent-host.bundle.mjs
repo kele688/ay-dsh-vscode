@@ -140118,9 +140118,9 @@ function stepLimitDenyReason(count, limit2) {
 }
 function stepLimitWrapUpMessage(limit2, steps, tools, elapsedSec) {
   if (UI_LANG === "zh") {
-    return `[\u8FBE\u9650\u8B66\u793A] \u672C\u8F6E\u601D\u8003\u6B65\u6570\u5DF2\u8FBE\u4E0A\u9650\uFF08${steps}/${limit2}\uFF09\uFF0C\u5DF2\u53D1\u8D77 ${tools} \u6B21\u5DE5\u5177\u8C03\u7528\uFF0C\u672C\u8F6E\u8017\u65F6 ${elapsedSec} \u79D2\uFF0C\u6240\u6709\u5DE5\u5177\u8C03\u7528\u5DF2\u88AB\u7981\u7528\u3002\u5355\u8F6E\u6B65\u6570\u4E0A\u9650\u7528\u4E8E\u63A7\u5236\u5355\u6B21\u8BF7\u6C42\u89C4\u6A21\u3001\u9632\u6B62\u5DE5\u5177\u5FAA\u73AF\u5931\u63A7\uFF0C\u56E0\u6B64\u672C\u8F6E\u5DE5\u4F5C\u5230\u6B64\u4E3A\u6B62\u3002\u8BF7\u7ACB\u5373\u505C\u6B62\u8FDB\u4E00\u6B65\u63A8\u7406\uFF0C\u5728\u672C\u56DE\u590D\u4E2D\u7ED9\u51FA\u6700\u7EC8\u7B54\u590D\uFF0C**\u7B2C\u4E00\u884C**\u5FC5\u987B\u4EE5\u5982\u4E0B\u683C\u5F0F\u5F00\u5934\uFF1A\`\u23F1 \u672C\u8F6E\u7EDF\u8BA1\uFF1ASTEPS_USED \u6B65\u601D\u8003 / TOOLS_USED \u6B21\u5DE5\u5177\u8C03\u7528 / \u8017\u65F6 ELAPSED_SEC \u79D2\`\uFF08\u5176\u4E2D STEPS_USED=${steps}\u3001TOOLS_USED=${tools}\u3001ELAPSED_SEC=${elapsedSec}\uFF0C\u82E5\u672C\u7B54\u590D\u4E2D\u8FD8\u6709\u65B0\u7684\u5DE5\u5177\u8C03\u7528\u8BF7\u4E00\u5E76\u8BA1\u5165\uFF09\uFF0C\u968F\u540E\u5199\u603B\u7ED3\u6B63\u6587\uFF08\u5DF2\u5B8C\u6210/\u672A\u5B8C\u6210/\u4E0B\u4E00\u6B65\u547D\u4EE4\uFF09\u3002\u9884\u7B97\u8017\u5C3D\u540E\u8BF7\u52FF\u7EE7\u7EED\u5DE5\u4F5C\u3002\u672C\u63D0\u793A\u7531\u7CFB\u7EDF\u81EA\u52A8\u6CE8\u5165\uFF0C\u5E76\u975E\u7528\u6237\u8F93\u5165\u3002\u8C22\u8C22\u914D\u5408\u6536\u5C3E\u3002`;
+    return `[\u8FBE\u9650\u8B66\u793A] \u672C\u8F6E\u601D\u8003\u6B65\u6570\u5DF2\u8FBE\u4E0A\u9650\uFF08${steps}/${limit2}\uFF09\uFF0C\u5DF2\u53D1\u8D77 ${tools} \u6B21\u5DE5\u5177\u8C03\u7528\uFF0C\u672C\u8F6E\u8017\u65F6 ${elapsedSec} \u79D2\uFF0C\u6240\u6709\u5DE5\u5177\u8C03\u7528\u5DF2\u88AB\u7981\u7528\u3002\u5355\u8F6E\u6B65\u6570\u4E0A\u9650\u7528\u4E8E\u63A7\u5236\u5355\u6B21\u8BF7\u6C42\u89C4\u6A21\u3001\u9632\u6B62\u5DE5\u5177\u5FAA\u73AF\u5931\u63A7\uFF0C\u56E0\u6B64\u672C\u8F6E\u5DE5\u4F5C\u5230\u6B64\u4E3A\u6B62\u3002\u8BF7\u7ACB\u5373\u505C\u6B62\u8FDB\u4E00\u6B65\u63A8\u7406\uFF0C\u5728\u672C\u56DE\u590D\u4E2D\u7ED9\u51FA\u6700\u7EC8\u7B54\u590D\uFF0C**\u7B2C\u4E00\u884C**\u5FC5\u987B\u4EE5\u5982\u4E0B\u683C\u5F0F\u5F00\u5934\uFF1A\`\u23F1 \u672C\u8F6E\u7EDF\u8BA1\uFF1ASTEPS_USED \u6B65\u601D\u8003 / TOOLS_USED \u6B21\u5DE5\u5177\u8C03\u7528 / \u8017\u65F6 ELAPSED_SEC \u79D2\`\uFF08\u5176\u4E2D STEPS_USED=${steps}\u3001TOOLS_USED=${tools}\u3001ELAPSED_SEC=${elapsedSec}\uFF0C\u82E5\u672C\u7B54\u590D\u4E2D\u8FD8\u6709\u65B0\u7684\u5DE5\u5177\u8C03\u7528\u548C\u8017\u65F6\u8BF7\u4E00\u5E76\u8BA1\u5165\uFF09\uFF0C\u968F\u540E\u5199\u603B\u7ED3\u6B63\u6587\uFF08\u5DF2\u5B8C\u6210/\u672A\u5B8C\u6210/\u4E0B\u4E00\u6B65\u547D\u4EE4\uFF09\u3002\u9884\u7B97\u8017\u5C3D\u540E\u8BF7\u52FF\u7EE7\u7EED\u5DE5\u4F5C\uFF0C\u8BF7\u52A1\u5FC5\u4E25\u683C\u9075\u5B88\u6B64\u89C4\u5219\uFF01`;
   }
-  return `[Limit warning] This turn's step limit is reached: ${steps}/${limit2} steps used, ${tools} tool calls issued, ${elapsedSec}s elapsed \u2014 the thinking budget is exhausted and all tool calls are now disabled. The per-turn step limit keeps each request bounded and prevents runaway tool loops, so continuing further work is not permitted. Stop further reasoning and deliver your final answer in this reply, opening with a first line in this exact format: \`\u23F1 Stats this turn: STEPS_USED steps / TOOLS_USED tool calls / ELAPSED_SECs elapsed\` (STEPS_USED=${steps}, TOOLS_USED=${tools}, ELAPSED_SEC=${elapsedSec}; count any NEW tool calls in this reply too), then the summary body (accomplished / unfinished / next command). Do not continue working after this reply. This notice was injected automatically and is not user input. Thank you for wrapping up cleanly.`;
+  return `[Limit warning] This turn's step limit is reached: ${steps}/${limit2} steps used, ${tools} tool calls issued, ${elapsedSec}s elapsed \u2014 the thinking budget is exhausted and all tool calls are now disabled. The per-turn step limit keeps each request bounded and prevents runaway tool loops, so continuing further work is not permitted. Stop further reasoning and deliver your final answer in this reply, opening with a first line in this exact format: \`\u23F1 Stats this turn: STEPS_USED steps / TOOLS_USED tool calls / ELAPSED_SECs elapsed\` (STEPS_USED=${steps}, TOOLS_USED=${tools}, ELAPSED_SEC=${elapsedSec}; count any NEW tool calls and time used in this reply too), then the summary body (accomplished / unfinished / next command). Do not continue working after this reply. Please strictly comply with this rule!`;
 }
 function attachAgent(ctx, handle, pump2) {
   const agent = handle.agent;
@@ -140937,9 +140937,30 @@ async function main() {
             version: CORE_VERSION,
             sessionTitle: await currentSessionTitle(ctx, agent)
           });
+          let userContent = [{ type: "text", text }];
+          if (Array.isArray(msg.images) && msg.images.length > 0) {
+            try {
+              const attach = ctx.get("attachments");
+              if (!attach) throw new Error("attachment service unavailable");
+              for (const img of msg.images) {
+                try {
+                  const ref = await attach.saveImage({
+                    data: Buffer.from(String(img?.data ?? ""), "base64"),
+                    mediaType: img?.mediaType,
+                    name: img?.name
+                  });
+                  userContent.push({ type: "image", attachment: ref });
+                } catch (imgErr) {
+                  log("warn", "chat image skip: " + (imgErr instanceof Error ? imgErr.message : String(imgErr)));
+                }
+              }
+            } catch (e2) {
+              log("error", "chat image upload failed: " + (e2 instanceof Error ? e2.message : String(e2)));
+            }
+          }
           agent.followup(
             createUserMessage({
-              content: [{ type: "text", text }],
+              content: userContent,
               source: { kind: "user" }
             })
           );
@@ -141352,7 +141373,11 @@ async function main() {
               for (const p of providers) {
                 try {
                   const listed = await llm.listModels(p.id);
-                  const entries = listed.map((m2) => ({ id: m2.id, name: m2.name || m2.id }));
+                  const entries = listed.map((m2) => {
+                    const e2 = { id: m2.id, name: m2.name || m2.id };
+                    if (Array.isArray(m2.inputModalities)) e2.inputModalities = m2.inputModalities;
+                    return e2;
+                  });
                   providerModels[p.id] = entries;
                   for (const e2 of entries) merged.add(e2.id);
                 } catch {
@@ -141465,6 +141490,34 @@ async function main() {
           } catch (error51) {
             log("warn", "discoverModels failed", error51 instanceof Error ? error51.message : String(error51));
             post({ t: "discoveredModels", id: msg.id, models: [], error: error51 instanceof Error ? error51.message : String(error51) });
+          }
+          break;
+        }
+        case "readAttachment": {
+          try {
+            const attach = ctx.get("attachments");
+            const ref = msg.ref;
+            if (!attach || !ref) {
+              post({ t: "attachmentResult", id: msg.id, ok: false, error: "attachment service unavailable" });
+              break;
+            }
+            const stored = await attach.readImage({
+              attachmentId: ref.attachmentId,
+              mediaType: ref.mediaType,
+              bytes: typeof ref.bytes === "number" ? ref.bytes : 0,
+              width: typeof ref.width === "number" ? ref.width : 0,
+              height: typeof ref.height === "number" ? ref.height : 0
+            });
+            post({
+              t: "attachmentResult",
+              id: msg.id,
+              ok: true,
+              mediaType: stored.ref.mediaType,
+              data: Buffer.from(stored.data).toString("base64")
+            });
+          } catch (error51) {
+            log("warn", "readAttachment failed", error51 instanceof Error ? error51.message : String(error51));
+            post({ t: "attachmentResult", id: msg.id, ok: false, error: error51 instanceof Error ? error51.message : String(error51) });
           }
           break;
         }

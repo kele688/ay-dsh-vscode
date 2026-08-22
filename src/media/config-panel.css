@@ -515,3 +515,10 @@ div.notes-box.notes-rendered .notes-empty {
   font-size: 12px;
   line-height: 1.4;
 }
+
+/* ---- 模型行：多模态标识（📷 表示支持图片输入） ---- */
+.image-badge {
+  margin-left: 4px;
+  font-size: 12px;
+  cursor: help;
+}

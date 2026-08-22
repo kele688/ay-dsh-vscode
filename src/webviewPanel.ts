@@ -202,8 +202,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     webviewView.webview.onDidReceiveMessage((msg: WebviewMessage) => {
       switch (msg.t) {
         case "chat":
-          void this.sendChat(msg.text);
+          void this.sendChat(msg.text, Array.isArray(msg.images) ? msg.images : undefined);
           break;
+        case "readAttachment": {
+          const h = this.host;
+          if (!h) break;
+          void h.readAttachment(msg.ref).then((data) => {
+            this.push({ t: "attachmentResult", id: msg.id, ok: !!data, mediaType: msg.ref.mediaType, data });
+          });
+          break;
+        }
         case "stop":
           this.host?.stop();
           break;
@@ -372,7 +380,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  private async sendChat(text: string): Promise<void> {
+  private async sendChat(text: string, images?: { data: string; mediaType: string; name?: string }[]): Promise<void> {
     if (this.view) {
       try {
         await this.deps.ensureHost();
@@ -405,7 +413,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
     this.setStatus("running");
     try {
-      const ok = await host.chat(text);
+      const ok = await host.chat(text, images);
       if (ok) this.deps.onChatDone?.();
       if (!ok) {
         this.push({
@@ -835,6 +843,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   </div>
   <footer id="composer">
     <div id="inputRow" class="composer-input-row">
+      <div id="imageRail" class="image-rail hidden" aria-label="Pending images"></div>
       <textarea id="input" rows="2" placeholder="${L.placeholder}"></textarea>
     </div>
     <div id="composerTools" class="composer-tools">
