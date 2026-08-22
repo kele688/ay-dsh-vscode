@@ -17,7 +17,7 @@
  *     owner 管理（见维护文档的发布路线图）。
  */
 import { spawnSync } from "node:child_process";
-import { readFileSync, readdirSync, statSync } from "node:fs";
+import { readFileSync, writeFileSync, readdirSync, statSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -58,11 +58,31 @@ try {
   const pkg = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
   const tag = `v${pkg.version}`;
   const asset = join(releaseDir, vsix.f).replace(/\\/g, "/");
+
+  // 生成 Release Notes：取 CHANGELOG.md 最新条目（首个 ## 标题到下一个 ## 标题之间）。
+  // 写入 release/release-notes.md，供 `gh release create --notes-file` 使用——
+  // 避免发布时 notes 缺失/占位导致 GitHub Releases 页与配置面板无实质内容。
+  let notes = `# ${pkg.name} v${pkg.version}\n\nRelease notes: see CHANGELOG.md`;
+  try {
+    const changelog = readFileSync(join(root, "CHANGELOG.md"), "utf8");
+    const m = /^## .*$/m.exec(changelog);
+    if (m) {
+      const rest = changelog.slice(m.index + m[0].length);
+      const next = /^## /m.exec(rest);
+      notes = (m[0] + rest.slice(0, next ? next.index : Math.min(rest.length, 800))).trim();
+    }
+  } catch {
+    // CHANGELOG 缺失/不可读：保持 fallback 文案
+  }
+  const notesFile = join(releaseDir, "release-notes.md");
+  writeFileSync(notesFile, notes, "utf8");
+
   console.log(`\n========================================================`);
   console.log(`  🎉 发布准备完成：${pkg.name} v${pkg.version}`);
   console.log(`  VSIX: ${asset}`);
+  console.log(`  Release Notes: ${notesFile}`);
   console.log(`  发布为 GitHub Release（需 release 权限 token，由 owner 执行）：`);
-  console.log(`    gh release create ${tag} "${asset}" --title "${tag}" --notes "见 CHANGELOG.md"`);
+  console.log(`    gh release create ${tag} "${asset}" --title "${tag}" --notes-file "${notesFile.replace(/\\/g, "/")}"`);
   console.log(`  或上传现有资产：`);
   console.log(`    gh release upload ${tag} "${asset}" --clobber`);
   console.log(`========================================================`);

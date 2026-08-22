@@ -89,6 +89,18 @@
     customListNote: zh ? "* = 自定义提供商（可编辑名称与模型列表）" : "* = custom provider (editable name & model list)",
     saveFailed: zh ? "保存失败：" : "Save failed: ",
     saving: zh ? "保存中…" : "Saving…",
+    refresh: zh ? "重新查询" : "Re-check",
+    reset: zh ? "重置" : "Reset",
+    update: zh ? "更新" : "Update",
+    querying: zh ? "查询中…" : "Querying…",
+    queryFailed: zh ? "查询失败：" : "Query failed: ",
+    noNewer: zh ? "（没有比当前更高的版本）" : "(no newer version)",
+    dshResetConfirm: zh ? "确认要回退到插件包原始版本" : "Reset DSH core back to the bundled version",
+    dshUpgradeConfirm: zh ? "将 DSH 核心升级到" : "Upgrade DSH core to",
+    pluginUpgradeConfirm: zh ? "将 AY-DSH 升级到" : "Upgrade AY-DSH to",
+    versionQ: zh ? "版本？" : " version?",
+    selectVersionFirst: zh ? "请先选择版本" : "Select a version first",
+    notesPlaceholder: zh ? "（选择版本后在此显示 Release Notes）" : "(Release notes appear here after selecting a version)",
   };
 
   const fields = {
@@ -106,6 +118,7 @@
   /** 知名供应商的公开 API 地址（选择供应商/「默认」按钮使用；DSH 目录不提供 baseUrl）。 */
   const PROVIDER_DEFAULT_BASEURL = {
     deepseek: "https://api.deepseek.com",
+    "deepseek-official": "https://api.deepseek.com",
     ollama: "http://localhost:11434/v1",
     openai: "https://api.openai.com/v1",
     anthropic: "https://api.anthropic.com",
@@ -166,6 +179,9 @@
     document.querySelectorAll(".cfg-group").forEach((el) => {
       el.classList.toggle("active", el.dataset.group === btn.dataset.group);
     });
+    // "版本升级"组无可保存表单：隐藏底部保存按钮，切走恢复
+    const footer = saveBtn.closest(".cfg-footer");
+    if (footer) footer.style.display = btn.dataset.group === "upgrade" ? "none" : "";
   });
   document.querySelectorAll(".cfg-tabs").forEach((tabs) => {
     tabs.addEventListener("click", (ev) => {
@@ -456,7 +472,9 @@
         $("pfToggleModels").textContent = `▾ ${L.configureModels}`;
         vscode.postMessage({
           t: "fetchModels",
-          providerId: editingProviderId || undefined,
+          // 编辑用已接入的 provider id；新增时用当前选中的 provider（知名模式=目录下拉 id，
+          // 自定义模式=输入框 id）——否则 discoverModels 收不到 provider，走不到内置直返/目录查询
+          providerId: editingProviderId || (isCustom ? $("pfProviderId").value : pidSel.value) || undefined,
           baseUrl: $("pfBaseUrl").value.trim(),
           apiKey: $("pfApiKey").value.trim(),
           protocol: $("pfProtocol").value,
@@ -823,6 +841,16 @@
         providers = Array.isArray(msg.providers) ? msg.providers : [];
         renderProviders();
         break;
+      case "providerKeys": {
+        // 密钥库状态异步到达：合并后重渲染（更新 🔑 徽标，不阻塞首次列表显示）
+        const states = msg.states || {};
+        providers = (Array.isArray(providers) ? providers : []).map((p) => ({
+          ...p,
+          apiKeyConfigured: Boolean(states[p.id]),
+        }));
+        renderProviders();
+        break;
+      }
       case "folder":
         if (msg.path) {
           if (msg.field === "defaultWorkspace") fields.defaultWorkspace.value = msg.path;
@@ -900,8 +928,201 @@
         }
         break;
       }
+      case "upgradeState": {
+        const d = msg.dsh || {};
+        const p = msg.plugin || {};
+        upgDsh.current.textContent = d.current || "—";
+        upgDsh.current.dataset.bundled = d.bundled || "";
+        dshVersions = d.versions || [];
+        fillVersionSelect(upgDsh.select, dshVersions, d.current);
+        showNotesFor(upgDsh, dshVersions);
+        upgPlugin.current.textContent = p.current || "—";
+        pluginVersions = p.versions || [];
+        fillVersionSelect(upgPlugin.select, pluginVersions, p.current);
+        showNotesFor(upgPlugin, pluginVersions);
+        break;
+      }
+      case "dshQueryResult":
+        applyQueryResult("dsh", msg);
+        break;
+      case "pluginQueryResult":
+        applyQueryResult("plugin", msg);
+        break;
+      case "dshApplyResult":
+        // 升级结果提示由扩展显示在 VS Code 状态栏；此处仅恢复按钮
+        setBusy("dsh", false);
+        break;
+      case "pluginApplyResult":
+        setBusy("plugin", false);
+        break;
+      case "dshResetResult":
+        setBusy("dsh", false);
+        break;
     }
   });
+
+  /* ---------------- 版本升级组（DSH 核心 + AY-DSH 插件） ---------------- */
+
+  const upgDsh = {
+    current: $("upgDshCurrent"),
+    select: $("upgDshSelect"),
+    notes: $("upgDshNotes"),
+    reset: $("upgDshReset"),
+    update: $("upgDshUpdate"),
+    refresh: $("upgDshRefresh"),
+  };
+  const upgPlugin = {
+    current: $("upgPluginCurrent"),
+    select: $("upgPluginSelect"),
+    notes: $("upgPluginNotes"),
+    update: $("upgPluginUpdate"),
+    refresh: $("upgPluginRefresh"),
+  };
+  let dshVersions = [];
+  let pluginVersions = [];
+  let dshBusy = false;
+  let pluginBusy = false;
+
+  /** 填充版本下拉：无可用版本时回退显示当前版本（单一项）。 */
+  function fillVersionSelect(sel, versions, current) {
+    sel.innerHTML = "";
+    const list = Array.isArray(versions) && versions.length > 0 ? versions : [{ version: current || "" }];
+    for (const v of list) {
+      const opt = document.createElement("option");
+      opt.value = v.version || "";
+      opt.textContent = v.version || "—";
+      sel.appendChild(opt);
+    }
+    sel.value = list[0].version || "";
+  }
+
+  /** HTML 转义（release note 渲染前处理，防注入）。 */
+  function escapeHtml(s) {
+    return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  }
+
+  /** 轻量 markdown 渲染（release note 用）：代码块/标题/列表/粗体/行内代码/链接/换行。 */
+  function renderMarkdown(text) {
+    const lines = String(text).replace(/\r\n/g, "\n").split("\n");
+    const out = [];
+    let inCode = false;
+    let codeBuf = [];
+    const inline = (s) =>
+      s
+        .replace(/`([^`]+)`/g, "<code>$1</code>")
+        .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+        .replace(/\*([^*]+)\*/g, "<em>$1</em>")
+        .replace(/\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g, '<a href="$2">$1</a>');
+    for (const line of lines) {
+      if (/^```/.test(line)) {
+        if (inCode) {
+          out.push(`<pre><code>${escapeHtml(codeBuf.join("\n"))}</code></pre>`);
+          codeBuf = [];
+          inCode = false;
+        } else {
+          inCode = true;
+        }
+        continue;
+      }
+      if (inCode) {
+        codeBuf.push(line);
+        continue;
+      }
+      const t = line.trim();
+      if (!t) {
+        out.push("");
+        continue;
+      }
+      const h = /^(#{1,6})\s+(.*)$/.exec(t);
+      if (h) {
+        out.push(`<h${h[1].length}>${inline(h[2])}</h${h[1].length}>`);
+        continue;
+      }
+      if (/^[-*]\s+/.test(t)) {
+        out.push(`<li>${inline(t.replace(/^[-*]\s+/, ""))}</li>`);
+        continue;
+      }
+      const ol = /^\d+\.\s+(.*)$/.exec(t);
+      if (ol) {
+        out.push(`<li>${inline(ol[1])}</li>`);
+        continue;
+      }
+      out.push(`<p>${inline(t)}</p>`);
+    }
+    if (inCode && codeBuf.length) out.push(`<pre><code>${escapeHtml(codeBuf.join("\n"))}</code></pre>`);
+    return out.join("\n");
+  }
+
+  /** 按下拉选中项刷新 release note 只读框（markdown 渲染）。 */
+  function showNotesFor(group, versions) {
+    const ver = group.select.value;
+    const found = (Array.isArray(versions) ? versions : []).find((v) => v.version === ver);
+    group.notes.innerHTML = found && found.notes ? renderMarkdown(found.notes) : `<span class="notes-empty">${L.notesPlaceholder}</span>`;
+  }
+
+  /** 执行期间禁用/恢复按钮（防重复点击）。 */
+  function setBusy(kind, busy) {
+    const g = kind === "dsh" ? upgDsh : upgPlugin;
+    const btns = kind === "dsh" ? [g.reset, g.update, g.refresh] : [g.update, g.refresh];
+    btns.forEach((b) => (b.disabled = busy));
+    if (kind === "dsh") dshBusy = busy;
+    else pluginBusy = busy;
+  }
+
+  /** 查询结果落地：刷新下拉 + release note + 恢复按钮。 */
+  function applyQueryResult(kind, msg) {
+    const isDsh = kind === "dsh";
+    const g = isDsh ? upgDsh : upgPlugin;
+    g.refresh.disabled = false;
+    g.refresh.textContent = L.refresh;
+    if (msg.error) {
+      g.notes.innerHTML = `<span class="notes-empty">${L.queryFailed}${escapeHtml(msg.error)}</span>`;
+      return;
+    }
+    if (isDsh) dshVersions = msg.versions || [];
+    else pluginVersions = msg.versions || [];
+    fillVersionSelect(g.select, msg.versions || [], g.current.textContent);
+    showNotesFor(g, msg.versions || []);
+  }
+
+  if (upgDsh.refresh) {
+    upgDsh.refresh.addEventListener("click", () => {
+      upgDsh.refresh.disabled = true;
+      upgDsh.refresh.textContent = L.querying;
+      vscode.postMessage({ t: "dshQuery" });
+    });
+    upgDsh.update.addEventListener("click", () => {
+      const v = upgDsh.select.value;
+      if (!v) {
+        upgDsh.notes.innerHTML = `<span class="notes-empty">${L.selectVersionFirst}</span>`;
+        return;
+      }
+      // 确认框由扩展侧弹原生对话框（webview 内 window.confirm 被禁用）
+      setBusy("dsh", true);
+      vscode.postMessage({ t: "dshApplyConfirm", version: v });
+    });
+    upgDsh.reset.addEventListener("click", () => {
+      setBusy("dsh", true);
+      vscode.postMessage({ t: "dshResetConfirm" });
+    });
+    upgDsh.select.addEventListener("change", () => showNotesFor(upgDsh, dshVersions));
+
+    upgPlugin.refresh.addEventListener("click", () => {
+      upgPlugin.refresh.disabled = true;
+      upgPlugin.refresh.textContent = L.querying;
+      vscode.postMessage({ t: "pluginQuery" });
+    });
+    upgPlugin.update.addEventListener("click", () => {
+      const v = upgPlugin.select.value;
+      if (!v) {
+        upgPlugin.notes.innerHTML = `<span class="notes-empty">${L.selectVersionFirst}</span>`;
+        return;
+      }
+      setBusy("plugin", true);
+      vscode.postMessage({ t: "pluginApplyConfirm", version: v });
+    });
+    upgPlugin.select.addEventListener("change", () => showNotesFor(upgPlugin, pluginVersions));
+  }
 
   vscode.postMessage({ t: "init" });
 })();

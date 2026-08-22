@@ -2300,13 +2300,12 @@ async function main() {
               const defaultModel = ctx.get("agentDefaultModel");
               let providers = [];
               if (llm !== undefined && typeof llm.listProviders === "function") {
-                // 排除 deepseek-official：它是 llm-deepseek 的内部官方路由，与配置面板的
-                // deepseek 条目（llm-pi-ai 路由）并列会造成"DeepSeek 出现两次"。
-                // 面板的 deepseek 条目经 llm-pi-ai 提供 DeepSeek 选项。
+                // deepseek-official 是 llm-deepseek 的官方路由，用户可将其作为独立提供商
+                // （DeepSeek (Official)，含多模态）配置；这里不排除，而是独立命名以免与
+                // pi-ai 的 deepseek 路由（纯文本）在聊天面板混淆。
                 providers = llm
                   .listProviders()
-                  .filter((p) => p.id !== "deepseek-official")
-                  .map((p) => ({ id: p.id, name: p.name ?? p.id }));
+                  .map((p) => ({ id: p.id, name: p.id === "deepseek-official" ? "DeepSeek (Official)" : (p.name ?? p.id) }));
               }
               if (providers.length === 0) {
                 // 兜底：没有任何已配置路由时，至少提供官方 DeepSeek 可选

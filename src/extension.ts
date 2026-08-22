@@ -13,14 +13,17 @@ import * as os from "node:os";
 import * as fs from "node:fs";
 import { AgentHost, getOutputChannel, resolveNode, hostLoaderArgs } from "./host";
 import { ChatViewProvider } from "./webviewPanel";
-import { openConfigPanel } from "./configPanel";
+import { openConfigPanel, type ProviderInfo } from "./configPanel";
 import { bundledDshVersion, startDshUpdateChecker, LAST_CHECK_KEY } from "./dshUpdater";
 import { DshRuntimeManager } from "./dshRuntime";
+import { UpgradeCenter } from "./upgradeCenter";
 
 let provider: ChatViewProvider | undefined;
 let host: AgentHost | undefined;
 /** DSH 运行时管理器（P2：动态解析升级/回滚/黑名单；采纳 UI 见顶栏横幅）。 */
 let runtimeManager: DshRuntimeManager | undefined;
+/** 版本升级中心（配置面板"版本升级"组后端：GitHub 查询/缓存/升级/重置编排）。 */
+let upgradeCenter: UpgradeCenter | undefined;
 /** 当前 DSH 升级候选（顶栏横幅常驻显示，直到用户操作；latest 为空 = 无候选）。 */
 let dshCandidate: { latest: string; upgrading: boolean } | undefined;
 /** 候选版本持久化键（跨 Reload 保留横幅，直到用户操作）。 */
@@ -38,11 +41,12 @@ function setDshCandidate(context: vscode.ExtensionContext, latest: string | unde
   provider?.pushDshUpdate();
 }
 
-/** 执行升级：横幅置"升级中" → 后台安装+自检（不影响进行中的对话）→ 空闲后切换宿主。 */
-async function doDshUpgrade(context: vscode.ExtensionContext): Promise<void> {
-  const latest = dshCandidate?.latest;
+/** 执行升级（横幅路径：使用候选版本；配置面板路径：指定版本）：后台安装+自检
+ *  （不影响进行中的对话）→ 空闲后切换宿主。两入口共用同一编排。 */
+async function doDshUpgradeTo(context: vscode.ExtensionContext, version?: string): Promise<void> {
+  const latest = version ?? dshCandidate?.latest;
   if (!latest || !runtimeManager) return;
-  dshCandidate = { latest, upgrading: true };
+  if (!version) dshCandidate = { latest, upgrading: true };
   provider?.pushDshUpdate();
   // ① 后台安装闭包 + 宿主自检：全程不触碰正在运行的宿主进程，对话不受影响
   const ok = await runtimeManager.upgrade(latest);
@@ -56,6 +60,21 @@ async function doDshUpgrade(context: vscode.ExtensionContext): Promise<void> {
   // ③ 切换（对话保护）：noteHostRestart 锁定发送 + 会话自动恢复（storedSessionId）；
   //    输入区内容保留（"先记着"），就绪后用户可继续（"切换后再发"），全程静默
   provider?.noteHostRestart();
+  disposeHost();
+  void ensureHost(context);
+}
+
+/** 横幅升级入口（候选版本）。 */
+async function doDshUpgrade(context: vscode.ExtensionContext): Promise<void> {
+  return doDshUpgradeTo(context);
+}
+
+/** 重置 DSH 运行时为 VSIX 内置（清空候选/黑名单/已采纳版本/检测周期；测试与紧急恢复用）。 */
+async function resetDshRuntimeFlow(context: vscode.ExtensionContext): Promise<void> {
+  runtimeManager?.reset();
+  setDshCandidate(context, undefined);
+  // 清除检测周期：重置后 1 分钟内即可重新检测（测试升级流程的关键）
+  void context.workspaceState.update(LAST_CHECK_KEY, undefined);
   disposeHost();
   void ensureHost(context);
 }
@@ -272,7 +291,11 @@ async function ensureHost(context: vscode.ExtensionContext): Promise<AgentHost> 
   await ensureWorkspaceChoice();
   const cfg = readConfig();
   const secretKey = await context.secrets.get(SECRET_KEY);
-  const apiKey = cfg.apiKey ?? secretKey ?? undefined;
+  // deepseek-official（llm-deepseek 插件路由）密钥：配置面板统一界面保存于密钥库，
+  // 此处注入宿主 DEEPSEEK_API_KEY 环境变量（llm-deepseek 默认凭据引用），
+  // 用户无需手动配置环境变量；环境变量/设置已有值时优先（readConfig 已读入 cfg.apiKey）
+  const officialKey = await context.secrets.get("dshVscode.provider.deepseek-official.apiKey");
+  const apiKey = cfg.apiKey ?? officialKey ?? secretKey ?? undefined;
   const h = new AgentHost(
     {
       extensionPath: context.extensionUri.fsPath,
@@ -373,29 +396,61 @@ function openSettings(context: vscode.ExtensionContext): void {
       // 无论是否重启都刷新聊天视图（如提供商热生效后的模型列表）
       provider?.pushConfigToView?.();
     },
-    // 查询 DSH 提供商目录（配置面板 Provider ID 下拉数据源；宿主未运行则先拉起）
+    // 查询 DSH 提供商目录（配置面板 Provider ID 下拉数据源；宿主未运行则先拉起）。
+    // 兜底补充 deepseek-official（llm-deepseek 插件注册路由）：确保它始终出现在
+    // "添加提供商"目录中，与 pi-ai 供应商一致——用户删除后仍可重新添加配置。
     queryProviders: async (): Promise<{ id: string; name: string }[]> => {
+      let list: { id: string; name: string }[] = [];
       try {
         const h = await ensureHost(context);
-        if (h) return await h.llmProviders();
+        if (h) list = await h.llmProviders();
       } catch {
         // 宿主不可用（如缺配置）：返回空，面板按空目录处理（可手动输入/自定义）
       }
-      return [];
+      if (!list.some((p) => p.id === "deepseek-official")) {
+        list = [{ id: "deepseek-official", name: "DeepSeek (Official)" }, ...list];
+      }
+      return list;
     },
     // 把配置面板保存的提供商配置同步进 DSH（llm-pi-ai settings + credentials，热生效）。
+    // deepseek-official 是 llm-deepseek 插件注册路由，配置在 llm-deepseek 命名空间
+    // （apiKey 走 DEEPSEEK_API_KEY 环境变量），不写入 llm-pi-ai.providers——过滤掉，
+    // 避免无效写入与路由干扰；其余提供商原样同步。
     // 宿主不可用时静默失败（返回错误信息，不影响面板本身）。
     applyProviders: async (providers): Promise<string | undefined> => {
+      const list = providers ?? [];
+      const hasOfficial = list.some((p) => p.id === "deepseek-official");
+      const piAi = list.filter((p) => p.id !== "deepseek-official");
       try {
         const h = await ensureHost(context);
-        if (h) return await h.applyProviders(providers);
+        if (h) {
+          const err = await h.applyProviders(piAi);
+          // deepseek-official 密钥注入宿主 DEEPSEEK_API_KEY 环境变量需重启宿主生效；
+          // 检测到本次保存包含该路由即重启（其余提供商仍热生效，不重启）
+          if (!err && hasOfficial) {
+            disposeHost();
+            void ensureHost(context);
+          }
+          return err;
+        }
       } catch (e) {
         return e instanceof Error ? e.message : String(e);
       }
       return "host unavailable";
     },
     // 模型发现：catalog 提供商免网络返回模型+元数据；未知提供商探活端点。
+    // deepseek-official 是插件路由（llm-deepseek），模型由其默认公布（含多模态），
+    // 不走 pi-ai catalog/网络查询——直接返回官方模型清单（与插件 DEFAULT_MODELS 一致）。
     discoverModels: async (opts): Promise<{ models: { id: string; name?: string; contextWindow?: number; maxTokens?: number }[]; error?: string }> => {
+      if (opts.provider === "deepseek-official") {
+        return {
+          models: [
+            { id: "deepseek-v4-flash", name: "DeepSeek-V4-Flash", contextWindow: 1000000, maxTokens: 384000 },
+            { id: "deepseek-v4-pro", name: "DeepSeek-V4-Pro", contextWindow: 1000000, maxTokens: 384000 },
+            { id: "deepseek-v4-flash-vision-exp", name: "DeepSeek-V4-Flash-Vision-Exp", contextWindow: 1000000, maxTokens: 384000 },
+          ],
+        };
+      }
       try {
         const h = await ensureHost(context);
         if (h) return await h.discoverModels(opts);
@@ -409,6 +464,19 @@ function openSettings(context: vscode.ExtensionContext): void {
     onProvidersSynced: () => {
       void ensureHost(context).then((h) => h?.getModelInfo());
     },
+    // 版本升级（配置面板"版本升级"组）：状态快照 + 缓存 + 查询/升级/重置
+    upgradeState: () => ({
+      dshCurrent: upgradeCenter?.dshCurrent(),
+      dshBundled: upgradeCenter?.dshBundled(),
+      pluginCurrent: upgradeCenter?.pluginCurrent() ?? "0.0.0",
+    }),
+    cachedDshVersions: () => upgradeCenter?.cachedDshVersions() ?? [],
+    cachedPluginVersions: () => upgradeCenter?.cachedPluginVersions() ?? [],
+    queryDshVersions: () => upgradeCenter?.queryDshVersions() ?? Promise.resolve({ versions: [] }),
+    queryPluginVersions: () => upgradeCenter?.queryPluginVersions() ?? Promise.resolve({ versions: [] }),
+    upgradeDsh: (version) => (upgradeCenter ? upgradeCenter.upgradeDsh(version) : Promise.resolve(false)),
+    upgradePlugin: (version) => (upgradeCenter ? upgradeCenter.upgradePlugin(version) : Promise.resolve({ ok: false })),
+    resetDsh: () => (upgradeCenter ? upgradeCenter.resetDsh() : Promise.resolve()),
   });
 }
 
@@ -528,6 +596,32 @@ export function activate(context: vscode.ExtensionContext): void {
       void vscode.window.setStatusBarMessage(msg, 8000);
     },
   });
+  // 版本升级中心（配置面板"版本升级"组后端）：GitHub Releases 查询/缓存 +
+  // DSH 升级/重置复用运行时管理器与宿主切换编排；插件升级下载 VSIX 安装。
+  upgradeCenter = new UpgradeCenter({
+    extensionPath: context.extensionUri.fsPath,
+    globalState: context.globalState,
+    runtime: runtimeManager,
+    pluginVersion: () => {
+      try {
+        const pkg = JSON.parse(fs.readFileSync(path.join(context.extensionUri.fsPath, "package.json"), "utf8")) as { version?: string };
+        return pkg.version ?? "0.0.0";
+      } catch {
+        return "0.0.0";
+      }
+    },
+    onDshUpgraded: async (version) => {
+      await doDshUpgradeTo(context, version);
+    },
+    onDshReset: async () => {
+      await resetDshRuntimeFlow(context);
+    },
+    log: (msg) => getOutputChannel().appendLine(msg),
+    statusBar: (msg) => {
+      void vscode.window.setStatusBarMessage(msg, 8000);
+    },
+  });
+
   context.subscriptions.push(
     startDshUpdateChecker({
       workspaceState: context.workspaceState,
@@ -564,12 +658,7 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("dshVscode.openWorkspace", () => openWorkspaceFolder()),
     // 重置 DSH 运行时为 VSIX 内置（清空候选/黑名单/已采纳版本/检测周期；测试与紧急恢复用）
     vscode.commands.registerCommand("dshVscode.resetDshRuntime", () => {
-      runtimeManager?.reset();
-      setDshCandidate(context, undefined);
-      // 清除检测周期：重置后 1 分钟内即可重新检测（测试升级流程的关键）
-      void context.workspaceState.update(LAST_CHECK_KEY, undefined);
-      disposeHost();
-      void ensureHost(context);
+      void resetDshRuntimeFlow(context);
     }),
     vscode.commands.registerCommand("dshVscode.explainSelection", () => {
       const editor = vscode.window.activeTextEditor;
