@@ -11,6 +11,7 @@
  */
 import * as vscode from "vscode";
 import type { ProviderApplyItem } from "./protocol";
+import type { UpgradeVersionInfo } from "./upgradeCenter";
 
 /** 配置命名空间（与 extension.ts 的 CONFIG_NS 一致）。 */
 const CONFIG_NS = "dshVscode";
@@ -32,9 +33,13 @@ export interface ProviderInfo {
   models: ProviderModel[];
 }
 
-/** 首次打开时的预置提供商。 */
+/** 首次打开时的预置提供商。
+ *  deepseek-official 是 llm-deepseek 插件注册的官方路由（含多模态模型），
+ *  与 pi-ai 的 deepseek 路由并存互补；其 API Key 走环境变量 DEEPSEEK_API_KEY，
+ *  保存时不写入 llm-pi-ai.providers（由扩展侧 applyProviders 过滤）。 */
 const DEFAULT_PROVIDERS: ProviderInfo[] = [
   { id: "deepseek", name: "DeepSeek", type: "deepseek", baseUrl: "https://api.deepseek.com", models: [{ id: "deepseek-v4-flash" }, { id: "deepseek-v4-pro" }] },
+  { id: "deepseek-official", name: "DeepSeek (Official)", type: "deepseek-official", baseUrl: "https://api.deepseek.com", models: [{ id: "deepseek-v4-flash" }, { id: "deepseek-v4-pro" }, { id: "deepseek-v4-flash-vision-exp" }] },
   { id: "ollama", name: "Ollama (local)", type: "ollama", baseUrl: "http://localhost:11434/v1", models: [{ id: "llama3.1" }, { id: "qwen2.5" }] },
 ];
 const PROVIDERS_KEY = "dshProviders";
@@ -72,6 +77,20 @@ export interface ConfigPanelDeps {
   discoverModels: (opts: { provider?: string; baseURL?: string; api?: string; apiKey?: string }) => Promise<{ models: { id: string; name?: string; contextWindow?: number; maxTokens?: number }[]; error?: string }>;
   /** 提供商配置同步完成后回调（扩展侧触发宿主 getModelInfo，刷新聊天面板模型列表）。 */
   onProvidersSynced: () => void;
+  /* ---------------- 版本升级（配置面板"版本升级"组） ---------------- */
+  /** 当前版本快照（DSH 当前/内置 + 插件当前）。 */
+  upgradeState: () => { dshCurrent?: string; dshBundled?: string; pluginCurrent: string };
+  /** 缓存的版本列表（仅版本信息；无缓存返回空数组）。 */
+  cachedDshVersions: () => UpgradeVersionInfo[];
+  cachedPluginVersions: () => UpgradeVersionInfo[];
+  /** 重新查询（GitHub Releases，只列比基线更高的版本），结果写入缓存。 */
+  queryDshVersions: () => Promise<{ versions: UpgradeVersionInfo[]; error?: string }>;
+  queryPluginVersions: () => Promise<{ versions: UpgradeVersionInfo[]; error?: string }>;
+  /** 执行升级（DSH 核心 / 插件）。返回成功与否；状态栏提示由扩展侧负责。 */
+  upgradeDsh: (version: string) => Promise<boolean>;
+  upgradePlugin: (version: string) => Promise<{ ok: boolean; message?: string }>;
+  /** 重置 DSH 核心回插件包原始版本。 */
+  resetDsh: () => Promise<void>;
 }
 
 let activePanel: vscode.WebviewPanel | undefined;
@@ -84,7 +103,7 @@ export function openConfigPanel(context: vscode.ExtensionContext, deps: ConfigPa
 
   const panel = vscode.window.createWebviewPanel(
     "dshVscode.configPanel",
-    "DSH — 配置",
+    "AY-DSH — 配置",
     vscode.ViewColumn.Active,
     {
       enableScripts: true,
@@ -98,6 +117,10 @@ export function openConfigPanel(context: vscode.ExtensionContext, deps: ConfigPa
   });
 
   const zh = vscode.env.language.startsWith("zh");
+  // 升级/重置确认框按钮文案（扩展侧原生对话框；webview 内 window.confirm 被禁用）
+  const CONFIRM_UPGRADE = zh ? "确认升级" : "Upgrade";
+  const CONFIRM_RESET = zh ? "确认重置" : "Reset";
+  const CONFIRM_CANCEL = zh ? "取消" : "Cancel";
   const scriptUri = panel.webview.asWebviewUri(vscode.Uri.joinPath(context.extensionUri, "media", "config-panel.js"));
   const styleUri = panel.webview.asWebviewUri(vscode.Uri.joinPath(context.extensionUri, "media", "config-panel.css"));
   panel.webview.html = renderHtml(panel.webview, scriptUri, styleUri, zh);
@@ -148,23 +171,9 @@ export function openConfigPanel(context: vscode.ExtensionContext, deps: ConfigPa
     try {
       const c = deps.readConfig();
       const cfg = vscode.workspace.getConfiguration(CONFIG_NS);
-      // 密钥库查询逐项容错：单个提供商 secret 读取异常不影响整体配置推送
-      const providers = await Promise.all(
-        loadProviders().map(async (p) => {
-          let configured = false;
-          try {
-            configured = Boolean(await context.secrets.get(providerSecretKey(p.id)));
-            // 旧版全局 API Key（dshVscode.apiKey）迁移兜底：deepseek 条目读不到专属 key 时
-            // 视为已配置（旧面板曾把 deepseek key 存在全局键）。
-            if (!configured && p.id === "deepseek") {
-              configured = Boolean(await context.secrets.get(SECRET_KEY));
-            }
-          } catch {
-            configured = false;
-          }
-          return { ...p, apiKeyConfigured: configured };
-        })
-      );
+      // 快路径：providers 列表立即推送（密钥状态先置 false），不等密钥库——
+      // 密钥库 IPC 较慢（尤其首次解锁），逐项 await 会让面板"先空后满"（两阶段感）
+      const providers = loadProviders().map((p) => ({ ...p, apiKeyConfigured: false }));
       panel.webview.postMessage({
         t: "config",
         config: {
@@ -179,6 +188,31 @@ export function openConfigPanel(context: vscode.ExtensionContext, deps: ConfigPa
         },
         providers,
       });
+      // 慢路径：异步读密钥库，完成后补发密钥状态（🔑 徽标）——不阻塞列表渲染
+      void (async () => {
+        try {
+          const states: Record<string, boolean> = {};
+          await Promise.all(
+            loadProviders().map(async (p) => {
+              let configured = false;
+              try {
+                configured = Boolean(await context.secrets.get(providerSecretKey(p.id)));
+                // 旧版全局 API Key（dshVscode.apiKey）迁移兜底：deepseek 条目读不到专属 key 时
+                // 视为已配置（旧面板曾把 deepseek key 存在全局键）。
+                if (!configured && p.id === "deepseek") {
+                  configured = Boolean(await context.secrets.get(SECRET_KEY));
+                }
+              } catch {
+                configured = false;
+              }
+              states[p.id] = configured;
+            })
+          );
+          panel.webview.postMessage({ t: "providerKeys", states });
+        } catch {
+          // 密钥状态读取失败不影响面板（徽标保持未显示）
+        }
+      })();
     } catch (e) {
       vscode.window.setStatusBarMessage(
         `✗ Config panel load failed: ${e instanceof Error ? e.message : String(e)}`,
@@ -201,10 +235,44 @@ export function openConfigPanel(context: vscode.ExtensionContext, deps: ConfigPa
     }
   };
 
+  /** 推送版本升级初始状态（当前版本 + 缓存列表，无缓存则面板显示当前版本）。 */
+  const pushUpgradeState = (): void => {
+    const st = deps.upgradeState();
+    panel.webview.postMessage({
+      t: "upgradeState",
+      dsh: { current: st.dshCurrent, bundled: st.dshBundled, versions: deps.cachedDshVersions() },
+      plugin: { current: st.pluginCurrent, versions: deps.cachedPluginVersions() },
+    });
+  };
+
+  /** 查询并推送结果（kind: "dsh" | "plugin"）。 */
+  const runQuery = async (kind: "dsh" | "plugin"): Promise<void> => {
+    const r = kind === "dsh" ? await deps.queryDshVersions() : await deps.queryPluginVersions();
+    panel.webview.postMessage({ t: `${kind}QueryResult`, versions: r.versions, error: r.error });
+  };
+
+  /** 执行升级并推送结果。 */
+  const runApply = async (kind: "dsh" | "plugin", version: string): Promise<void> => {
+    if (kind === "dsh") {
+      const ok = await deps.upgradeDsh(version);
+      panel.webview.postMessage({ t: "dshApplyResult", ok });
+    } else {
+      const r = await deps.upgradePlugin(version);
+      panel.webview.postMessage({ t: "pluginApplyResult", ok: r.ok, message: r.message });
+    }
+  };
+
+  /** 重置 DSH 核心回插件包原始版本。 */
+  const runReset = async (): Promise<void> => {
+    await deps.resetDsh();
+    panel.webview.postMessage({ t: "dshResetResult", ok: true });
+  };
+
   panel.webview.onDidReceiveMessage(async (msg) => {
     switch (msg.t) {
       case "init": {
         await sendConfig();
+        pushUpgradeState();
         break;
       }
       case "pickFolder": {
@@ -334,9 +402,39 @@ export function openConfigPanel(context: vscode.ExtensionContext, deps: ConfigPa
       }
       case "save": {
         const v = msg.values ?? {};
+        // 无变化秒回：先归一化比较运行参数 + 判断是否有 API Key 操作。
+        // 都没有变化时直接返回（不写配置、不重启、不刷新），避免"点保存转半天"。
+        const prevC0 = deps.readConfig();
+        const prevCfg0 = vscode.workspace.getConfiguration(CONFIG_NS);
+        const prev0 = {
+          permissionMode: prevC0.permissionMode,
+          nodePath: prevC0.nodePath,
+          defaultWorkspace: prevCfg0.get<string>("defaultWorkspace") ?? "",
+          maxOutputChars: prevCfg0.get<number>("maxOutputChars") ?? 40000,
+          maxSteps: Number.isFinite(prevC0.maxSteps) && prevC0.maxSteps >= 0 ? prevC0.maxSteps : 100,
+          subagentMaxDepth: Number.isFinite(prevC0.subagentMaxDepth) && prevC0.subagentMaxDepth > 0 ? prevC0.subagentMaxDepth : 3,
+          maxParallelSubagents: Number.isFinite(prevC0.maxParallelSubagents) && prevC0.maxParallelSubagents > 0 ? prevC0.maxParallelSubagents : 5,
+        };
+        const next0 = {
+          permissionMode: ["workspace-write", "read-only", "danger-full-access"].includes(v.permissionMode) ? v.permissionMode : "workspace-write",
+          nodePath: typeof v.nodePath === "string" ? v.nodePath.trim() : "",
+          defaultWorkspace: typeof v.defaultWorkspace === "string" ? v.defaultWorkspace.trim() : "",
+          maxOutputChars: Number.isFinite(v.maxOutputChars) && v.maxOutputChars > 0 ? v.maxOutputChars : 40000,
+          maxSteps: Number.isFinite(v.maxSteps) && v.maxSteps >= 0 ? v.maxSteps : 100,
+          subagentMaxDepth: Number.isFinite(v.subagentMaxDepth) && v.subagentMaxDepth > 0 ? v.subagentMaxDepth : 3,
+          maxParallelSubagents: Number.isFinite(v.maxParallelSubagents) && v.maxParallelSubagents > 0 ? v.maxParallelSubagents : 5,
+        };
+        const keyOp = v.clearKey === true || (typeof v.apiKey === "string" && v.apiKey.trim() !== "");
+        if (JSON.stringify(prev0) === JSON.stringify(next0) && !keyOp) {
+          vscode.window.setStatusBarMessage(zh ? "✅ 配置无变化，无需保存" : "✅ No changes to save", 3000);
+          panel.webview.postMessage({ t: "saved", ok: true, message: zh ? "配置无变化" : "No changes" });
+          break;
+        }
         // 保存事务开始：扩展侧忽略逐项配置变更事件，等 onSaved 统一处理
         deps.onConfigSaveStart();
-        vscode.window.setStatusBarMessage(zh ? "⏳ 正在保存配置…" : "⏳ Saving settings…", 3000);
+        // 保存中提示常显（60s 兜底），保存完成时被成功/失败/无变化提示立即覆盖——
+        // 保证"保存并应用"执行全程（含宿主重启，可能数秒）状态栏都有明确反馈
+        vscode.window.setStatusBarMessage(zh ? "⏳ 正在保存配置…" : "⏳ Saving settings…", 60000);
         try {
           // 记录保存前生效的宿主运行参数（判断本次保存是否真的改变了需要重启的配置）
           const prevC = deps.readConfig();
@@ -437,6 +535,60 @@ export function openConfigPanel(context: vscode.ExtensionContext, deps: ConfigPa
         }
         break;
       }
+      case "dshApplyConfirm": {
+        const v = String(msg.version ?? "");
+        if (!v) break;
+        const pick = await vscode.window.showWarningMessage(
+          zh ? `将 DSH 核心升级到 ${v} 版本？` : `Upgrade DSH core to ${v}?`,
+          { modal: true },
+          CONFIRM_UPGRADE,
+          CONFIRM_CANCEL
+        );
+        if (pick === CONFIRM_UPGRADE) void runApply("dsh", v);
+        else panel.webview.postMessage({ t: "dshApplyResult", ok: false });
+        break;
+      }
+      case "pluginApplyConfirm": {
+        const v = String(msg.version ?? "");
+        if (!v) break;
+        const pick = await vscode.window.showWarningMessage(
+          zh ? `将 AY-DSH 升级到 ${v} 版本？` : `Upgrade AY-DSH to ${v}?`,
+          { modal: true },
+          CONFIRM_UPGRADE,
+          CONFIRM_CANCEL
+        );
+        if (pick === CONFIRM_UPGRADE) void runApply("plugin", v);
+        else panel.webview.postMessage({ t: "pluginApplyResult", ok: false });
+        break;
+      }
+      case "dshResetConfirm": {
+        const st = deps.upgradeState();
+        const bundled = st.dshBundled ?? st.dshCurrent ?? "?";
+        const pick = await vscode.window.showWarningMessage(
+          zh ? `确认要回退到插件包原始版本 ${bundled}？` : `Reset DSH core back to the bundled version ${bundled}?`,
+          { modal: true },
+          CONFIRM_RESET,
+          CONFIRM_CANCEL
+        );
+        if (pick === CONFIRM_RESET) void runReset();
+        else panel.webview.postMessage({ t: "dshResetResult", ok: false });
+        break;
+      }
+      case "dshQuery":
+        void runQuery("dsh");
+        break;
+      case "pluginQuery":
+        void runQuery("plugin");
+        break;
+      case "dshApply":
+        void runApply("dsh", String(msg.version ?? ""));
+        break;
+      case "pluginApply":
+        void runApply("plugin", String(msg.version ?? ""));
+        break;
+      case "dshReset":
+        void runReset();
+        break;
       case "cancel":
         panel.dispose();
         break;
@@ -446,7 +598,7 @@ export function openConfigPanel(context: vscode.ExtensionContext, deps: ConfigPa
 
 function renderHtml(webview: vscode.Webview, scriptUri: vscode.Uri, styleUri: vscode.Uri, zh: boolean): string {
   const L = {
-    title: zh ? "DSH 配置" : "DSH Settings",
+    title: zh ? "AY-DSH 配置" : "AY-DSH Settings",
     navLabel: zh ? "配置分组" : "Settings groups",
     groupModel: zh ? "模型配置" : "Model",
     providersTitle: zh ? "已接入模型提供商" : "Connected model providers",
@@ -472,6 +624,27 @@ function renderHtml(webview: vscode.Webview, scriptUri: vscode.Uri, styleUri: vs
     maxParallelHint: zh ? "多 Agent 模式下同时派发的子代理数量上限（默认 5）" : "Max concurrently dispatched subagents in multi-agent mode (default 5)",
     browse: zh ? "浏览…" : "Browse…",
     save: zh ? "保存并应用" : "Save & Apply",
+    groupUpgrade: zh ? "版本升级" : "Upgrades",
+    dshSection: zh ? "DSH 核心升级" : "DSH Core",
+    pluginSection: zh ? "AY-DSH-VSCode 插件升级" : "AY-DSH-VSCode extension",
+    dshCurrent: zh ? "当前 DSH 核心版本" : "Current DSH core version",
+    pluginCurrentLabel: zh ? "当前 AY-DSH 版本" : "Current AY-DSH version",
+    latestLabel: zh ? "最新版本" : "Latest version",
+    reset: zh ? "重置" : "Reset",
+    update: zh ? "更新" : "Update",
+    refresh: zh ? "重新查询" : "Re-check",
+    notesPlaceholder: zh ? "（选择版本后在此显示 Release Notes）" : "(Release notes appear here after selecting a version)",
+    loading: zh ? "查询中…" : "Querying…",
+    noNewer: zh ? "（没有比当前更高的版本）" : "(no newer version available)",
+    dshResetConfirm: zh ? "确认要回退到插件包原始版本" : "Reset DSH core back to the bundled version",
+    dshUpgradeConfirm: zh ? "将 DSH 核心升级到" : "Upgrade DSH core to",
+    pluginUpgradeConfirm: zh ? "将 AY-DSH 升级到" : "Upgrade AY-DSH to",
+    versionSuffix: zh ? "版本？" : " version?",
+    resetHint: zh ? "回退 DSH 核心到插件包原始版本（清空升级记录）" : "Reset DSH core back to the bundled version (clears upgrade history)",
+    updateDshHint: zh ? "将 DSH 核心升级到下拉框所选版本（先自检兼容性）" : "Upgrade DSH core to the selected version (compatibility self-check first)",
+    refreshDshHint: zh ? "从 GitHub 重新拉取 DSH 核心可用版本（只列比内置更高的）" : "Re-fetch DSH core versions from GitHub (newer than bundled only)",
+    updatePluginHint: zh ? "将 AY-DSH 插件升级到下拉框所选版本（下载 VSIX 安装，需重载窗口）" : "Upgrade the AY-DSH extension to the selected version (downloads VSIX; reload required)",
+    refreshPluginHint: zh ? "从 GitHub 重新拉取插件可用版本（只列比当前更高的）" : "Re-fetch extension versions from GitHub (newer than current only)",
   };
 
   // CSP：与聊天视图同款写法（webview.cspSource 为标准做法）。
@@ -500,6 +673,7 @@ function renderHtml(webview: vscode.Webview, scriptUri: vscode.Uri, styleUri: vs
     <button type="button" class="cfg-nav active" data-group="model">${L.groupModel}</button>
     <button type="button" class="cfg-nav" data-group="runtime">${L.groupRuntime}</button>
     <button type="button" class="cfg-nav" data-group="control">${L.groupControl}</button>
+    <button type="button" class="cfg-nav" data-group="upgrade">${L.groupUpgrade}</button>
   </nav>
 
   <section class="cfg-content">
@@ -571,6 +745,45 @@ function renderHtml(webview: vscode.Webview, scriptUri: vscode.Uri, styleUri: vs
           <label for="cfgMaxParallel">${L.maxParallel}</label>
           <input type="number" id="cfgMaxParallel" min="1" step="1" value="5">
           <span class="hint">${L.maxParallelHint}</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="cfg-group" data-group="upgrade">
+      <div class="cfg-pane active" data-pane="main">
+        <h3 class="sub-title">${L.dshSection}</h3>
+        <div class="field">
+          <div class="row version-row">
+            <span>${L.dshCurrent}：<b id="upgDshCurrent">—</b></span>
+            <button type="button" class="primary" id="upgDshReset" title="${L.resetHint}">${L.reset}</button>
+          </div>
+        </div>
+        <div class="field">
+          <label for="upgDshSelect">${L.latestLabel}：</label>
+          <div class="row">
+            <select id="upgDshSelect"></select>
+            <button type="button" class="primary" id="upgDshUpdate" title="${L.updateDshHint}">${L.update}</button>
+            <button type="button" class="primary" id="upgDshRefresh" title="${L.refreshDshHint}">${L.refresh}</button>
+          </div>
+        </div>
+        <div class="field">
+          <div id="upgDshNotes" class="notes-box notes-rendered" aria-label="${L.notesPlaceholder}"></div>
+        </div>
+
+        <h3 class="sub-title upgrade-divider">${L.pluginSection}</h3>
+        <div class="field">
+          <span>${L.pluginCurrentLabel}：<b id="upgPluginCurrent">—</b></span>
+        </div>
+        <div class="field">
+          <label for="upgPluginSelect">${L.latestLabel}：</label>
+          <div class="row">
+            <select id="upgPluginSelect"></select>
+            <button type="button" class="primary" id="upgPluginUpdate" title="${L.updatePluginHint}">${L.update}</button>
+            <button type="button" class="primary" id="upgPluginRefresh" title="${L.refreshPluginHint}">${L.refresh}</button>
+          </div>
+        </div>
+        <div class="field">
+          <div id="upgPluginNotes" class="notes-box notes-rendered" aria-label="${L.notesPlaceholder}"></div>
         </div>
       </div>
     </div>

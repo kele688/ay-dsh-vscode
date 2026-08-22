@@ -139813,7 +139813,7 @@ function installModelSelection(agentCtx, selection) {
 
 // host/agent-host.mjs
 var NAME2 = "dsh-vscode-host";
-var CORE_VERSION = "0.2.1";
+var CORE_VERSION = "0.3.0";
 var SESSION_PREFIX = "dsh-vscode-";
 var workMode = "single";
 var getWorkMode = () => workMode;
@@ -141340,7 +141340,7 @@ async function main() {
             const defaultModel = ctx.get("agentDefaultModel");
             let providers = [];
             if (llm !== void 0 && typeof llm.listProviders === "function") {
-              providers = llm.listProviders().filter((p) => p.id !== "deepseek-official").map((p) => ({ id: p.id, name: p.name ?? p.id }));
+              providers = llm.listProviders().map((p) => ({ id: p.id, name: p.id === "deepseek-official" ? "DeepSeek (Official)" : p.name ?? p.id }));
             }
             if (providers.length === 0) {
               providers = [{ id: "deepseek-official", name: "DeepSeek" }];
