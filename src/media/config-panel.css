@@ -454,8 +454,8 @@ button.secondary:hover {
 /* ---- 版本升级：release note 渲染框（markdown 渲染；默认约 5 行，最多 10 行滚动） ---- */
 div.notes-box.notes-rendered {
   width: 100%;
-  min-height: 5em;               /* 约 5 行 */
-  max-height: 10em;              /* 约 10 行，超出出现滚动条 */
+  min-height: 75px;              /* 约 5 行：内容少时兜底 */
+  max-height: 150px;             /* 约 10 行：内容多时封顶，超出出现滚动条 */
   overflow-y: auto;
   box-sizing: border-box;
   font-family: var(--vscode-editor-font-family, inherit);

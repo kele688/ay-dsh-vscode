@@ -17,7 +17,6 @@
  *     owner 管理（见维护文档的发布路线图）。
  */
 import { spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
 import { readFileSync, writeFileSync, readdirSync, statSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -63,8 +62,7 @@ try {
   const asset = join(releaseDir, vsix.f).replace(/\\/g, "/");
 
   // 生成双语 Release Notes：取 CHANGELOG（EN）与 CHANGELOG.zh-CN（ZH）最新条目拼接，
-  // 并自动附带校验和（SHA256），供 `gh release create --notes-file` 一次带全（避免发布
-  // 后再改 note）；当版条目过少时给出警告（防止 release note 过于简略）。
+  // 供 `gh release create --notes-file` 使用。资产 SHA256 由 GitHub 自动计算展示，无需写入 note。
   const grabEntry = (path) => {
     let out = "";
     try {
@@ -80,11 +78,7 @@ try {
   };
   const enEntry = grabEntry(join(root, "CHANGELOG.md"));
   const zhEntry = grabEntry(join(root, "CHANGELOG.zh-CN.md"));
-  let notes = `# ${pkg.name} v${pkg.version}\n\n${enEntry}\n\n---\n\n${zhEntry}\n`;
-  try {
-    const sha = createHash("sha256").update(readFileSync(asset)).digest("hex");
-    notes += `\nSHA256: ${sha}\n`;
-  } catch { /* VSIX 未就绪则不附校验和 */ }
+  const notes = `# ${pkg.name} v${pkg.version}\n\n${enEntry}\n\n---\n\n${zhEntry}\n`;
   const notesFile = join(releaseDir, "release-notes.md");
   writeFileSync(notesFile, notes, "utf8");
 
