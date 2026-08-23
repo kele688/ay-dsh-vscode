@@ -98,7 +98,7 @@ export class UpgradeCenter {
     return this.queryReleases(
       DSH_REPO,
       DSH_TAG_PREFIX,
-      (v) => bundled !== undefined && semverGt(v, bundled),
+      (v) => bundled !== undefined && (v === bundled || semverGt(v, bundled)),
       CACHE_KEY_DSH
     );
   }
@@ -109,7 +109,7 @@ export class UpgradeCenter {
     return this.queryReleases(
       PLUGIN_REPO,
       PLUGIN_TAG_PREFIX,
-      (v) => Boolean(current) && semverGt(v, current),
+      (v) => Boolean(current) && (v === current || semverGt(v, current)),
       CACHE_KEY_PLUGIN
     );
   }
@@ -178,6 +178,7 @@ export class UpgradeCenter {
     const ok = await this.deps.runtime.upgrade(version);
     if (ok) {
       this.deps.log(`[upgrade-center] DSH upgraded to ${version} — switching host`);
+      await this.deps.globalState.update(CACHE_KEY_DSH, undefined);
       await this.deps.onDshUpgraded(version);
     }
     return ok;
@@ -187,6 +188,7 @@ export class UpgradeCenter {
   async resetDsh(): Promise<void> {
     this.deps.log("[upgrade-center] resetting DSH core to bundled");
     this.deps.runtime.reset();
+    await this.deps.globalState.update(CACHE_KEY_DSH, undefined);
     await this.deps.onDshReset();
   }
 
@@ -198,6 +200,14 @@ export class UpgradeCenter {
    */
   async upgradePlugin(version: string): Promise<{ ok: boolean; message?: string }> {
     const zh = vscode.env.language.startsWith("zh");
+    const current = this.pluginCurrent();
+    // 不高于当前版本：直接拒绝（与 upgradeDsh 一致），避免选中当前版本却触发重回安装
+    if (current && !semverGt(version, current)) {
+      this.deps.statusBar(
+        zh ? `✗ 所选版本 ${version} 不高于当前版本 ${current}` : `✗ Selected version ${version} is not newer than current ${current}`
+      );
+      return { ok: false, message: "not newer than current" };
+    }
     try {
       // 1) 取该版本的 Release（找 VSIX 资产下载地址）
       const ctrl = new AbortController();
@@ -230,6 +240,7 @@ export class UpgradeCenter {
       this.deps.statusBar(
         zh ? `✅ 插件已升级到 ${version}，请重新加载窗口生效` : `✅ Extension upgraded to ${version} — reload the window to apply`
       );
+      await this.deps.globalState.update(CACHE_KEY_PLUGIN, undefined);
       return { ok: true };
     } catch (e) {
       const message = e instanceof Error ? e.message : String(e);

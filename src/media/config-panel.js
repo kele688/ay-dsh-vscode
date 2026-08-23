@@ -993,10 +993,13 @@
         dshVersions = d.versions || [];
         fillVersionSelect(upgDsh.select, dshVersions, d.current);
         showNotesFor(upgDsh, dshVersions);
+        // 缓存为空（= DSH 刚升级/重置导致缓存被清，或首次）：自动补查一次，及时拿到新基线
+        if (dshVersions.length === 0) vscode.postMessage({ t: "dshQuery" });
         upgPlugin.current.textContent = p.current || "—";
         pluginVersions = p.versions || [];
         fillVersionSelect(upgPlugin.select, pluginVersions, p.current);
         showNotesFor(upgPlugin, pluginVersions);
+        if (pluginVersions.length === 0) vscode.postMessage({ t: "pluginQuery" });
         break;
       }
       case "dshQueryResult":
