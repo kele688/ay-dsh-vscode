@@ -137533,6 +137533,7 @@ var BOOTSTRAP_NAMES = /* @__PURE__ */ new Set([
   "EDITOR",
   "VISUAL",
   "PAGER",
+  "BROWSER",
   "DEEPSEEK_BASE_URL",
   "DEEPSEEK_SEARCH_BASE_URL",
   "SSL_CERT_FILE",
@@ -137740,8 +137741,11 @@ ${deepest.stack ?? deepest.message}` : "";
 // node_modules/@deepseek-ai/dsh-credentials/lib/index.js
 var REF_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
 function credentialRef(value) {
-  if (!REF_PATTERN.test(value)) throw new TypeError(`credential ref "${value}" must match ${String(REF_PATTERN)}`);
+  if (!isCredentialRefName(value)) throw new TypeError(`credential ref "${value}" must match ${String(REF_PATTERN)}`);
   return value;
+}
+function isCredentialRefName(value) {
+  return REF_PATTERN.test(value);
 }
 
 // node_modules/@earendil-works/pi-ai/dist/providers/data/amazon-bedrock.json
@@ -139740,7 +139744,7 @@ var EMPTY_RESPONSE_CODE = "EMPTY_RESPONSE";
 var STRUCTURED_CONTEXT_OVERFLOW = new RegExp(String.raw`(?:^|[^a-z0-9])context[\s_-](?:length|window)[\s_-]` + String.raw`(?:exceed(?:ed|s)?|overflow(?:ed)?|limit[\s_-]exceeded)(?:$|[^a-z0-9])`, "i");
 var TOO_LARGE_FOR_CONTEXT = new RegExp(String.raw`\b(?:request|prompt|input|messages?)\s+(?:is\s+|are\s+)?` + String.raw`too\s+(?:large|long)\s+for\s+(?:(?:this|the)\s+)?` + String.raw`(?:model(?:'s)?\s+)?context(?:\s+window)?\b`, "i");
 var EXCEEDS_MODEL_CONTEXT = new RegExp(String.raw`\b(?:input|prompt|request|messages?)\b.{0,40}` + String.raw`\b(?:exceed(?:s|ed)?|overflows?|is\s+larger\s+than)\b.{0,40}` + String.raw`\b(?:the\s+)?(?:model(?:'s)?\s+)?context(?:\s+(?:length|window))?\b`, "i");
-var DEFAULT_MAX_RETRIES2 = 2;
+var DEFAULT_MAX_RETRIES2 = 5;
 var DEFAULT_INITIAL_DELAY_MS = 500;
 var DEFAULT_MAX_DELAY_MS = 1e4;
 var DEFAULT_JITTER_RATIO = 0.1;
@@ -139813,7 +139817,7 @@ function installModelSelection(agentCtx, selection) {
 
 // host/agent-host.mjs
 var NAME2 = "dsh-vscode-host";
-var CORE_VERSION = "0.3.0";
+var CORE_VERSION = "0.4.0";
 var SESSION_PREFIX = "dsh-vscode-";
 var workMode = "single";
 var getWorkMode = () => workMode;

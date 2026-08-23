@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.4.0] - 2026-08-23
+
+- self-contained DSH core 0.1.1-rc.2 (replaces 0.1.0-rc.6)
+- multimodal model support: DeepSeek-V4-Vision-Exp for image understanding
+- paste images into a scrollable horizontal rail with an [imageN] anchor reference
+- lightbox card: prev/next buttons, mouse-wheel navigation, close button, filename & counter
+- history message images scroll horizontally and open a multi-image lightbox
+- gentle image limits (PNG/JPG/WebP/GIF, 20/message, ≤5MB each, content dedup)
+- configurable auto-compaction (auto / thresholdRatio / maxTokens) in the control-params group; threshold ratio as percent (80% default)
+- compaction start/end surfaced on the status bar with the freed-token count
+- chat header logo rebranded to AY-DSH; input placeholder updated
+- paste is the only image entry (drag-and-drop and the attach button removed)
+
 ## [0.3.0] - 2026-08-20
 
 - Multi-provider LLM routing (DeepSeek/Zhipu/ZAI) with in-session model switching

@@ -60,17 +60,45 @@ function copyTree(src, dest) {
 }
 
 async function ensureKoffi() {
+  // 主 @koromix/koffi 是否存在：DSH 内核从某版本起弃用 koffi 后，这里补出的平台子包
+  // 将是"无主包"的孤儿，会让 vsce 的 `npm list --production` 校验报 invalid/extraneous。
+  // 因此主包不存在时直接跳过补全，并清理可能残留的孤儿平台子包。
+  const mainKoffi = join(root, "node_modules", "@koromix", "koffi", "package.json");
+  if (!existsSync(mainKoffi)) {
+    log("main @koromix/koffi absent (DSH no longer uses koffi) — skipping cross-platform koffi fill");
+    for (const p of REQUIRED_KOFFI) {
+      const d = join(root, "node_modules", "@koromix", p);
+      if (existsSync(d)) {
+        rmSync(d, { recursive: true, force: true });
+        log(`koffi ${p}: removed (orphan, no main koffi)`);
+      }
+    }
+    return;
+  }
+
+  // 主包存在：以主包的真实版本补齐其它平台子包（避免硬编码版本与主包不符）。
+  let koffiVersion = KOFFI_VERSION;
+  try {
+    koffiVersion = JSON.parse(readFileSync(mainKoffi, "utf8")).version || KOFFI_VERSION;
+  } catch { /* keep default */ }
+
   rmSync(TMP, { recursive: true, force: true });
   mkdirSync(TMP, { recursive: true });
   for (const p of REQUIRED_KOFFI) {
     const dest = join(root, "node_modules", "@koromix", p);
     const marker = join(dest, "package.json");
     if (existsSync(marker)) {
-      log(`koffi ${p}: already present`);
-      continue;
+      let cur = "";
+      try { cur = JSON.parse(readFileSync(marker, "utf8")).version || ""; } catch { /* ignore */ }
+      if (cur === koffiVersion) {
+        log(`koffi ${p}: already present (${cur})`);
+        continue;
+      }
+      log(`koffi ${p}: version mismatch (${cur || "?"} vs ${koffiVersion}) — refreshing`);
+      rmSync(dest, { recursive: true, force: true });
     }
-    log(`koffi ${p}: downloading…`);
-    const url = `${REG}/@koromix/${p}/-/${p}-${KOFFI_VERSION}.tgz`;
+    log(`koffi ${p}: downloading ${koffiVersion}…`);
+    const url = `${REG}/@koromix/${p}/-/${p}-${koffiVersion}.tgz`;
     const res = await fetch(url);
     if (!res.ok) fail(`failed to download @koromix/${p} (HTTP ${res.status})`);
     const tgz = join(TMP, `${p}.tgz`);

@@ -17,6 +17,7 @@
  *     owner 管理（见维护文档的发布路线图）。
  */
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { readFileSync, writeFileSync, readdirSync, statSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -24,7 +25,8 @@ import { fileURLToPath } from "node:url";
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const args = process.argv.slice(2);
 const bumpLevel = args[args.indexOf("--bump") + 1] ?? "patch";
-const message = args[args.indexOf("--message") + 1];
+const messageEn = args[args.indexOf("--message-en") + 1];
+const messageZh = args[args.indexOf("--message-zh") + 1];
 const noBump = args.includes("--no-bump");
 
 function run(step, cmd, cmdArgs) {
@@ -42,7 +44,8 @@ try {
     console.log("跳过版本递增（--no-bump）");
   } else {
     const bumpArgs = [join(root, "scripts", "bump-version.mjs"), bumpLevel];
-    if (message) bumpArgs.push("--message", message);
+    if (messageEn) bumpArgs.push("--message-en", messageEn);
+    if (messageZh) bumpArgs.push("--message-zh", messageZh);
     run("版本递增", process.execPath, bumpArgs);
   }
   run("构建（esbuild bundle + media）", process.execPath, [join(root, "scripts", "build.mjs")]);
@@ -59,21 +62,29 @@ try {
   const tag = `v${pkg.version}`;
   const asset = join(releaseDir, vsix.f).replace(/\\/g, "/");
 
-  // 生成 Release Notes：取 CHANGELOG.md 最新条目（首个 ## 标题到下一个 ## 标题之间）。
-  // 写入 release/release-notes.md，供 `gh release create --notes-file` 使用——
-  // 避免发布时 notes 缺失/占位导致 GitHub Releases 页与配置面板无实质内容。
-  let notes = `# ${pkg.name} v${pkg.version}\n\nRelease notes: see CHANGELOG.md`;
+  // 生成双语 Release Notes：取 CHANGELOG（EN）与 CHANGELOG.zh-CN（ZH）最新条目拼接，
+  // 并自动附带校验和（SHA256），供 `gh release create --notes-file` 一次带全（避免发布
+  // 后再改 note）；当版条目过少时给出警告（防止 release note 过于简略）。
+  const grabEntry = (path) => {
+    let out = "";
+    try {
+      const c = readFileSync(path, "utf8");
+      const m = /^## .*$/m.exec(c);
+      if (m) {
+        const rest = c.slice(m.index + m[0].length);
+        const next = /^## /m.exec(rest);
+        out = (m[0] + rest.slice(0, next ? next.index : Math.min(rest.length, 1600))).trim();
+      }
+    } catch { /* CHANGELOG 缺失/不可读：保持空 */ }
+    return out;
+  };
+  const enEntry = grabEntry(join(root, "CHANGELOG.md"));
+  const zhEntry = grabEntry(join(root, "CHANGELOG.zh-CN.md"));
+  let notes = `# ${pkg.name} v${pkg.version}\n\n${enEntry}\n\n---\n\n${zhEntry}\n`;
   try {
-    const changelog = readFileSync(join(root, "CHANGELOG.md"), "utf8");
-    const m = /^## .*$/m.exec(changelog);
-    if (m) {
-      const rest = changelog.slice(m.index + m[0].length);
-      const next = /^## /m.exec(rest);
-      notes = (m[0] + rest.slice(0, next ? next.index : Math.min(rest.length, 800))).trim();
-    }
-  } catch {
-    // CHANGELOG 缺失/不可读：保持 fallback 文案
-  }
+    const sha = createHash("sha256").update(readFileSync(asset)).digest("hex");
+    notes += `\nSHA256: ${sha}\n`;
+  } catch { /* VSIX 未就绪则不附校验和 */ }
   const notesFile = join(releaseDir, "release-notes.md");
   writeFileSync(notesFile, notes, "utf8");
 
