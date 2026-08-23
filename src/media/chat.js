@@ -143,13 +143,14 @@
       removeImage: (name) => `移除图片 ${name || ""}`,
       modelNoImage: (name) => `当前模型 ${name || ""} 不支持图片`
         + "——请切换到支持多模态的模型（如 DeepSeek (Official) 的 vision 模型）后再粘贴图片",
-      imageLimit: (n) => `每条消息最多可包含 ${n} 张图片`,
+      imageLimit: (n) => `这条消息的图片已经放满 ${n} 张了——先删掉一张，或直接用文字继续就好`,
       imageAdded: (name) => `已添加图片：${name || "image"}`
-        + "（将随下一条消息发送；点 × 可移除）",
+        + "（将随下一条消息发送，点 × 可以移除）",
       imageRef: (idx) => `[图${idx}]`,
-      imageDup: (name) => `已跳过重复图片：${name || "image"}`,
-      fileUnsupported: (name) => `${name || "文件"}：仅支持粘贴 PNG/JPG/WebP/GIF 图片`
-        + "——请粘贴图片内容，或把文件文本复制进输入框",
+      imageDup: (name) => `这张图片已经加过了（${name}），这次就没再重复添加`,
+      imageTooLarge: (mb) => `这张图片超过单张 ${mb}MB 的上限了——先压缩一下，或换一张小一点的就好`,
+      fileUnsupported: (name) => `“${name || "文件"}”似乎还不是我支持的图片格式（PNG / JPG / WebP / GIF）——换成其中一种就好`,
+      closeLightbox: "关闭",
     },
     en: {
       thinking: "Thinking",
@@ -233,13 +234,14 @@
       removeImage: (name) => `Remove image ${name || ""}`,
       modelNoImage: (name) => `Model ${name || ""} does not support images`
         + " — switch to a multimodal model (e.g. DeepSeek (Official) vision) to paste images",
-      imageLimit: (n) => `A message can include up to ${n} images`,
+      imageLimit: (n) => `This message already has ${n} images — remove one, or continue with text`,
       imageAdded: (name) => `Image added: ${name || "image"}`
         + " (it will be sent with the next message; remove with × to cancel)",
       imageRef: (idx) => `[image${idx}]`,
-      imageDup: (name) => `Skipped duplicate image: ${name || "image"}`,
-      fileUnsupported: (name) => `${name || "File"}: only PNG/JPG/WebP/GIF images can be attached`
-        + " — paste image content, or copy the file text into the input instead",
+      imageDup: (name) => `This image was already added (${name}), so it wasn't added again`,
+      imageTooLarge: (mb) => `This image exceeds the ${mb}MB per-image limit — compress it, or pick a smaller one`,
+      fileUnsupported: (name) => `“${name || "File"}” doesn't look like a supported image type (PNG / JPG / WebP / GIF) — try one of those`,
+      closeLightbox: "Close",
     },
   };
 
@@ -750,6 +752,19 @@
     return SYSTEM_DIRECTIVE_PREFIXES.some((p) => t.startsWith(p));
   }
 
+  /** 打开用户消息图片的 gallery（收集该轨道内所有已加载缩略图，支持左右切换）。 */
+  function openUserImageGallery(rail, current) {
+    if (!rail) return;
+    const thumbs = Array.from(rail.querySelectorAll("img.user-image-thumb"));
+    const list = thumbs.map((im) => ({
+      data: String(im.src).split(",")[1] || "",
+      mediaType: (String(im.src).match(/^data:([^;]+);/) || [])[1] || "image/png",
+      name: im.alt || "image",
+    }));
+    if (list.length === 0) return;
+    showImageGallery(list, Math.max(0, thumbs.indexOf(current)));
+  }
+
   function addUserMessage(text, images) {
     // 系统指令（宿主自动注入）：模型可见、界面不渲染
     if (isSystemDirective(text)) return;
@@ -758,16 +773,24 @@
     if (Array.isArray(images) && images.length > 0) {
       // 消息带图片：先渲染缩略图行，再渲染文本（图片以 data URL 即时显示）
       const rail = el("div", "user-image-rail");
+      // 历史/实时图片都横排滚动：鼠标滚轮转横向滚动
+      rail.addEventListener("wheel", (ev) => {
+        if (rail.scrollWidth <= rail.clientWidth) return;
+        if (Math.abs(ev.deltaY) > Math.abs(ev.deltaX)) {
+          ev.preventDefault();
+          rail.scrollLeft += ev.deltaY;
+        }
+      }, { passive: false });
       for (const img of images) {
         if (!img) continue;
         if (img.data) {
-          // 实时：直接显示缩略图（base64 已有）
+          // 实时：直接显示缩略图（base64 已有）；点击进多图切换
           const thumb = document.createElement("img");
           thumb.className = "user-image-thumb";
           thumb.src = `data:${img.mediaType || "image/png"};base64,${img.data}`;
           thumb.alt = img.name || "image";
           thumb.title = img.name || "image";
-          thumb.addEventListener("click", () => showImageLightbox(img));
+          thumb.addEventListener("click", () => openUserImageGallery(rail, thumb));
           rail.appendChild(thumb);
         } else if (img.attachmentId) {
           // 历史：先显示占位，发 readAttachment 读原图，收到后回填缩略图
@@ -1421,7 +1444,7 @@
           img.src = `data:${msg.mediaType || item.mediaType};base64,${msg.data}`;
           img.alt = item.name || "image";
           img.title = item.name || "image";
-          img.addEventListener("click", () => showImageLightbox({ data: msg.data, mediaType: msg.mediaType || item.mediaType, name: item.name }));
+          img.addEventListener("click", () => openUserImageGallery(img.closest(".user-image-rail"), img));
           ph.replaceWith(img);
         }
         delete imageRefPending[msg.id];
@@ -1672,11 +1695,24 @@
   /** 图片类型白名单（与 DSH 附件服务一致）：PNG/JPG/WebP/GIF。 */
   const IMAGE_TYPES = ["image/png", "image/jpeg", "image/webp", "image/gif"];
   const MAX_IMAGES = 20; // 与 DSH 默认 maxImagesPerMessage 一致
+  const MAX_IMAGE_BYTES = 5 * 1024 * 1024; // 单张图片大小上限（参考 dsh web 的 5MB 约定，体贴的前端预检）
+  const IMAGE_LIMIT_MB = Math.round(MAX_IMAGE_BYTES / 1024 / 1024);
 
   /** 渲染待发图片轨道（缩略图 + 可移除）。 */
   function renderImageRail() {
     const rail = $("imageRail");
     if (!rail) return;
+    // 横排轨道支持鼠标滚轮横向滚动（不需要点滚动条；竖向滚轮转横向滚动）
+    if (!rail.dataset.wheelBound) {
+      rail.dataset.wheelBound = "1";
+      rail.addEventListener("wheel", (ev) => {
+        if (rail.scrollWidth <= rail.clientWidth) return;
+        if (Math.abs(ev.deltaY) > Math.abs(ev.deltaX)) {
+          ev.preventDefault();
+          rail.scrollLeft += ev.deltaY;
+        }
+      }, { passive: false });
+    }
     rail.innerHTML = "";
     if (pendingImages.length === 0) {
       rail.classList.add("hidden");
@@ -1691,8 +1727,8 @@
       const thumb = document.createElement("img");
       thumb.src = `data:${img.mediaType};base64,${img.data}`;
       thumb.alt = img.name || "image";
-      // 点击缩略图 → 放大显示
-      thumb.addEventListener("click", () => showImageLightbox(img));
+      // 点击缩略图 → 放大显示（待发多张支持上/下一张切换）
+      thumb.addEventListener("click", () => showImageGallery(pendingImages, i));
       const rm = document.createElement("button");
       rm.type = "button";
       rm.className = "image-rail-remove";
@@ -1708,18 +1744,70 @@
     });
   }
 
-  /** 点击缩略图放大显示（lightbox，点击遮罩关闭）。 */
+  /** 点击单张缩略图放大显示（兼容历史图片等单张场景）。 */
   function showImageLightbox(img) {
     if (!img || !img.data) return;
-    const overlay = document.createElement("div");
-    overlay.className = "image-lightbox";
-    const frame = document.createElement("img");
-    frame.src = `data:${img.mediaType || "image/png"};base64,${img.data}`;
-    frame.alt = img.name || "image";
+    showImageGallery([img], 0);
+  }
+
+  /** 多图 lightbox（借鉴 dsh web）：居中大图 + 文件名/序号 + 上一下一张切换；
+   *  点遮罩空白或 Esc 关闭，点图片本身不关闭（避免手滑）。 */
+  function showImageGallery(list, index) {
+    if (!list) return;
+    const safe = list.filter((x) => x && x.data);
+    if (safe.length === 0) return;
+    let cur = Math.max(0, Math.min(index, safe.length - 1));
+
+    const overlay = el("div", "image-lightbox");
+    const frame = el("img", "");
+    frame.alt = "image";
+    const nameEl = el("div", "image-lightbox-name", "");
+    const counterEl = el("span", "image-lightbox-counter", "");
+    const btnPrev = el("button", "image-lightbox-nav left", "‹");
+    const btnNext = el("button", "image-lightbox-nav right", "›");
+    const btnClose = el("button", "image-lightbox-close", "×");
+    btnPrev.type = btnNext.type = btnClose.type = "button";
+    btnClose.title = t("closeLightbox");
+
+    const render = () => {
+      const item = safe[cur];
+      frame.src = `data:${item.mediaType || "image/png"};base64,${item.data}`;
+      nameEl.textContent = item.name || "image";
+      counterEl.textContent = `${cur + 1} / ${safe.length}`;
+      btnPrev.disabled = safe.length <= 1 || cur === 0;
+      btnNext.disabled = safe.length <= 1 || cur === safe.length - 1;
+    };
+    const go = (delta) => {
+      const nx = cur + delta;
+      if (nx >= 0 && nx < safe.length) { cur = nx; render(); }
+    };
+    const close = () => { document.removeEventListener("keydown", onKey); overlay.remove(); };
+    const onKey = (e) => { if (e.key === "Escape") close(); };
+
+    btnPrev.addEventListener("click", (e) => { e.stopPropagation(); go(-1); });
+    btnNext.addEventListener("click", (e) => { e.stopPropagation(); go(1); });
+    btnClose.addEventListener("click", (e) => { e.stopPropagation(); close(); });
     frame.addEventListener("click", (e) => e.stopPropagation());
-    overlay.appendChild(frame);
-    overlay.addEventListener("click", () => overlay.remove());
+    // 鼠标滚轮左右切图（纵向滚轮也转切图，贴近"浏览相册"手感）
+    overlay.addEventListener("wheel", (ev) => {
+      if (safe.length <= 1) return;
+      if (Math.abs(ev.deltaY) >= Math.abs(ev.deltaX)) {
+        ev.preventDefault();
+        go(ev.deltaY > 0 ? 1 : -1);
+      }
+    }, { passive: false });
+    overlay.addEventListener("click", close);
+    document.addEventListener("keydown", onKey);
+
+    const caption = el("div", "image-lightbox-caption", "");
+    caption.append(nameEl, counterEl);
+    const card = el("div", "image-lightbox-card");
+    caption.addEventListener("click", (e) => e.stopPropagation());
+    card.addEventListener("click", (e) => e.stopPropagation());
+    card.append(caption, frame, btnPrev, btnNext, btnClose);
+    overlay.append(card);
     document.body.appendChild(overlay);
+    render();
   }
 
   /** 当前选中模型的模态类型（来自模型配置信息 inputModalities；缺省按纯文本）。 */
@@ -1755,55 +1843,64 @@
     }
     for (const f of files) pushFile(f);
     if (fileList.length === 0) return; // 纯文本粘贴：放行（正常粘贴文字）
-    // 剪贴板含文件 → 按当前模型模态判断（模型配置信息里的 inputModalities）
+    // 剪贴板含文件：拦截默认粘贴（不把文件内容/路径当文本贴入），交由 ingestFiles 统一收纳与提示
+    ev.preventDefault();
+    ingestFiles(fileList);
+  }
+
+  /** 将一个 File 列表统一收纳进待发图片轨道（粘贴 / 拖拽共用）。
+   *  处理：模态校验 → 类型白名单 → 张数上限 → 单张大小上限 → 内容去重；
+   *  返回是否有图片被实际接收（粘贴场景据此决定是否阻止默认文本粘贴）。 */
+  function ingestFiles(fileList) {
+    if (!fileList || fileList.length === 0) return false;
     if (!currentModelModalities().includes("image")) {
       const entry = (state.providerModels?.[selProvider.value] || []).find((m) => m.id === selModel.value);
       setHint(t("modelNoImage", entry?.name || selModel.value));
-      ev.preventDefault();
-      return;
+      return false;
     }
     let imageCount = 0;
     for (const f of fileList) {
-      if (IMAGE_TYPES.includes(f.type)) {
-        if (pendingImages.length >= MAX_IMAGES) {
-          setHint(t("imageLimit", MAX_IMAGES));
-          continue;
-        }
-        const imgName = f.name || "pasted-image.png";
-        fileToBase64(f, (data) => {
-          if (!data) return;
-          // 内容去重：同一图片（相同 base64）只保留一个缩略图，避免重复粘贴出两个相同图
-          if (pendingImages.some((p) => p.data === data)) {
-            setHint(t("imageDup", imgName));
-            return;
-          }
-          const idx = pendingImages.length + 1; // 序号（随粘贴顺序生成，用户改动自负责）
-          pendingImages.push({ data, mediaType: f.type, name: imgName });
-          renderImageRail();
-          setHint(t("imageAdded", imgName));
-          // 在输入框**光标处**插入序号引用锚点：[图N: 名称]，以**空格**分隔（不自动换行）。
-          // 用户此后如需改顺序/删锚点，自行调整即可（后续改变不再自动联动）。
-          const ref = t("imageRef", idx);
-          const pos = inputEl.selectionStart ?? inputEl.value.length;
-          const pre = inputEl.value.slice(0, pos);
-          const gap = pre && !/\s$/.test(pre) ? " " : "";
-          inputEl.setRangeText(gap + ref.trim(), pos, pos, "end");
-          autoResize();
-        });
-        imageCount++;
-      } else {
-        // 非图片文件：DSH 附件通道仅支持图片，给出明确提示
+      if (!IMAGE_TYPES.includes(f.type)) {
+        // 非图片文件：DSH 附件通道仅支持白名单图片，温和提示可换的格式
         setHint(t("fileUnsupported", f.name || f.type));
+        continue;
       }
+      if (pendingImages.length >= MAX_IMAGES) {
+        setHint(t("imageLimit", MAX_IMAGES));
+        continue;
+      }
+      if (f.size > MAX_IMAGE_BYTES) {
+        // 单张超过 5MB：前端预检提示，避免传大喜击后端
+        setHint(t("imageTooLarge", IMAGE_LIMIT_MB));
+        continue;
+      }
+      const imgName = f.name || "pasted-image.png";
+      fileToBase64(f, (data) => {
+        if (!data) return;
+        // 内容去重：同一图片（相同 base64）只保留一个缩略图，避免重复粘贴出两个相同图
+        if (pendingImages.some((p) => p.data === data)) {
+          setHint(t("imageDup", imgName));
+          return;
+        }
+        const idx = pendingImages.length + 1; // 序号（随粘贴顺序生成，用户改动自负责）
+        pendingImages.push({ data, mediaType: f.type, name: imgName });
+        renderImageRail();
+        setHint(t("imageAdded", imgName));
+        // 在输入框**光标处**插入序号引用锚点：[图N: 名称]，以**空格**分隔（不自动换行）。
+        // 用户此后如需改顺序/删锚点，自行调整即可（后续改变不再自动联动）。
+        const ref = t("imageRef", idx);
+        const pos = inputEl.selectionStart ?? inputEl.value.length;
+        const pre = inputEl.value.slice(0, pos);
+        const gap = pre && !/\s$/.test(pre) ? " " : "";
+        inputEl.setRangeText(gap + ref.trim(), pos, pos, "end");
+        autoResize();
+      });
+      imageCount++;
     }
-    if (imageCount > 0) {
-      // 有图片被接收：不再走默认文本粘贴，交由图片轨道
-      ev.preventDefault();
-    }
+    return imageCount > 0;
   }
 
-  /**
-   * 输入框自适应高度：默认 2 行，随内容增至最多 5 行，超出 5 行出现纵向滚动条。
+  /** 输入框自适应高度：默认 2 行，随内容增至最多 5 行，超出 5 行出现纵向滚动条。
    */
   function autoResize() {
     inputEl.style.height = "auto";

@@ -139880,6 +139880,17 @@ function composePatches(env2) {
         root: dshHomePath("sessions-ay-dsh")
       }
     },
+    // 上下文自动压缩（compaction-basic）：把扩展侧 VS Code 设置注入内核配置。
+    // auto=是否启用，thresholdRatio=触发比例（contextWindow 占比），maxTokens=摘要 token 上限。
+    // 值来自 host.ts spawn 时设置的环境变量；配置面板"控制参数"区保存后重启宿主生效。
+    {
+      id: "compaction-basic",
+      config: {
+        auto: env2.DSH_COMPACTION_AUTO !== "false",
+        thresholdRatio: Number(env2.DSH_COMPACTION_THRESHOLD_RATIO) || 0.8,
+        maxTokens: Number(env2.DSH_COMPACTION_MAX_TOKENS) || 8192
+      }
+    },
     // 禁用的插件（对应依赖已从 VSIX 剔除，不加载即不 import）：
     // - session-telemetry-otel：遥测，插件默认关闭
     // - typert-gateway（dsh-api-gateway / host-apiproxy）：web API 网关。它会先于
@@ -140092,12 +140103,12 @@ function wrapUpReportSection() {
   if (UI_LANG === "zh") {
     return {
       name: "wrap-up-report",
-      text: "\u6536\u5C3E\u62A5\u544A\uFF08**\u5F3A\u5236\uFF0C\u975E\u53EF\u9009\u9879**\uFF09\uFF1A\u6700\u7EC8\u7B54\u590D\u7684**\u7B2C\u4E00\u884C**\u5FC5\u987B\u4EE5\u5982\u4E0B\u683C\u5F0F\u5F00\u5934\uFF1A`\u23F1 \u672C\u8F6E\u7EDF\u8BA1\uFF1ASTEPS_USED \u6B65\u601D\u8003 / TOOLS_USED \u6B21\u5DE5\u5177\u8C03\u7528 / \u8017\u65F6 ELAPSED_SEC \u79D2`\u2014\u2014**STEPS_USED / TOOLS_USED / ELAPSED_SEC \u53D6\u672C\u6B65 [\u672C\u6B65\u6307\u5F15] \u4E2D\u540C\u540D\u4E13\u7528\u5B57\u6BB5\u7684\u503C**\uFF1B\u5982\u679C\u4F60\u672C\u6B65\u8FD8\u8FDB\u884C\u4E86\u5DE5\u5177\u8C03\u7528\uFF0C\u5219 TOOLS_USED \u8FD8\u5FC5\u987B\u52A0\u4E0A\u4F60\u672C\u6B65\u8C03\u7528\u5DE5\u5177\u7684\u6B21\u6570\uFF0CELAPSED_SEC \u5FC5\u987B\u52A0\u4E0A\u4F60\u672C\u6B65\u7684\u8017\u65F6\uFF0C\u968F\u540E\u518D\u5199\u603B\u7ED3\u6B63\u6587\uFF08\u5DF2\u5B8C\u6210/\u672A\u5B8C\u6210/\u4E0B\u4E00\u6B65\u547D\u4EE4\uFF09\u3002"
+      text: "\u6536\u5C3E\u62A5\u544A\uFF08**\u5F3A\u5236\uFF0C\u975E\u53EF\u9009\u9879**\uFF09\uFF1A\u6BCF\u8F6E\u5BF9\u8BDD\uFF08\u5BF9\u5E94\u7528\u6237\u7684\u4E00\u6B21\u8F93\u5165\uFF09\u7684\u6700\u7EC8\u7B54\u590D\u7684**\u7B2C\u4E00\u884C**\u5FC5\u987B\u4EE5\u5982\u4E0B\u683C\u5F0F\u5F00\u5934\uFF1A`\u23F1 \u672C\u8F6E\u7EDF\u8BA1\uFF1ASTEPS_USED \u6B65\u601D\u8003 / TOOLS_USED \u6B21\u5DE5\u5177\u8C03\u7528 / \u8017\u65F6 ELAPSED_SEC \u79D2`\u2014\u2014**STEPS_USED / TOOLS_USED / ELAPSED_SEC \u53D6\u672C\u6B65 [\u672C\u6B65\u6307\u5F15] \u4E2D\u540C\u540D\u4E13\u7528\u5B57\u6BB5\u7684\u503C**\uFF1B\u5982\u679C\u4F60\u672C\u6B65\u8FD8\u8FDB\u884C\u4E86\u5DE5\u5177\u8C03\u7528\uFF0C\u5219 TOOLS_USED \u8FD8\u5FC5\u987B\u52A0\u4E0A\u4F60\u672C\u6B65\u8C03\u7528\u5DE5\u5177\u7684\u6B21\u6570\uFF0CELAPSED_SEC \u5FC5\u987B\u52A0\u4E0A\u4F60\u672C\u6B65\u7684\u8017\u65F6\uFF0C\u968F\u540E\u518D\u5199\u603B\u7ED3\u6B63\u6587\uFF08\u5DF2\u5B8C\u6210/\u672A\u5B8C\u6210/\u4E0B\u4E00\u6B65\u547D\u4EE4\uFF09\u3002"
     };
   }
   return {
     name: "wrap-up-report",
-    text: "Wrap-up report (MANDATORY, not optional): your final answer's FIRST LINE must open with `\u23F1 Stats this turn: STEPS_USED steps / TOOLS_USED tool calls / ELAPSED_SECs elapsed` \u2014 STEPS_USED / TOOLS_USED / ELAPSED_SEC are the values of the SAME NAMED FIELDS in THIS step's [Step guide]; if you issue additional tool calls in this step, ADD them to TOOLS_USED and ADD this step's elapsed time to ELAPSED_SEC, then write the summary body (accomplished / unfinished / next command)."
+    text: "Wrap-up report (MANDATORY, not optional): Per turn (one user input) your final answer's FIRST LINE must open with `\u23F1 Stats this turn: STEPS_USED steps / TOOLS_USED tool calls / ELAPSED_SECs elapsed` \u2014 STEPS_USED / TOOLS_USED / ELAPSED_SEC are the values of the SAME NAMED FIELDS in THIS step's [Step guide]; if you issue additional tool calls in this step, ADD them to TOOLS_USED and ADD this step's elapsed time to ELAPSED_SEC, then write the summary body (accomplished / unfinished / next command)."
   };
 }
 function roundGuideText(perfNoteText) {

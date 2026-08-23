@@ -141,6 +141,17 @@ function composePatches(env) {
         root: dshHomePath("sessions-ay-dsh"),
       },
     },
+    // 上下文自动压缩（compaction-basic）：把扩展侧 VS Code 设置注入内核配置。
+    // auto=是否启用，thresholdRatio=触发比例（contextWindow 占比），maxTokens=摘要 token 上限。
+    // 值来自 host.ts spawn 时设置的环境变量；配置面板"控制参数"区保存后重启宿主生效。
+    {
+      id: "compaction-basic",
+      config: {
+        auto: env.DSH_COMPACTION_AUTO !== "false",
+        thresholdRatio: Number(env.DSH_COMPACTION_THRESHOLD_RATIO) || 0.8,
+        maxTokens: Number(env.DSH_COMPACTION_MAX_TOKENS) || 8192,
+      },
+    },
     // 禁用的插件（对应依赖已从 VSIX 剔除，不加载即不 import）：
     // - session-telemetry-otel：遥测，插件默认关闭
     // - typert-gateway（dsh-api-gateway / host-apiproxy）：web API 网关。它会先于
@@ -578,7 +589,7 @@ function wrapUpReportSection() {
     return {
       name: "wrap-up-report",
       text:
-        "收尾报告（**强制，非可选项**）：最终答复的**第一行**必须以如下格式开头：" +
+        "收尾报告（**强制，非可选项**）：每轮对话（对应用户的一次输入）的最终答复的**第一行**必须以如下格式开头：" +
         "`⏱ 本轮统计：STEPS_USED 步思考 / TOOLS_USED 次工具调用 / 耗时 ELAPSED_SEC 秒`" +
         "——**STEPS_USED / TOOLS_USED / ELAPSED_SEC 取本步 [本步指引] 中同名专用字段的值**；" +
         "如果你本步还进行了工具调用，则 TOOLS_USED 还必须加上你本步调用工具的次数，" +
@@ -588,7 +599,7 @@ function wrapUpReportSection() {
   return {
     name: "wrap-up-report",
     text:
-      "Wrap-up report (MANDATORY, not optional): your final answer's FIRST LINE must open with " +
+      "Wrap-up report (MANDATORY, not optional): Per turn (one user input) your final answer's FIRST LINE must open with " +
       "`⏱ Stats this turn: STEPS_USED steps / TOOLS_USED tool calls / ELAPSED_SECs elapsed`" +
       " — STEPS_USED / TOOLS_USED / ELAPSED_SEC are the values of the SAME NAMED FIELDS in THIS step's " +
       "[Step guide]; if you issue additional tool calls in this step, ADD them to TOOLS_USED and ADD this " +

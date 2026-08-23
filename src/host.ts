@@ -55,6 +55,12 @@ export interface AgentHostOptions {
   subagentMaxDepth?: number;
   /** 多 agent 模式并行子代理数量上限（prompt 级约束）。 */
   maxParallelSubagents?: number;
+  /** 上下文自动压缩：是否启用。 */
+  autoCompaction?: boolean;
+  /** 上下文自动压缩触发比例（contextWindow 占比，0~1）。 */
+  compactionThresholdRatio?: number;
+  /** 上下文自动压缩摘要的 token 上限。 */
+  compactionMaxTokens?: number;
   /** 插件专属的 DSH home 目录（会话/配置均存于此，与官方 dsh 完全隔离）。 */
   dshHome: string;
   /** 旧 DSH home（用于一次性迁移历史会话）。 */
@@ -269,6 +275,9 @@ export class AgentHost {
       DSH_LOCALE: vscode.env.language.startsWith("zh") ? "zh" : "en",
       DSH_SUBAGENT_MAX_DEPTH: String(this.options.subagentMaxDepth ?? 3),
       DSH_MAX_PARALLEL_SUBAGENTS: String(this.options.maxParallelSubagents ?? 5),
+      DSH_COMPACTION_AUTO: String(this.options.autoCompaction ?? true),
+      DSH_COMPACTION_THRESHOLD_RATIO: String(this.options.compactionThresholdRatio ?? 0.8),
+      DSH_COMPACTION_MAX_TOKENS: String(this.options.compactionMaxTokens ?? 8192),
       DSH_TELEMETRY_DISABLED: "1",
       // 统一子进程文本编码为 UTF-8：Windows PowerShell 5.1 / Python 默认按
       // 系统代码页（GBK）输出中文，Node 侧按 UTF-8 读取会乱码。
@@ -736,6 +745,22 @@ export class AgentHost {
           status: t.status as "pending" | "in_progress" | "completed",
         }));
         return { kind: "todo", todos, ts: event.time };
+      }
+      case "compaction/start":
+      case "compaction/summary":
+      case "compaction/end": {
+        // 上下文自动/手动压缩：桥接成 view event，供扩展在状态栏即时提示
+        // （用户不必盯着顶部提示区，压缩在后台进行也能感知到）。
+        // summary 事件携带被压缩掉的 token 数（shadowedTokenCount），用于完成提示的具体指标。
+        const d = event.data as { error?: string; shadowedTokenCount?: number } | undefined;
+        return {
+          kind: "compaction",
+          phase: event.type === "compaction/start" ? "start" : event.type === "compaction/summary" ? "summary" : "end",
+          ok: d?.error === undefined,
+          error: typeof d?.error === "string" ? d.error : undefined,
+          tokens: typeof d?.shadowedTokenCount === "number" ? d.shadowedTokenCount : undefined,
+          ts: event.time,
+        };
       }
       default:
         return null;

@@ -357,6 +357,8 @@ input.invalid {
 #cfgMaxSteps,
 #cfgSubagentDepth,
 #cfgMaxParallel,
+#cfgCompactThreshold,
+#cfgCompactMaxTokens,
 #meCtx,
 #meMax {
   max-width: 150px;
@@ -397,6 +399,15 @@ input.invalid {
 }
 .checkbox-row input {
   accent-color: var(--vscode-checkbox-background);
+}
+/* 数字输入框 + 后缀单位（如 %）：输入框按内容自适应宽度，单位紧邻其后 */
+.suffix-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.suffix-row input {
+  flex: none;
 }
 .key-note {
   font-size: 11px;

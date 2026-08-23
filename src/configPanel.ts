@@ -58,6 +58,9 @@ export interface ConfigPanelDeps {
     maxSteps: number;
     subagentMaxDepth: number;
     maxParallelSubagents: number;
+    autoCompaction: boolean;
+    compactionThresholdRatio: number;
+    compactionMaxTokens: number;
   };
   /** 当前 Agent 工作目录（展示用）。 */
   workspaceRoot: () => string;
@@ -186,6 +189,9 @@ export function openConfigPanel(context: vscode.ExtensionContext, deps: ConfigPa
           maxSteps: cfg.get<number>("maxSteps") ?? 100,
           subagentMaxDepth: cfg.get<number>("subagentMaxDepth") ?? 3,
           maxParallelSubagents: cfg.get<number>("maxParallelSubagents") ?? 5,
+          autoCompaction: cfg.get<boolean>("autoCompaction") ?? true,
+          compactionThresholdRatio: cfg.get<number>("compactionThresholdRatio") ?? 0.8,
+          compactionMaxTokens: cfg.get<number>("compactionMaxTokens") ?? 8192,
           cwd: deps.workspaceRoot(),
         },
         providers,
@@ -230,6 +236,9 @@ export function openConfigPanel(context: vscode.ExtensionContext, deps: ConfigPa
           maxSteps: 100,
           subagentMaxDepth: 3,
           maxParallelSubagents: 5,
+          autoCompaction: true,
+          compactionThresholdRatio: 0.8,
+          compactionMaxTokens: 8192,
           cwd: "",
         },
         providers: [],
@@ -416,6 +425,9 @@ export function openConfigPanel(context: vscode.ExtensionContext, deps: ConfigPa
           maxSteps: Number.isFinite(prevC0.maxSteps) && prevC0.maxSteps >= 0 ? prevC0.maxSteps : 100,
           subagentMaxDepth: Number.isFinite(prevC0.subagentMaxDepth) && prevC0.subagentMaxDepth > 0 ? prevC0.subagentMaxDepth : 3,
           maxParallelSubagents: Number.isFinite(prevC0.maxParallelSubagents) && prevC0.maxParallelSubagents > 0 ? prevC0.maxParallelSubagents : 5,
+          autoCompaction: prevC0.autoCompaction ?? true,
+          compactionThresholdRatio: Number.isFinite(prevC0.compactionThresholdRatio) && prevC0.compactionThresholdRatio > 0 ? prevC0.compactionThresholdRatio : 0.8,
+          compactionMaxTokens: Number.isFinite(prevC0.compactionMaxTokens) && prevC0.compactionMaxTokens > 0 ? prevC0.compactionMaxTokens : 8192,
         };
         const next0 = {
           permissionMode: ["workspace-write", "read-only", "danger-full-access"].includes(v.permissionMode) ? v.permissionMode : "workspace-write",
@@ -425,6 +437,9 @@ export function openConfigPanel(context: vscode.ExtensionContext, deps: ConfigPa
           maxSteps: Number.isFinite(v.maxSteps) && v.maxSteps >= 0 ? v.maxSteps : 100,
           subagentMaxDepth: Number.isFinite(v.subagentMaxDepth) && v.subagentMaxDepth > 0 ? v.subagentMaxDepth : 3,
           maxParallelSubagents: Number.isFinite(v.maxParallelSubagents) && v.maxParallelSubagents > 0 ? v.maxParallelSubagents : 5,
+          autoCompaction: typeof v.autoCompaction === "boolean" ? v.autoCompaction : true,
+          compactionThresholdRatio: Number.isFinite(v.compactionThresholdRatio) && v.compactionThresholdRatio > 0 ? Math.min(1, v.compactionThresholdRatio) : 0.8,
+          compactionMaxTokens: Number.isFinite(v.compactionMaxTokens) && v.compactionMaxTokens > 0 ? v.compactionMaxTokens : 8192,
         };
         const keyOp = v.clearKey === true || (typeof v.apiKey === "string" && v.apiKey.trim() !== "");
         if (JSON.stringify(prev0) === JSON.stringify(next0) && !keyOp) {
@@ -452,6 +467,9 @@ export function openConfigPanel(context: vscode.ExtensionContext, deps: ConfigPa
             maxSteps: Number.isFinite(prevC.maxSteps) && prevC.maxSteps >= 0 ? prevC.maxSteps : 100,
             subagentMaxDepth: Number.isFinite(prevC.subagentMaxDepth) && prevC.subagentMaxDepth > 0 ? prevC.subagentMaxDepth : 3,
             maxParallelSubagents: Number.isFinite(prevC.maxParallelSubagents) && prevC.maxParallelSubagents > 0 ? prevC.maxParallelSubagents : 5,
+            autoCompaction: prevC.autoCompaction ?? true,
+            compactionThresholdRatio: Number.isFinite(prevC.compactionThresholdRatio) && prevC.compactionThresholdRatio > 0 ? prevC.compactionThresholdRatio : 0.8,
+            compactionMaxTokens: Number.isFinite(prevC.compactionMaxTokens) && prevC.compactionMaxTokens > 0 ? prevC.compactionMaxTokens : 8192,
           };
           // 1. API Key：清除 / 写入密钥库（写入时清空设置项，保持"密钥库优先"策略）
           if (v.clearKey) {
@@ -498,6 +516,21 @@ export function openConfigPanel(context: vscode.ExtensionContext, deps: ConfigPa
             Number.isFinite(v.maxParallelSubagents) && v.maxParallelSubagents > 0 ? v.maxParallelSubagents : 5,
             vscode.ConfigurationTarget.Global
           );
+          await cfg.update(
+            "autoCompaction",
+            typeof v.autoCompaction === "boolean" ? v.autoCompaction : true,
+            vscode.ConfigurationTarget.Global
+          );
+          await cfg.update(
+            "compactionThresholdRatio",
+            Number.isFinite(v.compactionThresholdRatio) && v.compactionThresholdRatio > 0 ? Math.min(1, v.compactionThresholdRatio) : 0.8,
+            vscode.ConfigurationTarget.Global
+          );
+          await cfg.update(
+            "compactionMaxTokens",
+            Number.isFinite(v.compactionMaxTokens) && v.compactionMaxTokens > 0 ? v.compactionMaxTokens : 8192,
+            vscode.ConfigurationTarget.Global
+          );
           // 3. 应用：对比保存前后的宿主运行参数——只有确实变化才重启宿主；
           //    提供商配置（经 llm-pi-ai settings 热生效）与无变化的保存都不重启。
           const next = {
@@ -508,6 +541,9 @@ export function openConfigPanel(context: vscode.ExtensionContext, deps: ConfigPa
             maxSteps: Number.isFinite(v.maxSteps) && v.maxSteps >= 0 ? v.maxSteps : 100,
             subagentMaxDepth: Number.isFinite(v.subagentMaxDepth) && v.subagentMaxDepth > 0 ? v.subagentMaxDepth : 3,
             maxParallelSubagents: Number.isFinite(v.maxParallelSubagents) && v.maxParallelSubagents > 0 ? v.maxParallelSubagents : 5,
+            autoCompaction: typeof v.autoCompaction === "boolean" ? v.autoCompaction : true,
+            compactionThresholdRatio: Number.isFinite(v.compactionThresholdRatio) && v.compactionThresholdRatio > 0 ? Math.min(1, v.compactionThresholdRatio) : 0.8,
+            compactionMaxTokens: Number.isFinite(v.compactionMaxTokens) && v.compactionMaxTokens > 0 ? v.compactionMaxTokens : 8192,
           };
           const hostChanged = JSON.stringify(prev) !== JSON.stringify(next);
           deps.onSaved(hostChanged);
@@ -624,6 +660,14 @@ function renderHtml(webview: vscode.Webview, scriptUri: vscode.Uri, styleUri: vs
     subagentDepthHint: zh ? "多级子代理嵌套的最大深度（默认 3）" : "Max nesting depth of subagents (default 3)",
     maxParallel: zh ? "并行子代理数量上限" : "Max parallel subagents",
     maxParallelHint: zh ? "多 Agent 模式下同时派发的子代理数量上限（默认 5）" : "Max concurrently dispatched subagents in multi-agent mode (default 5)",
+    autoCompaction: zh ? "自动压缩上下文" : "Auto compact context",
+    autoCompactionHint: zh ? "上下文占比接近上限时自动归纳为摘要，释放空间" : "When context share nears the limit, summarize older history to free space",
+    autoCompactionOn: zh ? "自动" : "Auto",
+    autoCompactionOff: zh ? "手动" : "Manual",
+    compactThreshold: zh ? "自动压缩触发比例" : "Auto-compaction threshold ratio",
+    compactThresholdHint: zh ? "上下文用到窗口的多少比例时触发压缩（10% ~ 100%，默认 80%）" : "Compact when context reaches this share of the window (10%–100%, default 80%)",
+    compactMaxTokens: zh ? "压缩摘要 token 上限" : "Compaction summary token cap",
+    compactMaxTokensHint: zh ? "一次压缩生成的摘要最大 token 数（默认 8192）" : "Max tokens in one compaction summary (default 8192)",
     browse: zh ? "浏览…" : "Browse…",
     save: zh ? "保存并应用" : "Save & Apply",
     groupUpgrade: zh ? "版本升级" : "Upgrades",
@@ -747,6 +791,27 @@ function renderHtml(webview: vscode.Webview, scriptUri: vscode.Uri, styleUri: vs
           <label for="cfgMaxParallel">${L.maxParallel}</label>
           <input type="number" id="cfgMaxParallel" min="1" step="1" value="5">
           <span class="hint">${L.maxParallelHint}</span>
+        </div>
+        <div class="field">
+          <label for="cfgAutoCompaction">${L.autoCompaction}</label>
+          <div class="checkbox-row">
+            <input type="checkbox" id="cfgAutoCompaction" checked>
+            <span class="hint" id="cfgAutoCompactionState">${L.autoCompactionOn}</span>
+          </div>
+          <span class="hint">${L.autoCompactionHint}</span>
+        </div>
+        <div class="field">
+          <label for="cfgCompactThreshold">${L.compactThreshold}</label>
+          <div class="suffix-row">
+            <input type="number" id="cfgCompactThreshold" min="10" max="100" step="5" value="80">
+            <span class="hint">%</span>
+          </div>
+          <span class="hint">${L.compactThresholdHint}</span>
+        </div>
+        <div class="field">
+          <label for="cfgCompactMaxTokens">${L.compactMaxTokens}</label>
+          <input type="number" id="cfgCompactMaxTokens" min="1" step="1000" value="8192">
+          <span class="hint">${L.compactMaxTokensHint}</span>
         </div>
       </div>
     </div>

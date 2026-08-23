@@ -841,9 +841,15 @@ body {
 /* ---- 多模态：待发图片轨道（粘贴图片后显示缩略图，可移除） ---- */
 .image-rail {
   display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
+  flex-wrap: nowrap;          /* 借鉴 dsh web gallery：一行横排，超出横向滚动，不撑高输入区 */
+  gap: 8px;
   padding: 4px 2px 6px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: thin;
+}
+.image-rail::-webkit-scrollbar {
+  height: 6px;
 }
 .image-rail-item {
   position: relative;
@@ -880,9 +886,15 @@ body {
 /* ---- 用户消息里的图片缩略图（发送后随消息显示） ---- */
 .user-image-rail {
   display: flex;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   gap: 6px;
   margin-bottom: 6px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: thin;
+}
+.user-image-rail::-webkit-scrollbar {
+  height: 6px;
 }
 .user-image-thumb {
   width: 48px;
@@ -902,6 +914,7 @@ body {
 }
 
 /* ---- 图片放大显示（lightbox，点击缩略图打开、点遮罩关闭） ---- */
+/* ---- 图片放大：深色卡片包住图片，控件贴卡片（不铺满整面板） ---- */
 .image-lightbox {
   position: fixed;
   inset: 0;
@@ -909,16 +922,84 @@ body {
   display: flex;
   align-items: center;
   justify-content: center;
-  background: rgba(0, 0, 0, 0.8);
-  padding: 24px;
+  background: rgba(0, 0, 0, 0.25);   /* 淡遮罩，聚焦但不遮挡对话主体 */
+  padding: 20px;
 }
-.image-lightbox img {
-  max-width: 92vw;
-  max-height: 92vh;
+.image-lightbox-card {
+  position: relative;
+  background: rgba(18, 18, 20, 0.94);
+  border-radius: 10px;
+  padding: 44px 64px 18px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.6);
+}
+.image-lightbox-card img {
+  display: block;
+  max-width: min(72vw, 1100px);
+  max-height: 74vh;
   object-fit: contain;
   border-radius: 4px;
-  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.5);
 }
+.image-lightbox-caption {
+  position: absolute;
+  top: 10px;
+  left: 16px;
+  right: 16px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  color: #fff;
+  font-size: 13px;
+  pointer-events: none;
+  white-space: nowrap;
+}
+.image-lightbox-name {
+  max-width: 46vw;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  opacity: 0.92;
+}
+.image-lightbox-counter {
+  opacity: 0.7;
+  font-variant-numeric: tabular-nums;
+}
+.image-lightbox-nav {
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 40px;
+  height: 40px;
+  line-height: 38px;
+  text-align: center;
+  padding: 0;
+  border: 1px solid rgba(255, 255, 255, 0.35);
+  border-radius: 50%;
+  background: rgba(0, 0, 0, 0.5);
+  color: #fff;
+  font-size: 22px;
+  cursor: pointer;
+  user-select: none;
+}
+.image-lightbox-nav.left { left: 8px; }
+.image-lightbox-nav.right { right: 8px; }
+.image-lightbox-nav:hover:not(:disabled) { background: rgba(0, 0, 0, 0.7); }
+.image-lightbox-nav:disabled { opacity: 0.35; cursor: default; }
+.image-lightbox-close {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  width: 30px;
+  height: 30px;
+  line-height: 26px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, 0.6);
+  color: #fff;
+  font-size: 18px;
+  cursor: pointer;
+}
+.image-lightbox-close:hover { background: rgba(0, 0, 0, 0.8); }
 
 /* ---- 一键拉到底：悬浮在消息区右下角（滚动条下方、输入框上方）的向下箭头 ---- */
 button.jump-down {

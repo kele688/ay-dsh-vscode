@@ -127,7 +127,8 @@ export type ViewEvent =
   | { kind: "tool-call"; callId: string; name: string; args: string; ts: number }
   | { kind: "tool-result"; callId: string; ok: boolean; text: string; ts: number }
   | { kind: "todo"; todos: { content: string; status: "pending" | "in_progress" | "completed" }[]; ts: number }
-  | { kind: "turn"; status: "start" | "end"; reason?: string; ts: number };
+  | { kind: "turn"; status: "start" | "end"; reason?: string; ts: number }
+  | { kind: "compaction"; phase: "start" | "summary" | "end"; ok?: boolean; error?: string; tokens?: number; ts: number };
 
 /** Webview -> Extension 的消息。 */
 export type WebviewMessage =
