@@ -68,6 +68,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private approvalStatusItem: vscode.StatusBarItem | undefined;
   /** 提示信息状态栏项（webview 内 hint 图标 + hover 之外，同步到 VS Code 状态栏）。 */
   private hintStatusItem: vscode.StatusBarItem | undefined;
+  /** 最近一次压缩摘要被压缩掉的 token 数（summary 事件先于 end 到达，用于完成提示的指标）。 */
+  private lastCompactionTokens: number | undefined;
   /** 最近一次会话统计（webview ready 时补发，避免就绪前的事件丢失）。 */
   private lastStats: (ExtensionToWebview & { t: "stats" }) | undefined;
   /**
@@ -500,6 +502,27 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         if (e.event.kind === "assistant-delta") {
           this.queueDelta(e.event);
         } else {
+          // 上下文压缩：状态栏即时提示（开始常驻"压缩中"，结束短暂提示结果），
+          // 用户不必盯着顶部提示区，后台压缩进行到哪一步一目了然。
+          if (e.event.kind === "compaction") {
+            if (e.event.phase === "start") {
+              this.lastCompactionTokens = undefined;
+              vscode.window.setStatusBarMessage(loc("正在压缩上下文…", "Compacting context…"));
+            } else if (e.event.phase === "summary" && typeof e.event.tokens === "number") {
+              this.lastCompactionTokens = e.event.tokens;
+            } else if (e.event.phase === "end") {
+              const tokens = this.lastCompactionTokens;
+              const meta = typeof tokens === "number"
+                ? loc(`，本次压缩约 ${tokens.toLocaleString()} tokens`, `, ~${tokens.toLocaleString()} tokens freed this time`)
+                : "";
+              vscode.window.setStatusBarMessage(
+                e.event.ok
+                  ? loc(`✓ 上下文已压缩${meta}`, `✓ Context compacted${meta}`)
+                  : loc(`压缩未完成${e.event.error ? `：${e.event.error}` : ""}`, `Compaction incomplete${e.event.error ? `: ${e.event.error}` : ""}`),
+                e.event.ok ? 8000 : 12000
+              );
+            }
+          }
           this.flushDelta();
           this.push({ t: "event", e: e.event });
         }
@@ -762,7 +785,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       approvalTitle: zh ? "需要授权" : "Authorization Required",
       deny: zh ? "拒绝" : "Deny",
       allow: zh ? "允许" : "Allow",
-      placeholder: zh ? "给 DSH Agent 下达任务…（Enter 发送，Shift+Enter 换行）" : "Ask the DSH Agent… (Enter to send, Shift+Enter for newline)",
+      placeholder: zh ? "给 AY-DSH 下达任务…（可以粘贴图片，Enter 发送，Shift+Enter 换行）" : "Ask AY-DSH a task… (paste images, Enter to send, Shift+Enter for newline)",
       send: zh ? "发送" : "Send",
       stop: zh ? "停止" : "Stop",
       compactTitle: zh ? "压缩上下文：把较早的对话历史归纳为摘要，释放上下文空间" : "Compact context: summarize older history to free context space",
@@ -793,7 +816,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 <body>
 <div id="app">
   <header id="header">
-    <span class="logo">◈ DSH</span>
+    <span class="logo">◈ AY-DSH</span>
     <span id="dshVersion" class="token-stat header-version"></span>
     <span id="dshUpdate" class="dsh-update hidden"></span>
     <span id="sessionTitle" class="session-title" title="">…</span>

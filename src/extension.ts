@@ -197,6 +197,9 @@ function readConfig(): {
   maxSteps: number;
   subagentMaxDepth: number;
   maxParallelSubagents: number;
+  autoCompaction: boolean;
+  compactionThresholdRatio: number;
+  compactionMaxTokens: number;
 } {
   const cfg = vscode.workspace.getConfiguration(CONFIG_NS);
   const apiKeySetting = cfg.get<string>("apiKey");
@@ -211,7 +214,11 @@ function readConfig(): {
   const maxSteps = Math.max(0, Number(cfg.get<number>("maxSteps") ?? 100) || 0);
   const subagentMaxDepth = Math.max(1, Number(cfg.get<number>("subagentMaxDepth") ?? 3) || 3);
   const maxParallelSubagents = Math.max(1, Number(cfg.get<number>("maxParallelSubagents") ?? 5) || 5);
-  return { apiKey, baseUrl, model, permissionMode, nodePath, maxSteps, subagentMaxDepth, maxParallelSubagents };
+  // 上下文自动压缩（借鉴 dsh web）：是否启用、触发比例（0~1）、摘要 token 上限
+  const autoCompaction = cfg.get<boolean>("autoCompaction") ?? true;
+  const compactionThresholdRatio = Math.min(1, Math.max(0.1, Number(cfg.get<number>("compactionThresholdRatio") ?? 0.8) || 0.8));
+  const compactionMaxTokens = Math.max(1, Number(cfg.get<number>("compactionMaxTokens") ?? 8192) || 8192);
+  return { apiKey, baseUrl, model, permissionMode, nodePath, maxSteps, subagentMaxDepth, maxParallelSubagents, autoCompaction, compactionThresholdRatio, compactionMaxTokens };
 }
 
 /** 配置摘要（推送给 UI 展示）。SecretStorage 密钥库是 API Key 的主存储，必须纳入判断。 */
@@ -308,6 +315,9 @@ async function ensureHost(context: vscode.ExtensionContext): Promise<AgentHost> 
       maxSteps: cfg.maxSteps,
       subagentMaxDepth: cfg.subagentMaxDepth,
       maxParallelSubagents: cfg.maxParallelSubagents,
+      autoCompaction: cfg.autoCompaction,
+      compactionThresholdRatio: cfg.compactionThresholdRatio,
+      compactionMaxTokens: cfg.compactionMaxTokens,
       dshHome: pluginDshHome(context),
       legacyDshHome: legacyDshHome(),
       runtimeNodeModulesPath: runtimeManager?.runtimeNodeModules(),

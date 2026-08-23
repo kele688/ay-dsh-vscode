@@ -79,6 +79,14 @@
     subagentDepthHint: zh ? "多级子代理嵌套的最大深度（默认 3）" : "Max nesting depth of subagents (default 3)",
     maxParallel: zh ? "并行子代理数量上限" : "Max parallel subagents",
     maxParallelHint: zh ? "多 Agent 模式下同时派发的子代理数量上限（默认 5）" : "Max concurrently dispatched subagents in multi-agent mode (default 5)",
+    autoCompaction: zh ? "自动压缩上下文" : "Auto compact context",
+    autoCompactionHint: zh ? "上下文占比接近上限时自动归纳为摘要，释放空间" : "When context share nears the limit, summarize older history to free space",
+    autoCompactionOn: zh ? "自动" : "Auto",
+    autoCompactionOff: zh ? "手动" : "Manual",
+    compactThreshold: zh ? "自动压缩触发比例" : "Auto-compaction threshold ratio",
+    compactThresholdHint: zh ? "上下文用到窗口的多少比例时触发压缩（10% ~ 100%，默认 80%）" : "Compact when context reaches this share of the window (10%–100%, default 80%)",
+    compactMaxTokens: zh ? "压缩摘要 token 上限" : "Compaction summary token cap",
+    compactMaxTokensHint: zh ? "一次压缩生成的摘要最大 token 数（默认 8192）" : "Max tokens in one compaction summary (default 8192)",
     save: zh ? "保存并应用" : "Save & Apply",
     cancel: zh ? "取消" : "Cancel",
     saved: zh ? "✓ 配置已保存，将在下次使用时生效" : "✓ Settings saved; they take effect on next use",
@@ -115,7 +123,18 @@
     maxSteps: $("cfgMaxSteps"),
     subagentMaxDepth: $("cfgSubagentDepth"),
     maxParallelSubagents: $("cfgMaxParallel"),
+    autoCompaction: $("cfgAutoCompaction"),
+    compactionThresholdRatio: $("cfgCompactThreshold"),
+    compactionMaxTokens: $("cfgCompactMaxTokens"),
   };
+  // 自动压缩开关旁的"自动/手动"状态随勾选框实时切换
+  const autoCompactionState = $("cfgAutoCompactionState");
+  const updateAutoCompactionState = () => {
+    if (autoCompactionState) {
+      autoCompactionState.textContent = fields.autoCompaction.checked ? L.autoCompactionOn : L.autoCompactionOff;
+    }
+  };
+  fields.autoCompaction.addEventListener("change", updateAutoCompactionState);
   const saveBtn = $("cfgSave");
   const cwdEl = $("cfgCwd");
 
@@ -835,6 +854,9 @@
         maxSteps: parseInt(fields.maxSteps.value, 10) || 0,
         subagentMaxDepth: parseInt(fields.subagentMaxDepth.value, 10) || 3,
         maxParallelSubagents: parseInt(fields.maxParallelSubagents.value, 10) || 5,
+        autoCompaction: fields.autoCompaction.checked,
+        compactionThresholdRatio: (parseFloat(fields.compactionThresholdRatio.value) || 80) / 100,
+        compactionMaxTokens: parseInt(fields.compactionMaxTokens.value, 10) || 8192,
       },
     });
   });
@@ -850,6 +872,10 @@
     fields.maxSteps.value = String(c.maxSteps ?? 100);
     fields.subagentMaxDepth.value = String(c.subagentMaxDepth ?? 3);
     fields.maxParallelSubagents.value = String(c.maxParallelSubagents ?? 5);
+    fields.autoCompaction.checked = c.autoCompaction !== false;
+    updateAutoCompactionState();
+    fields.compactionThresholdRatio.value = String(Math.round((c.compactionThresholdRatio ?? 0.8) * 100));
+    fields.compactionMaxTokens.value = String(c.compactionMaxTokens ?? 8192);
     cwdEl.value = c.cwd || "";
     saveBtn.disabled = false;
   }

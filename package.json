@@ -212,6 +212,24 @@
           "type": "number",
           "default": 5,
           "markdownDescription": "多 Agent 模式下并行子代理数量上限（提示词级约束）。"
+        },
+        "dshVscode.autoCompaction": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "上下文自动压缩：接近上限时自动归纳为摘要，释放上下文空间。"
+        },
+        "dshVscode.compactionThresholdRatio": {
+          "type": "number",
+          "default": 0.8,
+          "minimum": 0.1,
+          "maximum": 1,
+          "markdownDescription": "上下文自动压缩触发比例：上下文用到窗口的多少比例时触发（10% ~ 100%，默认 80%，设置存小数）。"
+        },
+        "dshVscode.compactionMaxTokens": {
+          "type": "number",
+          "default": 8192,
+          "minimum": 1,
+          "markdownDescription": "上下文自动压缩摘要的 token 上限（默认 8192）。"
         }
       }
     }
