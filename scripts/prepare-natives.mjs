@@ -60,26 +60,12 @@ function copyTree(src, dest) {
 }
 
 async function ensureKoffi() {
-  // 主 @koromix/koffi 是否存在：DSH 内核从某版本起弃用 koffi 后，这里补出的平台子包
-  // 将是"无主包"的孤儿，会让 vsce 的 `npm list --production` 校验报 invalid/extraneous。
-  // 因此主包不存在时直接跳过补全，并清理可能残留的孤儿平台子包。
-  const mainKoffi = join(root, "node_modules", "@koromix", "koffi", "package.json");
-  if (!existsSync(mainKoffi)) {
-    log("main @koromix/koffi absent (DSH no longer uses koffi) — skipping cross-platform koffi fill");
-    for (const p of REQUIRED_KOFFI) {
-      const d = join(root, "node_modules", "@koromix", p);
-      if (existsSync(d)) {
-        rmSync(d, { recursive: true, force: true });
-        log(`koffi ${p}: removed (orphan, no main koffi)`);
-      }
-    }
-    return;
-  }
-
-  // 主包存在：以主包的真实版本补齐其它平台子包（避免硬编码版本与主包不符）。
+  // DSH 内核依赖 bare `koffi`（native），其平台原生模块由 `@koromix/koffi-<plat>` 子包提供。
+  // 跨平台 VSIX 需补齐各平台子包（linux/darwin 的 x64/arm64），否则对应平台启动会报
+  // "Cannot find the native Koffi module"。版本以 bare koffi 主包的实际版本为准（勿硬编码）。
   let koffiVersion = KOFFI_VERSION;
   try {
-    koffiVersion = JSON.parse(readFileSync(mainKoffi, "utf8")).version || KOFFI_VERSION;
+    koffiVersion = JSON.parse(readFileSync(join(root, "node_modules", "koffi", "package.json"), "utf8")).version || KOFFI_VERSION;
   } catch { /* keep default */ }
 
   rmSync(TMP, { recursive: true, force: true });
