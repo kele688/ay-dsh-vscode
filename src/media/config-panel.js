@@ -83,6 +83,22 @@
     autoCompactionHint: zh ? "上下文占比接近上限时自动归纳为摘要，释放空间" : "When context share nears the limit, summarize older history to free space",
     autoCompactionOn: zh ? "自动" : "Auto",
     autoCompactionOff: zh ? "手动" : "Manual",
+    permissionMatch: zh ? "工具名" : "Tool",
+    permissionAction: zh ? "动作" : "Action",
+    permissionActionAllow: zh ? "允许" : "Allow",
+    permissionActionAsk: zh ? "询问" : "Ask",
+    permissionActionDeny: zh ? "拒绝" : "Deny",
+    permissionAdd: zh ? "＋ 添加规则" : "+ Add rule",
+    permissionRemove: zh ? "删除" : "Delete",
+    permissionEmpty: zh ? "（暂无规则；使用内置默认：glob / grep / read / find 自动允许）" : "(no rules; built-in defaults: glob / grep / read / find allowed)",
+    permissionCommandRejected: zh ? "该配置不被接受：DSH 内核暂未提供具体命令参数，仅支持工具级（如 glob / grep / read），不支持带参数命令甄别" : "Rejected: command-level rules are unsupported (the DSH kernel does not expose command args). Use tool-level matches only (e.g. glob / grep / read)",
+    permissionSave: zh ? "保存" : "Save",
+    permissionCancel: zh ? "取消" : "Cancel",
+    permissionApplyNow: zh ? "立即应用" : "Apply now",
+    permissionTitle: zh ? "提示" : "Notice",
+    permissionOk: zh ? "确定" : "OK",
+    permissionEmptyName: zh ? "工具名不能为空" : "Tool name must not be empty",
+    permissionInvalidName: zh ? "请输入合法命令行（不带参数）" : "Enter a valid command (without arguments)",
     compactThreshold: zh ? "自动压缩触发比例" : "Auto-compaction threshold ratio",
     compactThresholdHint: zh ? "上下文用到窗口的多少比例时触发压缩（10% ~ 100%，默认 80%）" : "Compact when context reaches this share of the window (10%–100%, default 80%)",
     compactMaxTokens: zh ? "压缩摘要 token 上限" : "Compaction summary token cap",
@@ -135,6 +151,130 @@
     }
   };
   fields.autoCompaction.addEventListener("change", updateAutoCompactionState);
+
+  // ---- 权限审批组：工具级自动授权规则（Kilo Code 风格）----
+  const permissionRulesEl = $("permissionRules");
+  const addPermissionBtn = $("cfgAddPermission");
+  // 内置默认白名单（工具级只读）：无配置时作为示例展示，用户可删除
+  const DEFAULT_PERMISSION_RULES = [
+    { match: "glob", action: "allow" },
+    { match: "grep", action: "allow" },
+    { match: "read", action: "allow" },
+    { match: "find", action: "allow" },
+  ];
+  // 工具名合法性：仅字母/数字开头，允许点/下划线/连字符（命令行 token，拒绝中文/空格/特殊字符）
+  const TOOL_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+  function validateToolName(name) {
+    const v = String(name ?? "").trim();
+    // 校验不合格统一提示：请输入合法命令行（不带参数）
+    if (!v) return L.permissionInvalidName;
+    if (!TOOL_NAME_RE.test(v)) return L.permissionInvalidName;
+    return "";
+  }
+  // 校验/限制提示：用配置面板 modal 弹框（webview 禁用 alert；不使用对话区红条）
+  function showPermissionError(text) {
+    const esc = (s) => String(s ?? "").replace(/"/g, "&quot;");
+    const overlay = document.createElement("div");
+    overlay.className = "modal-overlay";
+    overlay.innerHTML = `
+      <div class="modal confirm-modal">
+        <h3>${esc(L.permissionTitle)}</h3>
+        <p class="confirm-text">${esc(text)}</p>
+        <div class="row" style="justify-content:flex-end">
+          <button type="button" class="primary" id="perrOk">${esc(L.permissionOk)}</button>
+        </div>
+      </div>`;
+    document.body.appendChild(overlay);
+    const close = () => overlay.remove();
+    overlay.querySelector("#perrOk").addEventListener("click", close);
+    overlay.addEventListener("click", (e) => { if (e.target === overlay) close(); });
+  }
+  let permissionRules = []; // [{ match, action, saved, dirty, baseMatch, baseAction }]
+  /** 把当前全部有效规则整体写回 settings（前端为权威，避免单条保存丢失其它规则）。 */
+  function persistPermissionRules() {
+    const rules = permissionRules
+      .filter((r) => r.match && r.match.trim() !== "" && TOOL_NAME_RE.test(r.match.trim()))
+      .map((r) => ({ match: r.match.trim(), action: r.action }));
+    vscode.postMessage({ t: "savePermission", rules });
+  }
+  function renderPermissionRules() {
+    if (!permissionRulesEl) return;
+    permissionRulesEl.innerHTML = "";
+    if (permissionRules.length === 0) {
+      permissionRulesEl.innerHTML = `<span class="hint">${L.permissionEmpty}</span>`;
+      return;
+    }
+    permissionRules.forEach((rule, i) => {
+      const row = document.createElement("div");
+      row.className = "permission-rule-row";
+      const inp = document.createElement("input");
+      inp.type = "text";
+      inp.value = rule.match || "";
+      inp.placeholder = "glob";
+      inp.spellcheck = false;
+      inp.readOnly = rule.saved; // 已配置的规则工具名只读
+      inp.addEventListener("input", () => {
+        rule.match = inp.value;
+        rule.dirty = true;
+      });
+      const sel = document.createElement("select");
+      sel.innerHTML = `<option value="allow">${L.permissionActionAllow}</option><option value="ask">${L.permissionActionAsk}</option><option value="deny">${L.permissionActionDeny}</option>`;
+      sel.value = ["allow", "ask", "deny"].includes(rule.action) ? rule.action : "ask";
+      sel.addEventListener("change", () => {
+        rule.action = sel.value;
+        rule.dirty = true;
+        renderPermissionRules(); // 有变化：显示"保存/取消"
+      });
+      // 保存：整体写回（含该条）；取消：已配置恢复原值 / 新增则放弃该行
+      const save = document.createElement("button");
+      save.type = "button";
+      save.className = "secondary";
+      save.textContent = L.permissionSave;
+      save.addEventListener("click", () => {
+        const err = validateToolName(rule.match);
+        if (err) { showPermissionError(err); return; }
+        persistPermissionRules();
+        rule.saved = true;
+        rule.dirty = false;
+        rule.baseMatch = rule.match.trim();
+        rule.baseAction = rule.action;
+        renderPermissionRules();
+      });
+      const cancel = document.createElement("button");
+      cancel.type = "button";
+      cancel.className = "secondary";
+      cancel.textContent = L.permissionCancel;
+      cancel.addEventListener("click", () => {
+        if (rule.saved) {
+          rule.match = rule.baseMatch;
+          rule.action = rule.baseAction;
+          rule.dirty = false;
+        } else {
+          permissionRules.splice(i, 1);
+        }
+        renderPermissionRules();
+      });
+      // 删除：移除该行并立即同步写回（明确"删除"，非取消）
+      const rm = document.createElement("button");
+      rm.type = "button";
+      rm.className = "secondary";
+      rm.textContent = L.permissionRemove;
+      rm.addEventListener("click", () => {
+        permissionRules.splice(i, 1);
+        persistPermissionRules();
+        renderPermissionRules();
+      });
+      row.append(inp, sel, ...(rule.dirty ? [save, cancel] : []), rm);
+      permissionRulesEl.appendChild(row);
+    });
+  }
+  if (addPermissionBtn) {
+    addPermissionBtn.addEventListener("click", () => {
+      permissionRules.push({ match: "", action: "allow", saved: false, dirty: true, baseMatch: "", baseAction: "allow" });
+      renderPermissionRules();
+    });
+  }
+
   const saveBtn = $("cfgSave");
   const cwdEl = $("cfgCwd");
 
@@ -195,19 +335,32 @@
 
   // ---- 左右布局：左侧菜单切换分组、组内 tab 切换面板（多 tab 预留） ----
   const sidebar = $("cfgSidebar");
+  let activeGroup = "model";
+  // 底部按钮随组切换：权限审批组显示"立即应用"（规则已按条单独保存，点击重启宿主生效）；
+  // 模型/升级组隐藏；运行/控制组显示"保存并应用"。
+  function updateFooterForGroup() {
+    const footer = saveBtn.closest(".cfg-footer");
+    if (activeGroup === "permission") {
+      if (footer) footer.style.display = "";
+      saveBtn.textContent = L.permissionApplyNow;
+    } else if (activeGroup === "upgrade" || activeGroup === "model") {
+      if (footer) footer.style.display = "none";
+    } else {
+      if (footer) footer.style.display = "";
+      saveBtn.textContent = L.save;
+    }
+  }
   sidebar.addEventListener("click", (ev) => {
     const btn = ev.target.closest(".cfg-nav");
     if (!btn) return;
+    activeGroup = btn.dataset.group;
     sidebar.querySelectorAll(".cfg-nav").forEach((b) => b.classList.toggle("active", b === btn));
     document.querySelectorAll(".cfg-group").forEach((el) => {
       el.classList.toggle("active", el.dataset.group === btn.dataset.group);
     });
-    // "模型配置"/"版本升级"组：操作均在各自弹窗/表单内保存，隐藏底部"保存并应用"；
-    // "运行环境"/"控制参数"组保留（有可保存的运行参数）。切走恢复。
-    const footer = saveBtn.closest(".cfg-footer");
-    const group = btn.dataset.group;
-    if (footer) footer.style.display = group === "upgrade" || group === "model" ? "none" : "";
+    updateFooterForGroup();
   });
+  updateFooterForGroup(); // 初始化：默认模型组隐藏底部按钮
   document.querySelectorAll(".cfg-tabs").forEach((tabs) => {
     tabs.addEventListener("click", (ev) => {
       const tab = ev.target.closest(".cfg-tab");
@@ -842,8 +995,21 @@
 
   saveBtn.addEventListener("click", () => {
     saveBtn.disabled = true;
+    // 权限审批组：规则已按条单独保存，此按钮 = "立即应用"（重启宿主使规则生效）
+    if (activeGroup === "permission") {
+      vscode.postMessage({ t: "applyPermission" });
+      saveBtn.disabled = false;
+      return;
+    }
     // 保存中/结果提示统一由扩展显示在 VS Code 状态栏，面板内不再显示任何文字
     // （避免挤占/移动保存按钮位置）
+    // 权限规则校验：DSH 内核暂未提供命令参数，仅支持工具级匹配——含空白=命令级，拒绝保存
+    const cmdRule = permissionRules.find((r) => /\s/.test(r.match));
+    if (cmdRule) {
+      showPermissionError(L.permissionCommandRejected);
+      saveBtn.disabled = false;
+      return;
+    }
     vscode.postMessage({
       t: "save",
       values: {
@@ -857,6 +1023,7 @@
         autoCompaction: fields.autoCompaction.checked,
         compactionThresholdRatio: (parseFloat(fields.compactionThresholdRatio.value) || 80) / 100,
         compactionMaxTokens: parseInt(fields.compactionMaxTokens.value, 10) || 8192,
+        autoApproveRules: permissionRules.filter((r) => r.match && r.match.trim() !== "").map((r) => ({ match: r.match.trim(), action: r.action })),
       },
     });
   });
@@ -876,6 +1043,10 @@
     updateAutoCompactionState();
     fields.compactionThresholdRatio.value = String(Math.round((c.compactionThresholdRatio ?? 0.8) * 100));
     fields.compactionMaxTokens.value = String(c.compactionMaxTokens ?? 8192);
+    permissionRules = Array.isArray(c.autoApproveRules) && c.autoApproveRules.length > 0
+      ? c.autoApproveRules.map((r) => ({ match: String(r.match ?? ""), action: ["allow", "ask", "deny"].includes(r.action) ? r.action : "ask", saved: true, dirty: false, baseMatch: String(r.match ?? ""), baseAction: ["allow", "ask", "deny"].includes(r.action) ? r.action : "ask" }))
+      : DEFAULT_PERMISSION_RULES.map((r) => ({ ...r, saved: true, dirty: false, baseMatch: r.match, baseAction: r.action }));
+    renderPermissionRules();
     cwdEl.value = c.cwd || "";
     saveBtn.disabled = false;
   }

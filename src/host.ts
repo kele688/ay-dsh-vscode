@@ -55,6 +55,8 @@ export interface AgentHostOptions {
   subagentMaxDepth?: number;
   /** 多 agent 模式并行子代理数量上限（prompt 级约束）。 */
   maxParallelSubagents?: number;
+  /** 自动授权规则（工具级 {match, action}；Kilo Code 风格）。 */
+  autoApproveRules?: { match: string; action: string }[];
   /** 上下文自动压缩：是否启用。 */
   autoCompaction?: boolean;
   /** 上下文自动压缩触发比例（contextWindow 占比，0~1）。 */
@@ -275,6 +277,7 @@ export class AgentHost {
       DSH_LOCALE: vscode.env.language.startsWith("zh") ? "zh" : "en",
       DSH_SUBAGENT_MAX_DEPTH: String(this.options.subagentMaxDepth ?? 3),
       DSH_MAX_PARALLEL_SUBAGENTS: String(this.options.maxParallelSubagents ?? 5),
+      DSH_AUTO_APPROVE: JSON.stringify(this.options.autoApproveRules ?? []),
       DSH_COMPACTION_AUTO: String(this.options.autoCompaction ?? true),
       DSH_COMPACTION_THRESHOLD_RATIO: String(this.options.compactionThresholdRatio ?? 0.8),
       DSH_COMPACTION_MAX_TOKENS: String(this.options.compactionMaxTokens ?? 8192),

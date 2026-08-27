@@ -61,6 +61,7 @@ export interface ConfigPanelDeps {
     autoCompaction: boolean;
     compactionThresholdRatio: number;
     compactionMaxTokens: number;
+    autoApproveRules: { match: string; action: string }[];
   };
   /** 当前 Agent 工作目录（展示用）。 */
   workspaceRoot: () => string;
@@ -192,6 +193,7 @@ export function openConfigPanel(context: vscode.ExtensionContext, deps: ConfigPa
           autoCompaction: cfg.get<boolean>("autoCompaction") ?? true,
           compactionThresholdRatio: cfg.get<number>("compactionThresholdRatio") ?? 0.8,
           compactionMaxTokens: cfg.get<number>("compactionMaxTokens") ?? 8192,
+          autoApproveRules: cfg.get<{ match: string; action: string }[]>("autoApproveRules") ?? [],
           cwd: deps.workspaceRoot(),
         },
         providers,
@@ -239,6 +241,7 @@ export function openConfigPanel(context: vscode.ExtensionContext, deps: ConfigPa
           autoCompaction: true,
           compactionThresholdRatio: 0.8,
           compactionMaxTokens: 8192,
+          autoApproveRules: [],
           cwd: "",
         },
         providers: [],
@@ -531,6 +534,15 @@ export function openConfigPanel(context: vscode.ExtensionContext, deps: ConfigPa
             Number.isFinite(v.compactionMaxTokens) && v.compactionMaxTokens > 0 ? v.compactionMaxTokens : 8192,
             vscode.ConfigurationTarget.Global
           );
+          await cfg.update(
+            "autoApproveRules",
+            Array.isArray(v.autoApproveRules)
+              ? (v.autoApproveRules as { match?: string; action?: string }[])
+                  .filter((r) => r && String(r.match ?? "").trim() !== "")
+                  .map((r) => ({ match: String(r.match ?? "").trim(), action: ["allow", "ask", "deny"].includes(String(r.action)) ? String(r.action) : "ask" }))
+              : [],
+            vscode.ConfigurationTarget.Global
+          );
           // 3. 应用：对比保存前后的宿主运行参数——只有确实变化才重启宿主；
           //    提供商配置（经 llm-pi-ai settings 热生效）与无变化的保存都不重启。
           const next = {
@@ -612,6 +624,24 @@ export function openConfigPanel(context: vscode.ExtensionContext, deps: ConfigPa
         else panel.webview.postMessage({ t: "dshResetResult", ok: false });
         break;
       }
+      case "savePermission": {
+        // 权限审批：前端为权威，整体写回工具级规则列表 {match, action}
+        const raw = (msg as { rules?: unknown }).rules;
+        const rules = Array.isArray(raw)
+          ? raw
+              .filter((r): r is { match?: string; action?: string } => Boolean(r) && typeof r === "object")
+              .map((r) => ({ match: String(r.match ?? "").trim(), action: ["allow", "ask", "deny"].includes(String(r.action)) ? String(r.action) : "ask" }))
+              .filter((r) => r.match && /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(r.match))
+          : [];
+        await vscode.workspace.getConfiguration(CONFIG_NS).update("autoApproveRules", rules, vscode.ConfigurationTarget.Global);
+        await sendConfig();
+        break;
+      }
+      case "applyPermission": {
+        // 权限审批"立即应用"：重启宿主使最新规则生效（规则本身已按条单独保存，不在此重复保存）
+        deps.onSaved(true);
+        break;
+      }
       case "dshQuery":
         void runQuery("dsh");
         break;
@@ -662,6 +692,18 @@ function renderHtml(webview: vscode.Webview, scriptUri: vscode.Uri, styleUri: vs
     maxParallelHint: zh ? "多 Agent 模式下同时派发的子代理数量上限（默认 5）" : "Max concurrently dispatched subagents in multi-agent mode (default 5)",
     autoCompaction: zh ? "自动压缩上下文" : "Auto compact context",
     autoCompactionHint: zh ? "上下文占比接近上限时自动归纳为摘要，释放空间" : "When context share nears the limit, summarize older history to free space",
+    groupPermission: zh ? "权限审批" : "Approval",
+    permissionHint: zh ? "自动授权规则：命中的工具调用按所选动作处理——允许 = 自动放行，不再弹审批框；询问 = 仍会弹框请您确认；拒绝 = 直接拒绝。仅对命中的工具生效，其余调用照常审批。" : "Auto-approval rules: a matched tool call follows the selected action — Allow = auto-approved without prompting; Ask = still prompts for your confirmation; Deny = rejected outright. Only matched tools are affected; others keep normal approval.",
+    permissionCommandNote: zh ? "由于 DSH 内核暂未提供具体命令参数，这里仅支持工具级匹配（如 glob / grep / read），暂不支持带参数命令甄别（如 git status）。" : "Because the DSH kernel does not expose command arguments yet, only tool-level matches are supported here (e.g. glob / grep / read); command-level rules (e.g. git status) are not supported.",
+    permissionMatch: zh ? "工具名" : "Tool",
+    permissionAction: zh ? "动作" : "Action",
+    permissionActionAllow: zh ? "允许" : "Allow",
+    permissionActionAsk: zh ? "询问" : "Ask",
+    permissionActionDeny: zh ? "拒绝" : "Deny",
+    permissionAdd: zh ? "＋ 添加规则" : "+ Add rule",
+    permissionRemove: zh ? "删除该规则" : "Remove rule",
+    permissionEmpty: zh ? "（暂无规则；使用内置默认：glob / grep / read / find 自动允许）" : "(no rules; built-in defaults: glob / grep / read / find allowed)",
+    permissionCommandRejected: zh ? "该配置不被接受：DSH 内核暂未提供具体命令参数，仅支持工具级（如 glob / grep / read），不支持带参数命令甄别" : "Rejected: command-level rules are unsupported (the DSH kernel does not expose command args). Use tool-level matches only (e.g. glob / grep / read)",
     autoCompactionOn: zh ? "自动" : "Auto",
     autoCompactionOff: zh ? "手动" : "Manual",
     compactThreshold: zh ? "自动压缩触发比例" : "Auto-compaction threshold ratio",
@@ -719,6 +761,7 @@ function renderHtml(webview: vscode.Webview, scriptUri: vscode.Uri, styleUri: vs
     <button type="button" class="cfg-nav active" data-group="model">${L.groupModel}</button>
     <button type="button" class="cfg-nav" data-group="runtime">${L.groupRuntime}</button>
     <button type="button" class="cfg-nav" data-group="control">${L.groupControl}</button>
+    <button type="button" class="cfg-nav" data-group="permission">${L.groupPermission}</button>
     <button type="button" class="cfg-nav" data-group="upgrade">${L.groupUpgrade}</button>
   </nav>
 
@@ -813,6 +856,18 @@ function renderHtml(webview: vscode.Webview, scriptUri: vscode.Uri, styleUri: vs
           <input type="number" id="cfgCompactMaxTokens" min="1" step="1000" value="8192">
           <span class="hint">${L.compactMaxTokensHint}</span>
         </div>
+      </div>
+    </div>
+
+    <div class="cfg-group" data-group="permission">
+      <div class="cfg-pane active" data-pane="main">
+        <h3 class="sub-title">${L.groupPermission}</h3>
+        <p class="hint" style="margin-top:0">${L.permissionHint}</p>
+        <div id="permissionRules" class="permission-rules"></div>
+        <div class="row" style="margin-top:8px">
+          <button type="button" class="secondary" id="cfgAddPermission">${L.permissionAdd}</button>
+        </div>
+        <p class="hint permission-note">${L.permissionCommandNote}</p>
       </div>
     </div>
 

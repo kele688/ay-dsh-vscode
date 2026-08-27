@@ -140343,8 +140343,36 @@ function attachAgent(ctx, handle, pump2) {
   });
   return { resetStepBudget };
 }
+function loadAutoApproveRules() {
+  const DEFAULT_RULES = [
+    { match: "glob", action: "allow" },
+    { match: "grep", action: "allow" },
+    { match: "read", action: "allow" },
+    { match: "find", action: "allow" }
+  ];
+  try {
+    const raw = process.env.DSH_AUTO_APPROVE;
+    if (!raw) return DEFAULT_RULES;
+    const arr = JSON.parse(raw);
+    if (!Array.isArray(arr)) return DEFAULT_RULES;
+    const valid = arr.map((r2) => ({ match: String(r2?.match ?? "").trim(), action: ["allow", "ask", "deny"].includes(r2?.action) ? r2.action : "ask" })).filter((r2) => r2.match);
+    return valid.length > 0 ? valid : DEFAULT_RULES;
+  } catch {
+    return DEFAULT_RULES;
+  }
+}
+var autoApproveRules = loadAutoApproveRules();
 function installApprovalListener(ctx, approvals) {
   ctx.on("approval/request", async (req) => {
+    const rule = autoApproveRules.find((r2) => r2.match === req.toolName);
+    if (rule && rule.action === "allow") {
+      log("info", `auto-approve ${req.toolName} (tool-level rule allow)`);
+      return "allowed-once";
+    }
+    if (rule && rule.action === "deny") {
+      log("info", `auto-deny ${req.toolName} (tool-level rule deny)`);
+      return "rejected";
+    }
     const id = approvals.nextId();
     const agent = req.agent;
     const agentId = agent?.session?.id ? String(agent.session.id).slice(-8) : void 0;

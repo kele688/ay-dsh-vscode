@@ -278,18 +278,19 @@ button.danger:hover {
 }
 .modal h3 {
   margin: 0 0 12px;
-  font-size: 14px;
+  font-size: 15px;
 }
 .modal.provider-modal {
   width: min(580px, 92vw);
 }
 .modal.confirm-modal {
-  width: min(380px, 90vw);
+  width: min(300px, 90vw);
 }
 .confirm-text {
   font-size: 13px;
   line-height: 1.5;
   margin: 0 0 2px;
+  text-align: center;
 }
 .modal .row {
   margin-top: 22px; /* 保存/取消按钮与上方字段拉开距离 */
@@ -408,6 +409,44 @@ input.invalid {
 }
 .suffix-row input {
   flex: none;
+}
+/* 权限审批：自动授权规则列表（工具级，Kilo Code 风格） */
+.permission-rules {
+  display: flex;
+  flex-direction: column;
+  margin-top: 6px;
+}
+.permission-rule-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 2px;
+  border-bottom: 1px solid var(--vscode-widget-border, rgba(128, 128, 128, 0.35)); /* 每行下边框分割线 */
+}
+.permission-rule-row:last-child {
+  border-bottom: none;
+}
+.permission-rule-row input[type="text"],
+.permission-rule-row select {
+  border: none; /* 字段无边框，靠行分割线分隔 */
+  background: transparent;
+  box-shadow: none;
+  max-width: none;
+}
+.permission-rule-row input[type="text"] {
+  flex: 1;
+  max-width: 220px;
+}
+.permission-rule-row select {
+  max-width: 120px;
+  /* 下拉用 VS Code 主题背景/前景，避免透明背景导致白底白字 */
+  background: var(--vscode-dropdown-background, #3c3c3c);
+  color: var(--vscode-dropdown-foreground, #cccccc);
+}
+/* 添加规则按钮下方的限制说明：字号更小一级 */
+.permission-note {
+  font-size: 11px;
+  opacity: 0.85;
 }
 .key-note {
   font-size: 11px;

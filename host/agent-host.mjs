@@ -1036,8 +1036,43 @@ function attachAgent(ctx, handle, pump) {
  * 瀑布语义要求监听器唯一：若同时在 agent.ctx 挂监听，同一请求会被
  * 两个监听器各自 claim（重复弹窗/双帧），故全部审批集中在此。
  */
+/** 自动授权规则（工具级；Kilo Code 风格 {match, action}）。
+ *  注意：DSH 内核暂不提供具体命令参数，仅支持工具级匹配（toolName），
+ *  不支持带参数命令甄别（如 "git status"）。默认对明确只读的独立工具放行。 */
+function loadAutoApproveRules() {
+  const DEFAULT_RULES = [
+    { match: "glob", action: "allow" },
+    { match: "grep", action: "allow" },
+    { match: "read", action: "allow" },
+    { match: "find", action: "allow" },
+  ];
+  try {
+    const raw = process.env.DSH_AUTO_APPROVE;
+    if (!raw) return DEFAULT_RULES;
+    const arr = JSON.parse(raw);
+    if (!Array.isArray(arr)) return DEFAULT_RULES;
+    const valid = arr
+      .map((r) => ({ match: String(r?.match ?? "").trim(), action: ["allow", "ask", "deny"].includes(r?.action) ? r.action : "ask" }))
+      .filter((r) => r.match);
+    return valid.length > 0 ? valid : DEFAULT_RULES;
+  } catch {
+    return DEFAULT_RULES;
+  }
+}
+const autoApproveRules = loadAutoApproveRules();
+
 function installApprovalListener(ctx, approvals) {
   ctx.on("approval/request", async (req) => {
+    // 自动授权前置（工具级）：命中规则直接应答，不打扰用户。
+    const rule = autoApproveRules.find((r) => r.match === req.toolName);
+    if (rule && rule.action === "allow") {
+      log("info", `auto-approve ${req.toolName} (tool-level rule allow)`);
+      return "allowed-once";
+    }
+    if (rule && rule.action === "deny") {
+      log("info", `auto-deny ${req.toolName} (tool-level rule deny)`);
+      return "rejected";
+    }
     const id = approvals.nextId();
     const agent = req.agent;
     // agent 标识：会话 id 短形式（多 agent 场景让用户知道是谁在请求授权）

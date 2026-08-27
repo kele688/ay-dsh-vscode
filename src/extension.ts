@@ -200,6 +200,7 @@ function readConfig(): {
   autoCompaction: boolean;
   compactionThresholdRatio: number;
   compactionMaxTokens: number;
+  autoApproveRules: { match: string; action: string }[];
 } {
   const cfg = vscode.workspace.getConfiguration(CONFIG_NS);
   const apiKeySetting = cfg.get<string>("apiKey");
@@ -218,7 +219,14 @@ function readConfig(): {
   const autoCompaction = cfg.get<boolean>("autoCompaction") ?? true;
   const compactionThresholdRatio = Math.min(1, Math.max(0.1, Number(cfg.get<number>("compactionThresholdRatio") ?? 0.8) || 0.8));
   const compactionMaxTokens = Math.max(1, Number(cfg.get<number>("compactionMaxTokens") ?? 8192) || 8192);
-  return { apiKey, baseUrl, model, permissionMode, nodePath, maxSteps, subagentMaxDepth, maxParallelSubagents, autoCompaction, compactionThresholdRatio, compactionMaxTokens };
+  // 自动授权规则（工具级，Kilo Code 风格）：glob/grep/read 等只读工具可自动放行
+  const rawRules = cfg.get<{ match?: string; action?: string }[]>("autoApproveRules");
+  const autoApproveRules: { match: string; action: string }[] = Array.isArray(rawRules)
+    ? rawRules
+        .map((r) => ({ match: String(r?.match ?? "").trim(), action: ["allow", "ask", "deny"].includes(String(r?.action)) ? String(r.action) : "ask" }))
+        .filter((r) => r.match)
+    : [];
+  return { apiKey, baseUrl, model, permissionMode, nodePath, maxSteps, subagentMaxDepth, maxParallelSubagents, autoCompaction, compactionThresholdRatio, compactionMaxTokens, autoApproveRules };
 }
 
 /** 配置摘要（推送给 UI 展示）。SecretStorage 密钥库是 API Key 的主存储，必须纳入判断。 */
@@ -318,6 +326,7 @@ async function ensureHost(context: vscode.ExtensionContext): Promise<AgentHost> 
       autoCompaction: cfg.autoCompaction,
       compactionThresholdRatio: cfg.compactionThresholdRatio,
       compactionMaxTokens: cfg.compactionMaxTokens,
+      autoApproveRules: cfg.autoApproveRules,
       dshHome: pluginDshHome(context),
       legacyDshHome: legacyDshHome(),
       runtimeNodeModulesPath: runtimeManager?.runtimeNodeModules(),
@@ -730,6 +739,8 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(
     vscode.workspace.onDidChangeConfiguration((e) => {
       if (!e.affectsConfiguration(CONFIG_NS)) return;
+      // 权限审批规则单独保存：仅 autoApproveRules 变化不自动重启（由"立即应用"显式触发）
+      if (e.affectsConfiguration(`${CONFIG_NS}.autoApproveRules`)) return;
       if (configSaveTransaction) return; // 面板保存事务中：onSaved 统一处理
       if (Date.now() - lastConfigRestartAt < 1500) return; // 面板保存刚重启过：忽略延迟事件
       provider?.noteHostRestart();
