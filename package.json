@@ -2,7 +2,7 @@
   "name": "ay-dsh-vscode",
   "displayName": "ay-dsh-vscode",
   "description": "AI coding agent powered by DeepSeek Harness (DSH): multi-agent orchestration, long-running goal tasks, transparent tool usage, sandboxed approvals — in a Kilo Code style chat.",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "publisher": "kele688",
   "license": "MIT",
   "icon": "media/icon.png",
@@ -237,8 +237,21 @@
           "items": {
             "type": "object",
             "properties": {
-              "match": { "type": "string", "markdownDescription": "工具名（如 glob / grep / read）。DSH 内核暂未提供具体命令参数，仅支持工具级匹配，不支持带参数命令。", "default": "" },
-              "action": { "type": "string", "enum": ["allow", "ask", "deny"], "default": "allow", "markdownDescription": "allow=自动允许，ask=询问，deny=拒绝。" }
+              "match": {
+                "type": "string",
+                "markdownDescription": "工具名（如 glob / grep / read）。DSH 内核暂未提供具体命令参数，仅支持工具级匹配，不支持带参数命令。",
+                "default": ""
+              },
+              "action": {
+                "type": "string",
+                "enum": [
+                  "allow",
+                  "ask",
+                  "deny"
+                ],
+                "default": "allow",
+                "markdownDescription": "allow=自动允许，ask=询问，deny=拒绝。"
+              }
             }
           },
           "markdownDescription": "自动授权规则（工具级）：命中的工具调用按动作处理（allow 自动允许 / ask 询问 / deny 拒绝），不弹审批框。"
