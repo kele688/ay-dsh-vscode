@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.4.1] - 2026-08-27
+
+- tool-level auto-approval rules
+- cross-platform koffi native fix
+- DSH core stays 0.1.1-rc.2
+
 ## [0.4.0] - 2026-08-23
 
 - self-contained DSH core 0.1.1-rc.2 (replaces 0.1.0-rc.6)
