@@ -72,6 +72,7 @@
       done: "✓ 完成",
       failed: "✗ 失败",
       approvalAsk: (name) => `Agent 请求调用工具 <strong>${name}</strong>`,
+      runningHint: "模型运行中：可先编辑输入准备下一轮（模型停止后按 Enter 发送）",
       sessionRotatedBody: (newTitle) => `会话历史已满，已创建新会话「${newTitle || "未命名"}」继续。`,
       sessionSizeTitle: (kb) => `会话日志大小：${kb} KB`,
       approvalQueue: (n) => `⏳ 队列中还有 ${n} 个待授权请求（逐个处理）`,
@@ -165,6 +166,7 @@
       done: "✓ Done",
       failed: "✗ Failed",
       approvalAsk: (name) => `Agent requests to call tool <strong>${name}</strong>`,
+      runningHint: "Model is running: you can type your next message now (press Enter to send once it finishes)",
       sessionRotatedBody: (newTitle) => `Session history is full; a new session "${newTitle || "untitled"}" has been created.`,
       sessionSizeTitle: (kb) => `Session log size: ${kb} KB`,
       approvalQueue: (n) => `⏳ Queue: ${n} pending approval(s) — handled one by one`,
@@ -264,13 +266,28 @@
    * + 同步到 VS Code 状态栏（面板行太窄，完整信息放状态栏）。
    * 传空字符串/undefined 时隐藏两处。
    */
-  function setHint(text) {
+  let hintTimer = null;
+  function setHint(text, timeoutMs) {
+    if (hintTimer !== null) {
+      clearTimeout(hintTimer);
+      hintTimer = null;
+    }
     const value = text || "";
     hintEl.classList.toggle("hidden", !value);
     // 极简内联显示：ⓘ + 文本（超长自动省略号截断，hover 看完整信息）
     hintEl.textContent = value ? `ⓘ ${value}` : "";
     hintEl.title = value;
     vscode.postMessage({ t: "hint", text: value });
+    // 可选自动消失（压缩等临时提示）：超时后清空面板提示区并同步状态栏
+    if (value && typeof timeoutMs === "number" && timeoutMs > 0) {
+      hintTimer = setTimeout(() => {
+        hintTimer = null;
+        hintEl.classList.add("hidden");
+        hintEl.textContent = "";
+        hintEl.title = "";
+        vscode.postMessage({ t: "hint", text: "" });
+      }, timeoutMs);
+    }
   }
 
   /* ---------------- 工具函数 ---------------- */
@@ -329,12 +346,18 @@
    */
   function attachStickyScroll(el) {
     let stick = true;
+    let raf = null;
     el.addEventListener("scroll", () => {
       const near = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
       stick = near;
     });
     return () => {
-      if (stick) el.scrollTop = el.scrollHeight;
+      if (!stick) return;
+      if (raf !== null) return; // 每帧最多一次滚动：避免每 delta 强制重排占满主线程
+      raf = requestAnimationFrame(() => {
+        raf = null;
+        el.scrollTop = el.scrollHeight;
+      });
     };
   }
 
@@ -931,27 +954,28 @@
     }
     const a = state.currentAssistant;
     if (!a || !state.streamText) return;
+    // innerHTML 重建会整体替换流式临时文本节点，无需逐个清理
     a.textBody.innerHTML = renderMarkdown(state.streamText);
-    a.streamNode = null; // 渲染后旧文本节点已销毁；后续 delta 会重建
     scrollToBottom();
   }
 
   function appendAssistantDelta(text, reasoning) {
     const a = ensureAssistant(false);
     if (reasoning) {
-      // 思考链：纯文本追加（无 markdown 解析，本身廉价），即时显示（实时自动展开）
+      // 思考链：独立文本节点即时追加（textContent += 在长文本下是 O(n²) 重建，
+      // 会占满主线程，卡住输入/授权弹窗），实时自动展开
       a.reasoning.classList.remove("hidden");
       a.reasoning.open = true;
-      a.reasoningBody.textContent += reasoning;
+      a.reasoningBody.appendChild(document.createTextNode(reasoning));
       a.stickReasoning();
     }
     if (text) {
       state.streamText += text;
-      if (!a.streamNode) {
-        a.streamNode = document.createTextNode("");
-        a.textBody.appendChild(a.streamNode);
-      }
-      a.streamNode.textContent += text; // O(delta) 即时追加
+      // 正文同理：独立文本节点追加（O(delta)）。原实现 textContent += 每次重建
+      // 整段文本（O(n²)），长文本流式输出时主线程被占满——表现为输入框卡顿、
+      // 旧消息选中被破坏（拷贝难）、授权弹窗延迟到输出停止才出现。
+      // flushStreamRender 的 innerHTML 重建会整体替换，无需逐个清理。
+      a.textBody.appendChild(document.createTextNode(text));
       scheduleStreamRender(); // 节流执行全量 markdown 格式化
     }
     scrollToBottom();
@@ -1368,6 +1392,9 @@
     // 过渡性状态提示作用不大，保持简洁：启动/就绪均不干扰界面
   }
 
+  /** 压缩进度（tokens 在 summary 阶段记录，end 阶段展示；跨事件持久）。 */
+  let compactTokens = 0;
+
   /** 处理单个视图事件（实时流与历史重放共用；历史重放时思考默认折叠）。 */
   function handleViewEvent(e, opts) {
     const foldReasoning = Boolean(opts && opts.foldReasoning);
@@ -1398,6 +1425,24 @@
       }
       case "tool-result":
         resolveToolCard(e.callId, e.ok, e.text);
+        break;
+      case "compaction":
+        // 面板提示区与状态栏同步（自动/手动压缩共用的宿主事件）：开始/完成提示，
+        // 均为自动超时的临时提示（8s 消失），非驻留；不动发送按钮状态
+        // （按钮由手动压缩的 compactDone/watchdog 管理，避免事件流中断卡死）。
+        if (e.phase === "start") {
+          compactTokens = 0;
+          setHint(t("compacting"), 8000);
+        } else if (e.phase === "summary" && typeof e.tokens === "number") {
+          compactTokens = e.tokens;
+        } else if (e.phase === "end") {
+          setHint(
+            e.ok
+              ? t("compacted", compactTokens > 0 ? `（约 ${compactTokens.toLocaleString()} tokens）` : "")
+              : t("compactFailed", e.error ?? "unknown error"),
+            8000
+          );
+        }
         break;
       case "turn":
         // 新一轮开始：冲刷上一轮未决的流式渲染，重置累积文本，防止串轮；
@@ -1730,9 +1775,16 @@
 
   function send() {
     const text = inputEl.value.trim();
+    if (!text) return;
+    // 模型运行中/压缩中：输入保留、不静默丢弃——用户可提前编辑准备下一轮，
+    // 模型停止后按 Enter 即发送；仅提示不打断（此时发送按钮是"停止"）。
+    if (state.running || state.compacting) {
+      setHint(t("runningHint"));
+      return;
+    }
     // resuming：会话历史恢复中，消息区即将被 history 帧重建，此时发送会
     // 造成"用户消息被清空/应答在前"的错乱——锁定直到历史渲染完成。
-    if (!text || state.running || state.compacting || state.resuming) return;
+    if (state.resuming) return;
     inputEl.value = "";
     autoResize();
     // 用户消息**先**同步渲染进消息列表（append），再通知扩展转发给宿主；

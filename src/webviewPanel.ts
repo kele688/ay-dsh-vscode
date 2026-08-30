@@ -508,7 +508,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           if (e.event.kind === "compaction") {
             if (e.event.phase === "start") {
               this.lastCompactionTokens = undefined;
-              vscode.window.setStatusBarMessage(loc("正在压缩上下文…", "Compacting context…"));
+              // 带超时的临时提示（10s 自动消失），不做常驻——常驻消息会被后续
+              // 带超时消息"恢复"，导致状态栏"又变回正在压缩"的假象。
+              vscode.window.setStatusBarMessage(loc("正在压缩上下文…", "Compacting context…"), 10000);
             } else if (e.event.phase === "summary" && typeof e.event.tokens === "number") {
               this.lastCompactionTokens = e.event.tokens;
             } else if (e.event.phase === "end") {

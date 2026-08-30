@@ -515,12 +515,18 @@ export function openConfigPanel(context: vscode.ExtensionContext, deps: ConfigPa
             ["workspace-write", "read-only", "danger-full-access"].includes(v.permissionMode) ? v.permissionMode : "workspace-write",
             vscode.ConfigurationTarget.Global
           );
-          await cfg.update("nodePath", typeof v.nodePath === "string" ? v.nodePath.trim() : "", vscode.ConfigurationTarget.Global);
-          await cfg.update("defaultWorkspace", typeof v.defaultWorkspace === "string" ? v.defaultWorkspace.trim() : "", vscode.ConfigurationTarget.Global);
+          // 运行环境相关参数（nodePath/defaultWorkspace/maxOutputChars）存入**工作区设置**：
+          // 跟随项目目录、按环境天然隔离（本地 / Remote 各自读写本机的 .vscode/settings.json），
+          // 不受 VS Code 设置同步（Settings Sync）的跨环境污染；无工作区时回退用户设置。
+          const runtimeTarget = vscode.workspace.workspaceFolders?.[0]
+            ? vscode.ConfigurationTarget.Workspace
+            : vscode.ConfigurationTarget.Global;
+          await cfg.update("nodePath", typeof v.nodePath === "string" ? v.nodePath.trim() : "", runtimeTarget);
+          await cfg.update("defaultWorkspace", typeof v.defaultWorkspace === "string" ? v.defaultWorkspace.trim() : "", runtimeTarget);
           await cfg.update(
             "maxOutputChars",
             Number.isFinite(v.maxOutputChars) && v.maxOutputChars > 0 ? v.maxOutputChars : 40000,
-            vscode.ConfigurationTarget.Global
+            runtimeTarget
           );
           await cfg.update(
             "maxSteps",
