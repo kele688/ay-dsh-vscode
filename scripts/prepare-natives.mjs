@@ -38,6 +38,36 @@ const REQUIRED_KOFFI = [
 ];
 const REQUIRED_PTY = ["linux-x64"]; // linux-arm64 optional (warn only if absent)
 
+/** @vscode/ripgrep 平台包（grep/glob 工具内部 spawn 的打包 rg 二进制）。
+ *  npm install 只装当前平台，跨平台 VSIX 若缺某平台包，该平台上工具执行
+ *  `require.resolve("@vscode/ripgrep-<plat>/bin/rg")` 会失败 → 报
+ *  "ripgrep launch failed"。版本以 node_modules/@vscode/ripgrep 主包为准（勿硬编码）。 */
+const REQUIRED_RIPGREP = [
+  "ripgrep-linux-x64",
+  "ripgrep-linux-arm64",
+  "ripgrep-linux-arm",
+  "ripgrep-linux-ia32",
+  "ripgrep-linux-ppc64",
+  "ripgrep-linux-riscv64",
+  "ripgrep-linux-s390x",
+  "ripgrep-darwin-x64",
+  "ripgrep-darwin-arm64",
+  "ripgrep-win32-x64",
+  "ripgrep-win32-arm64",
+  "ripgrep-win32-ia32",
+];
+
+/** sharp 平台包（dsh-attachment-local 依赖，图片附件处理）。npm 只装当前平台，
+ *  Linux 缺 @img/sharp-linux-x64 + @img/sharp-libvips-linux-x64；跨平台 WASM 兜底
+ *  @img/sharp-wasm32 已由 package.json 显式声明（否则 vsce 只按依赖树打包）。
+ *  各平台包版本以 sharp 主包 optionalDependencies 声明为准（libvips 与主包版本不同）。 */
+const REQUIRED_SHARP = [
+  "sharp-linux-x64",
+  "sharp-libvips-linux-x64",
+  "sharp-linux-arm64",
+  "sharp-libvips-linux-arm64",
+];
+
 function log(msg) {
   console.log(`[prepare-natives] ${msg}`);
 }
@@ -59,6 +89,50 @@ function copyTree(src, dest) {
   }
 }
 
+/** 确保一个 scoped 平台包就位（koffi/ripgrep/sharp 通用）：
+ *  优先复用本地缓存（scripts/.natives/，gitignored）——首次下载的 tgz 存入缓存，
+ *  之后打包直接解压缓存，避免重复下载浪费时间/流量，也避免网络失败阻断打包。
+ *  目标已存在且版本匹配时直接跳过。 */
+async function ensurePlatformPackage(scope, name, version) {
+  const dest = join(root, "node_modules", scope, name);
+  const marker = join(dest, "package.json");
+  if (existsSync(marker)) {
+    let cur = "";
+    try { cur = JSON.parse(readFileSync(marker, "utf8")).version || ""; } catch { /* ignore */ }
+    if (cur === version) {
+      log(`${name}: already present (${cur})`);
+      return;
+    }
+    log(`${name}: version mismatch (${cur || "?"} vs ${version}) — refreshing`);
+    rmSync(dest, { recursive: true, force: true });
+  }
+  const cacheFile = join(NATIVES, `${scope.replace(/^@/, "")}-${name}-${version}.tgz`);
+  let tgz;
+  if (existsSync(cacheFile)) {
+    log(`${name}: using cached tgz (${cacheFile})`);
+    tgz = cacheFile;
+  } else {
+    log(`${name}: downloading ${version}…`);
+    const url = `${REG}/${scope}/${name}/-/${name}-${version}.tgz`;
+    const res = await fetch(url);
+    if (!res.ok) fail(`failed to download ${scope}/${name} (HTTP ${res.status})`);
+    mkdirSync(NATIVES, { recursive: true });
+    tgz = join(TMP, `${name}.tgz`);
+    writeFileSync(tgz, Buffer.from(await res.arrayBuffer()));
+    writeFileSync(cacheFile, readFileSync(tgz));
+    log(`${name}: cached to ${cacheFile}`);
+  }
+  const x = join(TMP, name);
+  rmSync(x, { recursive: true, force: true });
+  mkdirSync(x, { recursive: true });
+  const r = spawnSync("tar", ["-xzf", tgz, "-C", x], { stdio: "ignore" });
+  if (r.status !== 0) fail(`failed to extract ${scope}/${name}`);
+  rmSync(dest, { recursive: true, force: true });
+  mkdirSync(dest, { recursive: true });
+  copyTree(join(x, "package"), dest);
+  log(`${name}: installed`);
+}
+
 async function ensureKoffi() {
   // DSH 内核依赖 bare `koffi`（native），其平台原生模块由 `@koromix/koffi-<plat>` 子包提供。
   // 跨平台 VSIX 需补齐各平台子包（linux/darwin 的 x64/arm64），否则对应平台启动会报
@@ -71,32 +145,45 @@ async function ensureKoffi() {
   rmSync(TMP, { recursive: true, force: true });
   mkdirSync(TMP, { recursive: true });
   for (const p of REQUIRED_KOFFI) {
-    const dest = join(root, "node_modules", "@koromix", p);
-    const marker = join(dest, "package.json");
-    if (existsSync(marker)) {
-      let cur = "";
-      try { cur = JSON.parse(readFileSync(marker, "utf8")).version || ""; } catch { /* ignore */ }
-      if (cur === koffiVersion) {
-        log(`koffi ${p}: already present (${cur})`);
-        continue;
-      }
-      log(`koffi ${p}: version mismatch (${cur || "?"} vs ${koffiVersion}) — refreshing`);
-      rmSync(dest, { recursive: true, force: true });
+    await ensurePlatformPackage("@koromix", p, koffiVersion);
+  }
+}
+
+/** @vscode/ripgrep 平台包补齐（仿 ensureKoffi）：grep/glob 工具内部 spawn 打包的
+ *  rg 二进制，跨平台 VSIX 缺某平台包时，该平台上工具执行
+ *  `require.resolve("@vscode/ripgrep-<plat>/bin/rg")` 失败 → 报 "ripgrep launch failed"。
+ *  版本以 node_modules/@vscode/ripgrep 主包为准（勿硬编码）。 */
+async function ensureRipgrep() {
+  let rgVersion = "";
+  try {
+    rgVersion = JSON.parse(readFileSync(join(root, "node_modules", "@vscode", "ripgrep", "package.json"), "utf8")).version || "";
+  } catch { /* keep empty */ }
+  if (!rgVersion) fail("cannot resolve @vscode/ripgrep version from node_modules — run npm install first");
+
+  for (const p of REQUIRED_RIPGREP) {
+    await ensurePlatformPackage("@vscode", p, rgVersion);
+  }
+}
+
+/** sharp 平台包补齐（仿 ensureRipgrep）：dsh-attachment-local 依赖 sharp 处理图片附件。
+ *  Linux 缺 @img/sharp-linux-x64 + @img/sharp-libvips-linux-x64 时图片功能不可用；
+ *  跨平台 WASM 兜底 @img/sharp-wasm32 已由 package.json 显式声明（vsce 只按依赖树打包）。
+ *  版本以 sharp 主包 optionalDependencies 声明为准（libvips 与主包版本不同，勿硬编码）。 */
+async function ensureSharp() {
+  let sharpVersion = "";
+  const pkgVersions = {};
+  try {
+    const sj = JSON.parse(readFileSync(join(root, "node_modules", "sharp", "package.json"), "utf8"));
+    sharpVersion = sj.version || "";
+    for (const p of REQUIRED_SHARP) {
+      const v = sj.optionalDependencies?.[`@img/${p}`];
+      if (v) pkgVersions[p] = v;
     }
-    log(`koffi ${p}: downloading ${koffiVersion}…`);
-    const url = `${REG}/@koromix/${p}/-/${p}-${koffiVersion}.tgz`;
-    const res = await fetch(url);
-    if (!res.ok) fail(`failed to download @koromix/${p} (HTTP ${res.status})`);
-    const tgz = join(TMP, `${p}.tgz`);
-    writeFileSync(tgz, Buffer.from(await res.arrayBuffer()));
-    const x = join(TMP, p);
-    mkdirSync(x, { recursive: true });
-    const r = spawnSync("tar", ["-xzf", tgz, "-C", x], { stdio: "ignore" });
-    if (r.status !== 0) fail(`failed to extract @koromix/${p}`);
-    rmSync(dest, { recursive: true, force: true });
-    mkdirSync(dest, { recursive: true });
-    copyTree(join(x, "package"), dest);
-    log(`koffi ${p}: installed`);
+  } catch { /* keep empty */ }
+  if (!sharpVersion) fail("cannot resolve sharp version from node_modules — run npm install first");
+
+  for (const p of REQUIRED_SHARP) {
+    await ensurePlatformPackage("@img", p, pkgVersions[p] || sharpVersion);
   }
 }
 
@@ -164,10 +251,14 @@ function manifest() {
     log(`  - @koromix/${p}: ${existsSync(join(root, "node_modules", "@koromix", p, "package.json")) ? "OK" : "MISSING"}`);
   }
   log(`  - node-pty prebuilds: ${existsSync(join(root, "node_modules", "node-pty", "prebuilds")) ? readdirSync(join(root, "node_modules", "node-pty", "prebuilds")).join(", ") : "(none)"}`);
+  log(`  - @vscode/ripgrep platform pkgs: ${REQUIRED_RIPGREP.filter((p) => existsSync(join(root, "node_modules", "@vscode", p, "package.json"))).length}/${REQUIRED_RIPGREP.length} present`);
+  log(`  - @img/sharp linux pkgs: ${REQUIRED_SHARP.filter((p) => existsSync(join(root, "node_modules", "@img", p, "package.json"))).length}/${REQUIRED_SHARP.length} present (wasm32 fallback: ${existsSync(join(root, "node_modules", "@img", "sharp-wasm32", "package.json")) ? "OK" : "MISSING"})`);
 }
 
 try {
   await ensureKoffi();
+  await ensureRipgrep();
+  await ensureSharp();
   await ensureNodePty();
   rmSync(TMP, { recursive: true, force: true });
   manifest();
