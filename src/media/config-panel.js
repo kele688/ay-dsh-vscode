@@ -83,6 +83,8 @@
     autoCompactionHint: zh ? "上下文占比接近上限时自动归纳为摘要，释放空间" : "When context share nears the limit, summarize older history to free space",
     autoCompactionOn: zh ? "自动" : "Auto",
     autoCompactionOff: zh ? "手动" : "Manual",
+    rotateSummaryOn: zh ? "开" : "On",
+    rotateSummaryOff: zh ? "关" : "Off",
     permissionMatch: zh ? "工具名" : "Tool",
     permissionAction: zh ? "动作" : "Action",
     permissionActionAllow: zh ? "允许" : "Allow",
@@ -142,6 +144,9 @@
     autoCompaction: $("cfgAutoCompaction"),
     compactionThresholdRatio: $("cfgCompactThreshold"),
     compactionMaxTokens: $("cfgCompactMaxTokens"),
+    rotateBytes: $("cfgRotateBytes"),
+    rotateSummary: $("cfgRotateSummary"),
+    rotateFallbackMsgs: $("cfgRotateFallbackMsgs"),
   };
   // 自动压缩开关旁的"自动/手动"状态随勾选框实时切换
   const autoCompactionState = $("cfgAutoCompactionState");
@@ -151,6 +156,14 @@
     }
   };
   fields.autoCompaction.addEventListener("change", updateAutoCompactionState);
+  // 日志管理：轮转摘要开关旁的"开/关"状态随勾选框实时切换
+  const rotateSummaryState = $("cfgRotateSummaryState");
+  const updateRotateSummaryState = () => {
+    if (rotateSummaryState) {
+      rotateSummaryState.textContent = fields.rotateSummary.checked ? L.rotateSummaryOn : L.rotateSummaryOff;
+    }
+  };
+  fields.rotateSummary.addEventListener("change", updateRotateSummaryState);
 
   // ---- 权限审批组：工具级自动授权规则（Kilo Code 风格）----
   const permissionRulesEl = $("permissionRules");
@@ -1023,6 +1036,9 @@
         autoCompaction: fields.autoCompaction.checked,
         compactionThresholdRatio: (parseFloat(fields.compactionThresholdRatio.value) || 80) / 100,
         compactionMaxTokens: parseInt(fields.compactionMaxTokens.value, 10) || 8192,
+        rotateBytes: parseInt(fields.rotateBytes.value, 10) || 10,
+        rotateSummary: fields.rotateSummary.checked,
+        rotateFallbackMsgs: parseInt(fields.rotateFallbackMsgs.value, 10) || 5,
         autoApproveRules: permissionRules.filter((r) => r.match && r.match.trim() !== "").map((r) => ({ match: r.match.trim(), action: r.action })),
       },
     });
@@ -1043,6 +1059,10 @@
     updateAutoCompactionState();
     fields.compactionThresholdRatio.value = String(Math.round((c.compactionThresholdRatio ?? 0.8) * 100));
     fields.compactionMaxTokens.value = String(c.compactionMaxTokens ?? 8192);
+    fields.rotateBytes.value = String(c.rotateBytes ?? 10);
+    fields.rotateSummary.checked = c.rotateSummary !== false;
+    updateRotateSummaryState();
+    fields.rotateFallbackMsgs.value = String(c.rotateFallbackMsgs ?? 5);
     permissionRules = Array.isArray(c.autoApproveRules) && c.autoApproveRules.length > 0
       ? c.autoApproveRules.map((r) => ({ match: String(r.match ?? ""), action: ["allow", "ask", "deny"].includes(r.action) ? r.action : "ask", saved: true, dirty: false, baseMatch: String(r.match ?? ""), baseAction: ["allow", "ask", "deny"].includes(r.action) ? r.action : "ask" }))
       : DEFAULT_PERMISSION_RULES.map((r) => ({ ...r, saved: true, dirty: false, baseMatch: r.match, baseAction: r.action }));

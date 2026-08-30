@@ -169,7 +169,9 @@ body {
   text-overflow: ellipsis;
   white-space: nowrap;
   min-width: 0;
-  flex: 1 1 auto;
+  /* 不撑满剩余宽度：让紧随其后的日志大小标签（.session-size）紧贴标题文字，
+     而不是被 flex 挤到标题栏右端；剩余空间由 .spacer 吸收，按钮组仍靠右。 */
+  flex: 0 1 auto;
 }
 
 .spacer {
@@ -657,6 +659,20 @@ body {
 .approval-agent {
   color: var(--muted);
   font-size: 11.5px;
+}
+
+/* 会话轮转提示卡：与审批卡同构，边框用 accent 区分（非危险操作） */
+.rotate-card {
+  border-color: var(--accent);
+}
+
+/* 会话标题后的日志大小标签（KB/MB，随事件批刷新；hover 显示 KB 注释） */
+.session-size {
+  margin-left: 6px;
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--muted);
+  white-space: nowrap;
 }
 
 /* ---- 代码块：独立引用区 + 语言标签 + 复制按钮 ---- */

@@ -10,6 +10,9 @@
   const messagesEl = $("messages");
   const inputEl = $("input");
   const approvalEl = $("approval");
+  const rotateEl = $("rotate");
+  const btnRotateOk = $("btnRotateOk");
+  btnRotateOk?.addEventListener("click", () => rotateEl.classList.add("hidden"));
   const btnAllow = $("btnAllow");
   const btnDeny = $("btnDeny");
   const btnSend = $("btnSend");
@@ -18,6 +21,7 @@
   const btnExportFull = $("btnExportFull");
   const topbarEl = $("topbar");
   const sessionTitleEl = $("sessionTitle");
+  const sessionSizeEl = $("sessionSize");
   const contextPctEl = $("contextPct");
   const tokensInEl = $("tokensIn");
   const stepsEl = $("steps");
@@ -68,6 +72,8 @@
       done: "✓ 完成",
       failed: "✗ 失败",
       approvalAsk: (name) => `Agent 请求调用工具 <strong>${name}</strong>`,
+      sessionRotatedBody: (newTitle) => `会话历史已满，已创建新会话「${newTitle || "未命名"}」继续。`,
+      sessionSizeTitle: (kb) => `会话日志大小：${kb} KB`,
       approvalQueue: (n) => `⏳ 队列中还有 ${n} 个待授权请求（逐个处理）`,
       approvalAgent: (id) => `🧩 子任务 …${id} 请求：`,
       emptyHistory: "暂无历史会话",
@@ -159,6 +165,8 @@
       done: "✓ Done",
       failed: "✗ Failed",
       approvalAsk: (name) => `Agent requests to call tool <strong>${name}</strong>`,
+      sessionRotatedBody: (newTitle) => `Session history is full; a new session "${newTitle || "untitled"}" has been created.`,
+      sessionSizeTitle: (kb) => `Session log size: ${kb} KB`,
       approvalQueue: (n) => `⏳ Queue: ${n} pending approval(s) — handled one by one`,
       approvalAgent: (id) => `🧩 Subtask …${id} requests:`,
       emptyHistory: "No sessions yet",
@@ -398,6 +406,31 @@
     if (n >= 1e6) return (n / 1e6).toFixed(1) + "m";
     if (n >= 1e3) return (n / 1e3).toFixed(1) + "k";
     return String(Math.round(n));
+  }
+
+  /** 会话日志大小格式化：<1MB 用 KB（1 位小数），否则 MB。 */
+  function fmtSize(bytes) {
+    if (!Number.isFinite(bytes) || bytes <= 0) return "0K";
+    if (bytes >= 1048576) return (bytes / 1048576).toFixed(1) + "M";
+    return (bytes / 1024).toFixed(1) + "K";
+  }
+
+  /** 更新标题栏后的会话日志大小标签（hover 显示 KB 注释；无有效大小/无会话时隐藏）。
+   *  值未变时跳过 textContent 写入，避免高频事件批（16ms）反复触发 DOM 重排。 */
+  let lastSizeLabel = null;
+  function updateSessionSize(bytes) {
+    if (Number.isFinite(bytes) && bytes > 0 && state.sessionId) {
+      const label = fmtSize(bytes);
+      if (label !== lastSizeLabel) {
+        sessionSizeEl.textContent = label;
+        sessionSizeEl.title = t("sessionSizeTitle", (bytes / 1024).toFixed(1));
+        lastSizeLabel = label;
+      }
+      sessionSizeEl.classList.remove("hidden");
+    } else {
+      lastSizeLabel = null;
+      sessionSizeEl.classList.add("hidden");
+    }
   }
 
   /** 渲染顶部信息栏（单行）：上下文占比、token 用量（含缓存命中率）、压缩按钮。 */
@@ -1409,6 +1442,9 @@
           tokensOutEl.textContent = "↘ 0";
         }
         state.sessionId = msg.sessionId || null;
+        // 会话大小标签：bootstrap 携带时立即显示（轮转/恢复场景），否则隐藏，
+        // 后续 events 批（宿主每次写日志）持续刷新
+        updateSessionSize(msg.sessionBytes);
         updateExportButton();
         // 顶部信息栏常显（Kilo Code 风格）：会话标题显示在顶栏（header 中）
         topbarEl.classList.remove("hidden");
@@ -1522,6 +1558,8 @@
         for (const e of msg.events) handleViewEvent(e, { foldReasoning: true });
         updateEmptyState();
         setHint(t("resumed", msg.sessionId.slice(0, 12)));
+        // 历史重放后同步会话日志大小标签（轮转/恢复场景的 ready 帧可能未带）
+        updateSessionSize(msg.sessionBytes);
         // 历史渲染完成：解除恢复期间的发送锁定，此后用户消息在 AI 应答之前
         // 进入消息列表（消息渲染全部按 append 顺序，不会再被 history 清空）。
         state.resuming = false;
@@ -1553,6 +1591,7 @@
         // 内容在顶部增长：滚动位置相应下移，用户看到的视口不变
         messagesEl.scrollTop = prevScrollTop + (messagesEl.scrollHeight - prevHeight);
         state.historyMore = msg.hasMore ? { hasMore: true, nextSeq: msg.nextSeq } : null;
+        updateSessionSize(msg.sessionBytes);
         break;
       }
       case "sessionDeleted": {
@@ -1591,6 +1630,27 @@
         if (!historyPanel.classList.contains("hidden")) {
           vscode.postMessage({ t: "historyRefresh" });
         }
+        break;
+      }
+      case "sessionRotated": {
+        // 会话轮转（历史文件超限自动新建）：bootstrap 帧已切新会话 id 并更新标题，
+        // 这里更新标题栏 + 弹面板提示（webview 禁用 alert，用与审批同款的居中 modal）
+        if (msg.newTitle) {
+          sessionTitleEl.textContent = msg.newTitle;
+          sessionTitleEl.title = msg.newTitle;
+        }
+        const bodyEl = $("rotateBody");
+        if (bodyEl) {
+          bodyEl.textContent = t("sessionRotatedBody", msg.newTitle ?? "");
+          rotateEl.classList.remove("hidden");
+        }
+        // 轮转帧携带新会话日志大小：立即刷新标题栏标签（不依赖首条消息的 events 批）
+        updateSessionSize(msg.sessionBytes);
+        break;
+      }
+      case "sessionSize": {
+        // 会话日志文件大小随 events 批附带（宿主每次写日志刷新）：更新标题栏 KB 标签
+        updateSessionSize(msg.bytes);
         break;
       }
       case "sessionExported": {

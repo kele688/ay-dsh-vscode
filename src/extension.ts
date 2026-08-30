@@ -200,6 +200,9 @@ function readConfig(): {
   autoCompaction: boolean;
   compactionThresholdRatio: number;
   compactionMaxTokens: number;
+  rotateBytes: number;
+  rotateSummary: boolean;
+  rotateFallbackMsgs: number;
   autoApproveRules: { match: string; action: string }[];
 } {
   const cfg = vscode.workspace.getConfiguration(CONFIG_NS);
@@ -219,6 +222,10 @@ function readConfig(): {
   const autoCompaction = cfg.get<boolean>("autoCompaction") ?? true;
   const compactionThresholdRatio = Math.min(1, Math.max(0.1, Number(cfg.get<number>("compactionThresholdRatio") ?? 0.8) || 0.8));
   const compactionMaxTokens = Math.max(1, Number(cfg.get<number>("compactionMaxTokens") ?? 8192) || 8192);
+  // 会话轮转（日志管理）：阈值（MB）、LLM 对话摘要开关、fallback 消息条数
+  const rotateBytes = Math.max(1, Number(cfg.get<number>("rotateBytes") ?? 10) || 10);
+  const rotateSummary = cfg.get<boolean>("rotateSummary") ?? true;
+  const rotateFallbackMsgs = Math.max(1, Number(cfg.get<number>("rotateFallbackMsgs") ?? 5) || 5);
   // 自动授权规则（工具级，Kilo Code 风格）：glob/grep/read 等只读工具可自动放行
   const rawRules = cfg.get<{ match?: string; action?: string }[]>("autoApproveRules");
   const autoApproveRules: { match: string; action: string }[] = Array.isArray(rawRules)
@@ -226,7 +233,7 @@ function readConfig(): {
         .map((r) => ({ match: String(r?.match ?? "").trim(), action: ["allow", "ask", "deny"].includes(String(r?.action)) ? String(r.action) : "ask" }))
         .filter((r) => r.match)
     : [];
-  return { apiKey, baseUrl, model, permissionMode, nodePath, maxSteps, subagentMaxDepth, maxParallelSubagents, autoCompaction, compactionThresholdRatio, compactionMaxTokens, autoApproveRules };
+  return { apiKey, baseUrl, model, permissionMode, nodePath, maxSteps, subagentMaxDepth, maxParallelSubagents, autoCompaction, compactionThresholdRatio, compactionMaxTokens, rotateBytes, rotateSummary, rotateFallbackMsgs, autoApproveRules };
 }
 
 /** 配置摘要（推送给 UI 展示）。SecretStorage 密钥库是 API Key 的主存储，必须纳入判断。 */
@@ -326,6 +333,9 @@ async function ensureHost(context: vscode.ExtensionContext): Promise<AgentHost> 
       autoCompaction: cfg.autoCompaction,
       compactionThresholdRatio: cfg.compactionThresholdRatio,
       compactionMaxTokens: cfg.compactionMaxTokens,
+      rotateBytes: cfg.rotateBytes,
+      rotateSummary: cfg.rotateSummary,
+      rotateFallbackMsgs: cfg.rotateFallbackMsgs,
       autoApproveRules: cfg.autoApproveRules,
       dshHome: pluginDshHome(context),
       legacyDshHome: legacyDshHome(),

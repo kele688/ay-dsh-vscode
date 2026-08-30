@@ -22,7 +22,7 @@ import { resolveDshHome, dshHomePath } from "@deepseek-ai/dsh-home-paths";
 import { DSH_LAUNCH_ENVIRONMENT_KEY } from "@deepseek-ai/dsh-launch-environment";
 import { credentialRef } from "@deepseek-ai/dsh-credentials";
 import { builtinProviders } from "@earendil-works/pi-ai/providers/all";
-import { createUserMessage } from "@deepseek-ai/dsh-llm";
+import { createUserMessage, BlockAssembler } from "@deepseek-ai/dsh-llm";
 import { SessionId } from "@deepseek-ai/dsh-session";
 import { installModelSelection } from "@deepseek-ai/dsh-agent";
 
@@ -211,9 +211,11 @@ async function bootTree() {
  *  16ms（< 1 帧）足够合并高频事件，同时端到端感知延迟不可察觉；
  *  配合 UI 侧节流渲染，输出呈现链式流畅。 */
 class EventPump {
-  constructor() {
+  constructor(sizeProvider, afterFlush) {
     this.queue = [];
     this.timer = undefined;
+    this.sizeProvider = sizeProvider;
+    this.afterFlush = afterFlush;
   }
   push(event) {
     this.queue.push(event);
@@ -229,7 +231,16 @@ class EventPump {
     if (this.queue.length === 0) return;
     const batch = this.queue;
     this.queue = [];
-    post({ t: "events", events: batch });
+    // 每批附带当前会话日志文件大小（前端标题栏 KB 显示；批内一次 stat 开销可忽略）
+    let sessionBytes;
+    try { sessionBytes = this.sizeProvider?.(); } catch { /* ignore */ }
+    post(
+      sessionBytes === undefined
+        ? { t: "events", events: batch }
+        : { t: "events", events: batch, sessionBytes }
+    );
+    // 写日志后顺带触发轮转检查（防抖在调用方）；异常不影响事件下发
+    try { this.afterFlush?.(); } catch { /* ignore */ }
   }
 }
 
@@ -249,8 +260,10 @@ async function createAgent(ctx, options, pump, approvals) {
   const model = options.model ?? base.model;
   const selection = { provider, model, reasoningEffort: base.reasoningEffort };
 
+  // 支持轮转场景指定会话 id（会话已预写摘要、meta 已绑定，agent 惰性创建于首条消息）
+  const sessionId = options?.sessionId ?? `dsh-vscode-${randomUUID()}`;
   const handle = await agents.create({
-    sessionId: SessionId(`dsh-vscode-${randomUUID()}`),
+    sessionId: SessionId(sessionId),
     meta: { cwd: process.cwd() },
     agentOptions: { provider, model },
     setup: (agentCtx) => {
@@ -692,6 +705,14 @@ function stepLimitWrapUpMessage(limit, steps, tools, elapsedSec) {
  */
 function attachAgent(ctx, handle, pump) {
   const agent = handle.agent;
+
+  // 会话日志大小：绑定到本 agent 的局部闭包。main 作用域闭包在 flush 时
+  // 可能读到 undefined（曾导致 events 帧从不携带 sessionBytes，标题栏大小
+  // 标签常态不显示）；此处 agent 是本函数局部变量，闭包求值必然可靠。
+  pump.sizeProvider = () =>
+    agent === undefined || agent.session === undefined
+      ? undefined
+      : sessionFileSize(String(agent.session.id));
 
   // 环境变量直读：非数字或缺失时回退 100；合法值原样保留（0 = 不限制）。
   const maxSteps = Number(process.env.DSH_MAX_STEPS);
@@ -1263,6 +1284,99 @@ async function sessionDisplayTitle(ctx, sessionId, kernelTitle) {
 /** 会话日志文件名（与 dsh-session-persistence-jsonl 的 logSuffix 一致）。 */
 const SESSION_LOG_NAMES = ["session.jsonl", "session.jsonl.zstd"];
 
+/** 会话日志大小缓存：sessionId -> { at, size }（TTL 内复用，避免高频事件批反复 statSync）。 */
+const sessionSizeCache = new Map();
+const SESSION_SIZE_CACHE_TTL = 1000; // 1s：标题栏大小最多滞后 1s，可接受
+
+/** 当前会话日志文件大小（字节）；带 TTL 缓存（轮转检测与前端标签共用，降低同步 stat 频率）。 */
+function sessionFileSize(sessionId) {
+  try {
+    const key = String(sessionId);
+    const now = Date.now();
+    const hit = sessionSizeCache.get(key);
+    if (hit !== undefined && now - hit.at < SESSION_SIZE_CACHE_TTL) return hit.size;
+    const root = dshHomePath("sessions-ay-dsh");
+    const dir = join(root, projectKey(process.cwd()), encodeSegment(key));
+    let size;
+    for (const n of SESSION_LOG_NAMES) {
+      const p = join(dir, n);
+      if (existsSync(p)) { size = statSync(p).size; break; }
+    }
+    sessionSizeCache.set(key, { at: now, size });
+    return size;
+  } catch { /* ignore */ }
+  return undefined;
+}
+
+/** 从倒数第 n 条用户输入起，截取之后（含）所有 user/assistant 消息文本，保持时间顺序。
+ *  用于轮转摘要：摘要取 n=30、fallback 取 n=5。 */
+function tailConversationText(events, lastUserCount) {
+  const userSeqs = [];
+  const msgs = []; // { seq, text }：只收 user/assistant 消息，跳过海量 assistant/chunk（单遍遍历）
+  for (const e of events) {
+    if (e.type === "user/message" && e.message?.source?.kind === "user") userSeqs.push(e.seq);
+    if (e.type === "user/message" || e.type === "assistant/message") {
+      const text = (e.message?.content ?? [])
+        .map((b) => (b.type === "text" ? b.text : ""))
+        .join("")
+        .trim();
+      if (text !== "") {
+        msgs.push({ seq: e.seq, text: `${e.type === "user/message" ? "用户" : "AI"}：${text}` });
+      }
+    }
+  }
+  if (userSeqs.length === 0) return "";
+  const startSeq = userSeqs[Math.max(0, userSeqs.length - lastUserCount)];
+  return msgs.filter((m) => m.seq >= startSeq).map((m) => m.text).join("\n\n");
+}
+
+/** 用 LLM 生成用户对话摘要；不可用/失败时返回空串（调用方走 fallback）。
+ *  与 compaction 的摘要调用不同：这里只输入用户消息文本，不复用系统提示词。 */
+async function summarizeUserMessages(ctx, agent, texts, signal) {
+  const llm = ctx.get("llm");
+  if (llm === undefined || typeof llm.stream !== "function" || texts.length === 0) return "";
+  const latest = agent.session.requestHeader?.()?.config;
+  const target = (agent.options?.provider && agent.options?.model)
+    ? { provider: agent.options.provider, model: agent.options.model }
+    : latest;
+  if (target === undefined) return "";
+  // texts 是 tailConversationText 拼好的字符串，取末尾 12000 字符（偏重最近对话）
+  const joined = texts.slice(-12000);
+  if (joined.length === 0) return "";
+  const instruction =
+    "你是对话摘要助手。请对下面这段用户与 AI 的协作对话做简明摘要，"
+    + "保留：关键问题、任务目标、已做出的决策、待办事项、重要结论。"
+    + "只输出摘要正文，不要解释，控制在 300 字以内。\n\n";
+  const messages = [
+    createUserMessage({
+      content: [{ type: "text", text: instruction + joined }],
+      source: { kind: "plugin", plugin: "dsh-vscode-host" },
+    }),
+  ];
+  try {
+    const assembler = new BlockAssembler();
+    for await (const chunk of llm.stream({
+      provider: target.provider,
+      model: target.model,
+      messages,
+      maxTokens: 600,
+      sessionId: agent.session.id,
+      purpose: "rotate-session",
+      signal,
+    })) {
+      assembler.push(chunk);
+    }
+    const text = assembler.blocks()
+      .map((b) => (b.type === "text" ? b.text : ""))
+      .join("")
+      .trim();
+    return text;
+  } catch (e) {
+    log("warn", "rotate summary llm failed", e instanceof Error ? e.message : String(e));
+    return "";
+  }
+}
+
 /**
  * 旧会话（meta 无 title）的静态标题：`oldsession_<mtime>`。
  * **不读任何日志文件**（列表性能纪律）：标题是纯静态记录，首指令前缀需要
@@ -1681,7 +1795,12 @@ async function exportSession(ctx, sessionId) {
 
 async function main() {
   const env = { ...process.env };
-  const pump = new EventPump();
+  /** 写日志后触发的轮转检查回调（try 块内绑定，避免 1h 定时器粒度太粗）。 */
+  let rotateCheckCb = null;
+  const pump = new EventPump(
+    () => (agent === undefined || agent.session === undefined ? undefined : sessionFileSize(String(agent.session.id))),
+    () => { try { rotateCheckCb?.(); } catch { /* ignore */ } }
+  );
   const approvals = { nextId: (() => { let n = 0; return () => ++n; })(), pending: new Map() };
 
   let ctx;
@@ -1692,10 +1811,101 @@ async function main() {
   /** 当前 agent 的"重置本轮思考步数预算"回调（chat 入口在每条用户消息前调用）。 */
   let resetStepBudget = null;
   let shuttingDown = false;
+  /** 主 agent 是否正在回复（由内核 agent/status 事件维护；轮转须避开运行期）。 */
+  let agentBusy = false;
+  /** 会话轮转：历史文件超限后预建的下一会话 id（agent 惰性创建于首条消息）。 */
+  let pendingSessionId = null;
 
   try {
     ctx = await bootTree();
     log("info", "DSH tree booted");
+    // 主 agent 运行状态跟踪（根 ctx 可收到子 agent 事件；仅跟踪当前主 agent）
+    ctx.on("agent/status", ({ agent: a, status }) => {
+      if (agent !== undefined && a === agent) agentBusy = status === "running";
+    });
+
+    // ---- 会话轮转：日志超阈值后预建新会话（agent 惰性创建），避免长会话拖垮宿主 ----
+    // 配置（env 可覆盖）：DSH_ROTATE_BYTES 阈值（默认 10MB）、DSH_ROTATE_SUMMARY
+    // （"1"=LLM 对话摘要，"0"=直接取最近用户消息）、DSH_ROTATE_FALLBACK_MSGS fallback 条数。
+    const ROTATE_BYTES = (() => {
+      const n = Number(process.env.DSH_ROTATE_BYTES);
+      return Number.isFinite(n) && n > 0 ? n : 10 * 1024 * 1024;
+    })();
+    const ROTATE_SUMMARY_ENABLED = String(process.env.DSH_ROTATE_SUMMARY ?? "1") !== "0";
+    const ROTATE_FALLBACK_MSGS = (() => {
+      const n = Number(process.env.DSH_ROTATE_FALLBACK_MSGS);
+      return Number.isInteger(n) && n > 0 ? n : 5;
+    })();
+    const stripSeqSuffix = (t) => String(t).replace(/_\d+$/, "");
+    const nextSessionSeq = (t) => {
+      const m = /_(\d+)$/.exec(String(t));
+      return m ? Number(m[1]) + 1 : 1;
+    };
+    async function maybeRotateSession() {
+      if (agent === undefined || pendingSessionId !== null || shuttingDown || agentBusy) return;
+      try {
+        const size = sessionFileSize(agent.session.id);
+        if (size === undefined || size <= ROTATE_BYTES) return;
+        const oldTitle = (await currentSessionTitle(ctx, agent)) || "会话";
+        // 1) 生成**用户对话摘要**（含 AI 回复；不再调用 compaction.compactNow：
+        //    那是同会话上下文压缩，摘要复用系统提示词，不适合跨会话迁移）
+        const tailText = tailConversationText(agent.session.events, 30);
+        let summary = "";
+        if (ROTATE_SUMMARY_ENABLED && tailText !== "") {
+          try {
+            summary = await summarizeUserMessages(ctx, agent, tailText, new AbortController().signal);
+          } catch (e) {
+            log("warn", "rotate summary failed, falling back to verbatim", e instanceof Error ? e.message : String(e));
+            summary = "";
+          }
+        }
+        if (summary === "") {
+          // fallback：LLM 摘要不可用/关闭 → 取倒数第 N 条用户输入起的所有
+          // user/assistant 消息原文（默认 N=5），不丢失记忆
+          summary = tailConversationText(agent.session.events, ROTATE_FALLBACK_MSGS);
+        }
+        // 2) 预建新会话：meta 先绑定（标题 _N + seedSummary），agent 惰性创建
+        const newId = `dsh-vscode-${randomUUID()}`;
+        const seq = nextSessionSeq(oldTitle);
+        const newTitle = `${stripSeqSuffix(oldTitle)}_${seq}`;
+        updateSessionMeta(newId, { title: newTitle, seedSummary: summary });
+        invalidateSessionsCache();
+        // 3) 关闭旧 agent（新会话 agent 等首条消息再惰性创建）
+        if (handle !== undefined) { await handle.dispose(); handle = undefined; agent = undefined; resetStepBudget = null; }
+        pendingSessionId = newId;
+        // 4) 前端自动切换到新会话 + 弹框提示
+        post({
+          t: "ready",
+          sessionId: newId,
+          cwd: process.cwd(),
+          provider: selection?.provider ?? "",
+          model: selection?.model ?? env.DSH_VSCODE_MODEL ?? "",
+          version: CORE_VERSION,
+          sessionTitle: newTitle,
+          sessionBytes: sessionFileSize(newId),
+        });
+        // 4.5) 补发新会话 history 帧（空事件）：前端 history 分支会清空旧消息区，
+        // 呈现"新会话"空态（摘要将在首条消息时经 agent.inject 持久化并随 events
+        // 批渲染），避免旧会话内容残留造成"看起来没切换"。
+        post({ t: "history", sessionId: newId, events: [], hasMore: false, nextSeq: undefined, sessionBytes: sessionFileSize(newId) });
+        post({ t: "sessionRotated", oldTitle, newTitle, sessionBytes: sessionFileSize(newId) });
+        log("info", `session rotated: ${oldTitle} -> ${newTitle} (file ${size} bytes, summary ${summary.length} chars)`);
+      } catch (e) {
+        log("warn", "session rotation failed", e instanceof Error ? e.message : String(e));
+      }
+    }
+    // 写日志后顺带检查（1s 防抖）：比 1h 定时器更及时地"封顶"，避免两次检查间日志暴涨
+    let rotateTimer = null;
+    rotateCheckCb = () => {
+      if (rotateTimer !== null) return;
+      rotateTimer = setTimeout(() => {
+        rotateTimer = null;
+        void maybeRotateSession();
+      }, 1000);
+    };
+    // 兜底定时器：events 长期不流动时仍能轮转
+    setTimeout(() => { void maybeRotateSession(); }, 60_000);
+    setInterval(() => { void maybeRotateSession(); }, 60 * 60 * 1000);
 
     // 全局审批监听（根 ctx，一次）：覆盖主 agent 与所有 subagent 的越界请求
     installApprovalListener(ctx, approvals);
@@ -1844,7 +2054,8 @@ async function main() {
               // 如 zai-free+deepseek-v4-flash 的错配请求。model 一律取
               // agentDefaultModel 的持久化默认（createAgent 内部 options.model ??
               // base.model），与 getModelInfo 展示给 UI 的选择同源。
-              const created = await createAgent(ctx, { model: msg.model }, pump, approvals);
+              const created = await createAgent(ctx, { model: msg.model, sessionId: pendingSessionId ?? undefined }, pump, approvals);
+              pendingSessionId = null;
               handle = created.handle;
               agent = created.agent;
               selection = created.selection;
@@ -1852,8 +2063,42 @@ async function main() {
               // 会话已真实创建：立即生成**静态临时标题**写入 meta（标题是静态
               // 记录，此后仅由用户重命名覆盖）。列表直接读 meta，无需内核折叠
               // 会话日志推导标题——历史列表因此秒开，与会话内容大小无关。
-              updateSessionMeta(agent.session.id, { title: genTempTitle(text) });
+              // 仅当会话尚无标题时才用首条消息生成临时标题：轮转新会话的
+              // meta 已写入 _N 标题（保持会话关联），不能被 genTempTitle 覆盖
+              if (!getSessionMeta(agent.session.id).title) {
+                updateSessionMeta(agent.session.id, { title: genTempTitle(text) });
+              }
               invalidateSessionsCache(); // 新会话入列表，丢弃旧缓存
+            }
+            // 轮转摘要注入：新会话首条消息时，把上一会话的用户对话摘要作为
+            // user/message 注入（agent.inject 持久化为日志首条 user 消息，位于
+            // 本次用户消息之前；注入后清除 meta 标记，只注入一次）。
+            const meta = getSessionMeta(agent.session.id);
+            if (meta?.seedSummary) {
+              try {
+                // 1) 钉住轮转标题（_N）：内核 rename（source=user）后自动标题被
+                //    supersede，不再覆盖我们设置的会话标题（保持会话关联）。
+                //    内核 sessionTitle.rename 是同步方法，经 Promise 包装兼容。
+                if (typeof meta.title === "string" && meta.title.trim() !== "") {
+                  const titleSvc = ctx.get("sessionTitle");
+                  if (titleSvc !== undefined && typeof titleSvc.rename === "function") {
+                    Promise.resolve()
+                      .then(() => titleSvc.rename(agent.session, meta.title))
+                      .catch((error) => {
+                        log("warn", "rotate session title pin failed", error instanceof Error ? error.message : String(error));
+                      });
+                  }
+                }
+                // 2) 注入上一会话摘要
+                agent.inject(createUserMessage({
+                  content: [{ type: "text", text: `【上一会话摘要】\n${meta.seedSummary}` }],
+                  source: { kind: "user" },
+                }));
+                updateSessionMeta(agent.session.id, { seedSummary: undefined });
+                log("info", `rotated session seed summary injected (${meta.seedSummary.length} chars)`);
+              } catch (e) {
+                log("warn", "rotate seed summary inject failed", e instanceof Error ? e.message : String(e));
+              }
             }
             // 新一轮用户消息：重置本轮思考步数预算（maxSteps 是单轮上限，
             // 不是会话累计上限——会话对话次数一直累加，不作为控制指标）。
@@ -1919,6 +2164,7 @@ async function main() {
             break;
           }
           case "newSession": {
+            pendingSessionId = null; // 用户主动新建：作废轮转预建的下一会话 id
             if (handle !== undefined) {
               await handle.dispose();
               handle = undefined;
@@ -1977,7 +2223,7 @@ async function main() {
                 const nextSeq = hasMore ? tail[0].seq : undefined;
                 // 统计：meta.stats 直读（合理则用，零遍历）；无/异常则全量算并落盘
                 const stats = resolveSessionStats(getSessionMeta(msg.id).stats, events, msg.id);
-                post({ t: "history", sessionId: msg.id, events: tail, hasMore, nextSeq, stats });
+                post({ t: "history", sessionId: msg.id, events: tail, hasMore, nextSeq, stats, sessionBytes: sessionFileSize(msg.id) });
               }
             } catch (error) {
               log("warn", "restorePreview preview failed", error instanceof Error ? error.message : String(error));
@@ -2040,6 +2286,7 @@ async function main() {
             break;
           }
           case "resumeSession": {
+            pendingSessionId = null; // 用户主动恢复：作废轮转预建的下一会话 id
             if (typeof msg.id !== "string" || msg.id.trim() === "") {
               post({ t: "sessionResumed", id: msg.id, ok: false, error: "invalid session id" });
               break;
@@ -2236,6 +2483,7 @@ async function main() {
             break;
           }
           case "deleteSession": {
+            pendingSessionId = null; // 删除会话：作废轮转预建的下一会话 id
             const result = await deleteSession(ctx, msg.id);
             if (result.ok) invalidateSessionsCache(); // 会话删除，列表需刷新
             if (result.ok && agent !== undefined && agent.session.id === msg.id) {
@@ -2677,6 +2925,7 @@ async function main() {
             break;
           }
           case "shutdown": {
+            pendingSessionId = null;
             await shutdown(0);
             break;
           }

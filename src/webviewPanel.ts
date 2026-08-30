@@ -487,6 +487,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           ready: true,
           locale: vscode.env.language.startsWith("zh") ? "zh" : "en",
           dshVersion: this.deps.getDshVersion(),
+          sessionBytes: e.sessionBytes,
         };
         this.pushHostState();
         this.push(this.lastBootstrap);
@@ -553,7 +554,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         this.push({ t: "sessions", list: e.list, error: e.error });
         break;
       case "history": {
-        this.push({ t: "history", sessionId: e.sessionId, events: e.events, hasMore: e.hasMore, nextSeq: e.nextSeq });
+        this.push({ t: "history", sessionId: e.sessionId, events: e.events, hasMore: e.hasMore, nextSeq: e.nextSeq, sessionBytes: e.sessionBytes });
         break;
       }
       case "historyMore": {
@@ -563,6 +564,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           events: e.events,
           hasMore: e.hasMore,
           nextSeq: e.nextSeq,
+          sessionBytes: e.sessionBytes,
         });
         break;
       }
@@ -658,6 +660,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         // 内核自动标题同步（fallback/LLM 总结）：轻量透传 webview 更新标题栏
         // （不同于 sessionRenamed：不打断用户正在进行的重命名输入）
         this.push({ t: "sessionTitleSynced", id: e.id, title: e.title });
+        break;
+      case "sessionRotated":
+        // 会话轮转（历史文件超限自动新建）：bootstrap 帧已切新会话 id，
+        // 这里透传旧/新标题与大小，前端更新标题栏并弹出面板提示
+        this.push({ t: "sessionRotated", oldTitle: e.oldTitle, newTitle: e.newTitle, sessionBytes: e.sessionBytes });
+        break;
+      case "sessionSize":
+        // 会话日志大小随 events 批刷新（每次写日志）：透传前端标题栏 KB 标签
+        this.push({ t: "sessionSize", bytes: e.bytes });
         break;
       case "sessionExported": {
         // 导出完成/失败提示走状态栏（不弹通知框）；成功时在系统浏览器中打开完整历史网页
@@ -785,6 +796,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       approvalTitle: zh ? "需要授权" : "Authorization Required",
       deny: zh ? "拒绝" : "Deny",
       allow: zh ? "允许" : "Allow",
+      sessionRotatedTitle: zh ? "会话已轮转" : "Session Rotated",
+      sessionRotatedOk: zh ? "知道了" : "Got it",
       placeholder: zh ? "给 AY-DSH 下达任务…（可以粘贴图片，Enter 发送，Shift+Enter 换行）" : "Ask AY-DSH a task… (paste images, Enter to send, Shift+Enter for newline)",
       send: zh ? "发送" : "Send",
       stop: zh ? "停止" : "Stop",
@@ -820,6 +833,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     <span id="dshVersion" class="token-stat header-version"></span>
     <span id="dshUpdate" class="dsh-update hidden"></span>
     <span id="sessionTitle" class="session-title" title="">…</span>
+    <span id="sessionSize" class="session-size hidden" title=""></span>
     <span class="spacer"></span>
     <button id="btnExportFull" class="icon-btn disabled" title="${L.exportTitle}">📄</button>
     <button id="btnHistory" class="icon-btn" title="${L.historyBtn}">🕘</button>
@@ -861,6 +875,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       <div class="approval-actions">
         <button id="btnDeny" class="btn deny">${L.deny}</button>
         <button id="btnAllow" class="btn allow">${L.allow}</button>
+      </div>
+    </div>
+  </div>
+  <!-- 会话轮转提示 modal：历史文件超限自动新建会话后弹出（webview 禁用 alert，用面板内 modal） -->
+  <div id="rotate" class="approval-modal hidden">
+    <div class="approval-backdrop"></div>
+    <div class="approval-card rotate-card">
+      <div class="approval-title">${L.sessionRotatedTitle}</div>
+      <div id="rotateBody" class="approval-body"></div>
+      <div class="approval-actions">
+        <button id="btnRotateOk" class="btn allow">${L.sessionRotatedOk}</button>
       </div>
     </div>
   </div>
