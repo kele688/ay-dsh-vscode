@@ -61,6 +61,9 @@ export interface ConfigPanelDeps {
     autoCompaction: boolean;
     compactionThresholdRatio: number;
     compactionMaxTokens: number;
+    rotateBytes: number;
+    rotateSummary: boolean;
+    rotateFallbackMsgs: number;
     autoApproveRules: { match: string; action: string }[];
   };
   /** 当前 Agent 工作目录（展示用）。 */
@@ -193,6 +196,9 @@ export function openConfigPanel(context: vscode.ExtensionContext, deps: ConfigPa
           autoCompaction: cfg.get<boolean>("autoCompaction") ?? true,
           compactionThresholdRatio: cfg.get<number>("compactionThresholdRatio") ?? 0.8,
           compactionMaxTokens: cfg.get<number>("compactionMaxTokens") ?? 8192,
+          rotateBytes: Number.isFinite(cfg.get<number>("rotateBytes")) && (cfg.get<number>("rotateBytes") ?? 0) > 0 ? cfg.get<number>("rotateBytes") : 10,
+          rotateSummary: cfg.get<boolean>("rotateSummary") ?? true,
+          rotateFallbackMsgs: Number.isFinite(cfg.get<number>("rotateFallbackMsgs")) && (cfg.get<number>("rotateFallbackMsgs") ?? 0) > 0 ? cfg.get<number>("rotateFallbackMsgs") : 5,
           autoApproveRules: cfg.get<{ match: string; action: string }[]>("autoApproveRules") ?? [],
           cwd: deps.workspaceRoot(),
         },
@@ -241,6 +247,9 @@ export function openConfigPanel(context: vscode.ExtensionContext, deps: ConfigPa
           autoCompaction: true,
           compactionThresholdRatio: 0.8,
           compactionMaxTokens: 8192,
+          rotateBytes: 10,
+          rotateSummary: true,
+          rotateFallbackMsgs: 5,
           autoApproveRules: [],
           cwd: "",
         },
@@ -431,6 +440,9 @@ export function openConfigPanel(context: vscode.ExtensionContext, deps: ConfigPa
           autoCompaction: prevC0.autoCompaction ?? true,
           compactionThresholdRatio: Number.isFinite(prevC0.compactionThresholdRatio) && prevC0.compactionThresholdRatio > 0 ? prevC0.compactionThresholdRatio : 0.8,
           compactionMaxTokens: Number.isFinite(prevC0.compactionMaxTokens) && prevC0.compactionMaxTokens > 0 ? prevC0.compactionMaxTokens : 8192,
+          rotateBytes: Number.isFinite(prevC0.rotateBytes) && prevC0.rotateBytes > 0 ? prevC0.rotateBytes : 10,
+          rotateSummary: prevC0.rotateSummary ?? true,
+          rotateFallbackMsgs: Number.isFinite(prevC0.rotateFallbackMsgs) && prevC0.rotateFallbackMsgs > 0 ? prevC0.rotateFallbackMsgs : 5,
         };
         const next0 = {
           permissionMode: ["workspace-write", "read-only", "danger-full-access"].includes(v.permissionMode) ? v.permissionMode : "workspace-write",
@@ -443,6 +455,9 @@ export function openConfigPanel(context: vscode.ExtensionContext, deps: ConfigPa
           autoCompaction: typeof v.autoCompaction === "boolean" ? v.autoCompaction : true,
           compactionThresholdRatio: Number.isFinite(v.compactionThresholdRatio) && v.compactionThresholdRatio > 0 ? Math.min(1, v.compactionThresholdRatio) : 0.8,
           compactionMaxTokens: Number.isFinite(v.compactionMaxTokens) && v.compactionMaxTokens > 0 ? v.compactionMaxTokens : 8192,
+          rotateBytes: Number.isFinite(v.rotateBytes) && v.rotateBytes > 0 ? v.rotateBytes : 10,
+          rotateSummary: typeof v.rotateSummary === "boolean" ? v.rotateSummary : true,
+          rotateFallbackMsgs: Number.isFinite(v.rotateFallbackMsgs) && v.rotateFallbackMsgs > 0 ? v.rotateFallbackMsgs : 5,
         };
         const keyOp = v.clearKey === true || (typeof v.apiKey === "string" && v.apiKey.trim() !== "");
         if (JSON.stringify(prev0) === JSON.stringify(next0) && !keyOp) {
@@ -473,6 +488,9 @@ export function openConfigPanel(context: vscode.ExtensionContext, deps: ConfigPa
             autoCompaction: prevC.autoCompaction ?? true,
             compactionThresholdRatio: Number.isFinite(prevC.compactionThresholdRatio) && prevC.compactionThresholdRatio > 0 ? prevC.compactionThresholdRatio : 0.8,
             compactionMaxTokens: Number.isFinite(prevC.compactionMaxTokens) && prevC.compactionMaxTokens > 0 ? prevC.compactionMaxTokens : 8192,
+            rotateBytes: Number.isFinite(prevC.rotateBytes) && prevC.rotateBytes > 0 ? prevC.rotateBytes : 10,
+            rotateSummary: prevC.rotateSummary ?? true,
+            rotateFallbackMsgs: Number.isFinite(prevC.rotateFallbackMsgs) && prevC.rotateFallbackMsgs > 0 ? prevC.rotateFallbackMsgs : 5,
           };
           // 1. API Key：清除 / 写入密钥库（写入时清空设置项，保持"密钥库优先"策略）
           if (v.clearKey) {
@@ -535,6 +553,21 @@ export function openConfigPanel(context: vscode.ExtensionContext, deps: ConfigPa
             vscode.ConfigurationTarget.Global
           );
           await cfg.update(
+            "rotateBytes",
+            Number.isFinite(v.rotateBytes) && v.rotateBytes > 0 ? v.rotateBytes : 10,
+            vscode.ConfigurationTarget.Global
+          );
+          await cfg.update(
+            "rotateSummary",
+            typeof v.rotateSummary === "boolean" ? v.rotateSummary : true,
+            vscode.ConfigurationTarget.Global
+          );
+          await cfg.update(
+            "rotateFallbackMsgs",
+            Number.isFinite(v.rotateFallbackMsgs) && v.rotateFallbackMsgs > 0 ? v.rotateFallbackMsgs : 5,
+            vscode.ConfigurationTarget.Global
+          );
+          await cfg.update(
             "autoApproveRules",
             Array.isArray(v.autoApproveRules)
               ? (v.autoApproveRules as { match?: string; action?: string }[])
@@ -556,6 +589,9 @@ export function openConfigPanel(context: vscode.ExtensionContext, deps: ConfigPa
             autoCompaction: typeof v.autoCompaction === "boolean" ? v.autoCompaction : true,
             compactionThresholdRatio: Number.isFinite(v.compactionThresholdRatio) && v.compactionThresholdRatio > 0 ? Math.min(1, v.compactionThresholdRatio) : 0.8,
             compactionMaxTokens: Number.isFinite(v.compactionMaxTokens) && v.compactionMaxTokens > 0 ? v.compactionMaxTokens : 8192,
+            rotateBytes: Number.isFinite(v.rotateBytes) && v.rotateBytes > 0 ? v.rotateBytes : 10,
+            rotateSummary: typeof v.rotateSummary === "boolean" ? v.rotateSummary : true,
+            rotateFallbackMsgs: Number.isFinite(v.rotateFallbackMsgs) && v.rotateFallbackMsgs > 0 ? v.rotateFallbackMsgs : 5,
           };
           const hostChanged = JSON.stringify(prev) !== JSON.stringify(next);
           deps.onSaved(hostChanged);
@@ -674,6 +710,16 @@ function renderHtml(webview: vscode.Webview, scriptUri: vscode.Uri, styleUri: vs
     addCustomProvider: zh ? "＋ 自定义提供商" : "+ Custom provider",
     groupRuntime: zh ? "运行环境" : "Runtime",
     groupControl: zh ? "控制参数" : "Control",
+    groupLog: zh ? "日志管理" : "Logs",
+    rotateBytes: zh ? "会话轮转阈值（MB）" : "Session rotation threshold (MB)",
+    rotateBytesHint: zh ? "会话日志超过该大小（MB）时自动轮转，创建新会话继续（默认 10）" : "Rotate when the session log exceeds this size (MB); a new session continues (default 10)",
+    rotateSummary: zh ? "轮转时生成对话摘要" : "Summarize conversation on rotation",
+    rotateSummaryHint: zh ? "开启后用 LLM 对最近对话生成摘要注入新会话；关闭则直接转移最近消息原文" : "When on, an LLM summarizes the recent conversation into the new session; when off, recent messages are copied verbatim",
+    rotateSummaryOn: zh ? "开" : "On",
+    rotateSummaryOff: zh ? "关" : "Off",
+    rotateFallbackMsgs: zh ? "摘要失败时保留的消息条数" : "Messages kept when summarization fails",
+    rotateFallbackMsgsHint: zh ? "LLM 摘要不可用时，从倒数第 N 条用户输入起保留对话原文（默认 5）" : "When the LLM summary fails, keep conversation from the Nth-last user input (default 5)",
+    saveLog: zh ? "保存并应用" : "Save & Apply",
     workspace: zh ? "默认工作目录（未打开文件夹时）" : "Default working directory (when no folder is open)",
     workspaceHint: zh ? "Agent 生成的文件保存位置；留空使用 ~/ay-dsh-workspace" : "Where agent files are saved; empty uses ~/ay-dsh-workspace",
     cwd: zh ? "当前工作目录" : "Current working directory",
@@ -762,6 +808,7 @@ function renderHtml(webview: vscode.Webview, scriptUri: vscode.Uri, styleUri: vs
     <button type="button" class="cfg-nav" data-group="runtime">${L.groupRuntime}</button>
     <button type="button" class="cfg-nav" data-group="control">${L.groupControl}</button>
     <button type="button" class="cfg-nav" data-group="permission">${L.groupPermission}</button>
+    <button type="button" class="cfg-nav" data-group="log">${L.groupLog}</button>
     <button type="button" class="cfg-nav" data-group="upgrade">${L.groupUpgrade}</button>
   </nav>
 
@@ -868,6 +915,29 @@ function renderHtml(webview: vscode.Webview, scriptUri: vscode.Uri, styleUri: vs
           <button type="button" class="secondary" id="cfgAddPermission">${L.permissionAdd}</button>
         </div>
         <p class="hint permission-note">${L.permissionCommandNote}</p>
+      </div>
+    </div>
+
+    <div class="cfg-group" data-group="log">
+      <div class="cfg-pane active" data-pane="main">
+        <div class="field">
+          <label for="cfgRotateBytes">${L.rotateBytes}</label>
+          <input type="number" id="cfgRotateBytes" min="1" step="1" value="10">
+          <span class="hint">${L.rotateBytesHint}</span>
+        </div>
+        <div class="field">
+          <label for="cfgRotateSummary">${L.rotateSummary}</label>
+          <div class="checkbox-row">
+            <input type="checkbox" id="cfgRotateSummary" checked>
+            <span class="hint" id="cfgRotateSummaryState">${L.rotateSummaryOn}</span>
+          </div>
+          <span class="hint">${L.rotateSummaryHint}</span>
+        </div>
+        <div class="field">
+          <label for="cfgRotateFallbackMsgs">${L.rotateFallbackMsgs}</label>
+          <input type="number" id="cfgRotateFallbackMsgs" min="1" step="1" value="5">
+          <span class="hint">${L.rotateFallbackMsgsHint}</span>
+        </div>
       </div>
     </div>
 

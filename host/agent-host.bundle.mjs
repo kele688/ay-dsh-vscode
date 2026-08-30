@@ -139690,6 +139690,9 @@ var MAX_TIMER_DELAY_MS = 2147483647;
 function MessageId(id) {
   return id;
 }
+function CallId(id) {
+  return id;
+}
 function deepFreeze(value) {
   const seen = /* @__PURE__ */ new WeakSet();
   const pending = [{
@@ -139772,6 +139775,189 @@ var alwaysPolicySchema = Schema2.object({
 });
 var RetryPolicySchema = Schema2.union([normalPolicySchema, alwaysPolicySchema]);
 var { version: version2 } = createRequire2(import.meta.url)("../package.json");
+function assertNever4(value, context2) {
+  const rendered = JSON.stringify(value) ?? String(value);
+  throw new Error(`unreachable variant${context2 ? ` in ${context2}` : ""}: ${rendered}`);
+}
+var BlockAssembler = class {
+  partials = /* @__PURE__ */ new Map();
+  order = [];
+  _usage;
+  _finish;
+  _replayState;
+  /**
+  * Feed one chunk into the assembly state.
+  * @param chunk - the next raw chunk, in stream order.
+  */
+  push(chunk) {
+    switch (chunk.type) {
+      case "block-start":
+        if (!this.partials.has(chunk.index)) {
+          this.order.push(chunk.index);
+          this.partials.set(chunk.index, {
+            blockType: chunk.blockType,
+            text: "",
+            toolCallArguments: ""
+          });
+        }
+        return;
+      case "text-delta":
+      case "reasoning-delta": {
+        const partial2 = this.ensure(chunk.index, chunk.type === "text-delta" ? "text" : "reasoning");
+        if (partial2.block) return;
+        partial2.text += chunk.text;
+        return;
+      }
+      case "tool-call-delta": {
+        const partial2 = this.ensure(chunk.index, "tool-call");
+        if (partial2.block) return;
+        partial2.toolCallId = chunk.id;
+        if (chunk.name) partial2.toolCallName = chunk.name;
+        partial2.toolCallArguments += chunk.argumentsDelta;
+        return;
+      }
+      case "block-end": {
+        const partial2 = this.ensure(chunk.index, chunk.block.type);
+        if (partial2.block) return;
+        partial2.block = chunk.block;
+        return;
+      }
+      case "usage":
+        this._usage = chunk.usage;
+        return;
+      case "finish":
+        this._finish = chunk.reason;
+        this._replayState = chunk.replayState;
+        return;
+      default:
+        return assertNever4(chunk, "BlockAssembler.push");
+    }
+  }
+  ensure(index, blockType) {
+    let partial2 = this.partials.get(index);
+    if (!partial2) {
+      partial2 = {
+        blockType,
+        text: "",
+        toolCallArguments: ""
+      };
+      this.partials.set(index, partial2);
+      this.order.push(index);
+    }
+    return partial2;
+  }
+  assemble(partial2, index) {
+    if (partial2.block) return partial2.block;
+    switch (partial2.blockType) {
+      case "text":
+        return {
+          type: "text",
+          text: partial2.text
+        };
+      case "reasoning":
+        return {
+          type: "reasoning",
+          text: partial2.text
+        };
+      case "tool-call":
+        return {
+          type: "tool-call",
+          id: partial2.toolCallId ?? CallId(`call-${index}`),
+          name: partial2.toolCallName ?? "",
+          arguments: partial2.toolCallArguments
+        };
+      default:
+        throw new Error(`cannot assemble incomplete block of type "${partial2.blockType}"`);
+    }
+  }
+  /** Invariant accessor: every index in `order` has a partial. */
+  mustGet(index) {
+    const partial2 = this.partials.get(index);
+    if (!partial2) throw new Error(`BlockAssembler invariant violated: no partial for index ${index}`);
+    return partial2;
+  }
+  /**
+  * The one shared keep/drop decision over all seen blocks: max-token
+  * truncation drops tool calls that cannot be executed safely. Emitted blocks
+  * and replay metadata both derive from this result, so they cannot disagree.
+  */
+  assembled() {
+    const all = this.order.map((index) => this.assemble(this.mustGet(index), index));
+    const kept = this.finish.kind === "max-tokens" ? all.map((block) => block.type !== "tool-call") : void 0;
+    const blocks = kept === void 0 ? all : all.filter((_, position) => kept[position]);
+    const envelope = this._replayState;
+    if (envelope?.blocks === void 0) return {
+      blocks,
+      replay: envelope
+    };
+    if (envelope.blocks.length !== all.length) return {
+      blocks,
+      replay: void 0
+    };
+    return {
+      blocks,
+      replay: kept === void 0 || blocks.length === all.length ? envelope : {
+        response: envelope.response,
+        blocks: envelope.blocks.filter((_, position) => kept[position])
+      }
+    };
+  }
+  /**
+  * Assemble all blocks seen so far, in stream order.
+  * @returns one block per seen index, except that max-token truncation drops
+  *   tool calls that cannot be executed safely; an open block assembles from
+  *   its accumulated deltas (an unknown block type never closed by `block-end` throws).
+  */
+  blocks() {
+    return this.assembled().blocks;
+  }
+  /**
+  * Assemble the prefix an interrupted stream can safely finalize: closed and
+  * open text/reasoning blocks with non-whitespace content, in stream order.
+  * Tool calls are omitted because interruption precedes dispatch; retaining
+  * one would require a fabricated result. Open unknown blocks are also omitted.
+  * @returns the kept blocks; empty when nothing streamed before the interruption.
+  */
+  interruptedBlocks() {
+    return this.order.map((index) => {
+      const partial2 = this.mustGet(index);
+      const type2 = partial2.block?.type ?? partial2.blockType;
+      if (type2 !== "text" && type2 !== "reasoning") return void 0;
+      return this.assemble(partial2, index);
+    }).filter((block) => (block?.type === "text" || block?.type === "reasoning") && block.text.trim() !== "");
+  }
+  /** Usage from the `usage` chunk; undefined until one arrives. */
+  get usage() {
+    return this._usage;
+  }
+  /** Finish reason from the `finish` chunk; `{kind: 'stop'}` when the stream ended without one. */
+  get finish() {
+    return this._finish ?? { kind: "stop" };
+  }
+  /**
+  * Replay metadata from the terminal finish chunk, if any, with per-block
+  * entries pruned in step with {@link blocks}. Undefined when the envelope's
+  * entries do not align with the emitted blocks.
+  */
+  get replayState() {
+    return this.assembled().replay;
+  }
+  /**
+  * The assembled assistant message.
+  * @param source - producer attribution for the assembled message.
+  * @returns a frozen assistant-role message over `blocks()` (same open-block assembly rules).
+  */
+  message(source = {
+    kind: "plugin",
+    plugin: "dsh-llm/assembler"
+  }) {
+    return createMessage({
+      role: "assistant",
+      content: this.blocks(),
+      source
+    });
+  }
+};
 
 // node_modules/@deepseek-ai/dsh-scope/lib/index.js
 var kScope = Symbol("dsh.scope");
@@ -139817,7 +140003,7 @@ function installModelSelection(agentCtx, selection) {
 
 // host/agent-host.mjs
 var NAME2 = "dsh-vscode-host";
-var CORE_VERSION = "0.4.0";
+var CORE_VERSION = "0.4.1";
 var SESSION_PREFIX = "dsh-vscode-";
 var workMode = "single";
 var getWorkMode = () => workMode;
@@ -139933,9 +140119,11 @@ async function bootTree() {
   return ctx;
 }
 var EventPump = class {
-  constructor() {
+  constructor(sizeProvider, afterFlush) {
     this.queue = [];
     this.timer = void 0;
+    this.sizeProvider = sizeProvider;
+    this.afterFlush = afterFlush;
   }
   push(event) {
     this.queue.push(event);
@@ -139951,7 +140139,18 @@ var EventPump = class {
     if (this.queue.length === 0) return;
     const batch = this.queue;
     this.queue = [];
-    post({ t: "events", events: batch });
+    let sessionBytes;
+    try {
+      sessionBytes = this.sizeProvider?.();
+    } catch {
+    }
+    post(
+      sessionBytes === void 0 ? { t: "events", events: batch } : { t: "events", events: batch, sessionBytes }
+    );
+    try {
+      this.afterFlush?.();
+    } catch {
+    }
   }
 };
 async function createAgent(ctx, options, pump2, approvals) {
@@ -139964,8 +140163,9 @@ async function createAgent(ctx, options, pump2, approvals) {
   const provider = options.provider ?? base.provider;
   const model = options.model ?? base.model;
   const selection = { provider, model, reasoningEffort: base.reasoningEffort };
+  const sessionId = options?.sessionId ?? `dsh-vscode-${randomUUID()}`;
   const handle = await agents.create({
-    sessionId: SessionId(`dsh-vscode-${randomUUID()}`),
+    sessionId: SessionId(sessionId),
     meta: { cwd: process.cwd() },
     agentOptions: { provider, model },
     setup: (agentCtx) => {
@@ -140139,6 +140339,7 @@ function stepLimitWrapUpMessage(limit2, steps, tools, elapsedSec) {
 }
 function attachAgent(ctx, handle, pump2) {
   const agent = handle.agent;
+  pump2.sizeProvider = () => agent === void 0 || agent.session === void 0 ? void 0 : sessionFileSize(String(agent.session.id));
   const maxSteps = Number(process.env.DSH_MAX_STEPS);
   const stepLimit = Number.isFinite(maxSteps) ? maxSteps : 100;
   let stepCount = 0;
@@ -140510,6 +140711,81 @@ function removeSessionMeta(sessionId) {
   }
 }
 var SESSION_LOG_NAMES = ["session.jsonl", "session.jsonl.zstd"];
+var sessionSizeCache = /* @__PURE__ */ new Map();
+var SESSION_SIZE_CACHE_TTL = 1e3;
+function sessionFileSize(sessionId) {
+  try {
+    const key = String(sessionId);
+    const now = Date.now();
+    const hit = sessionSizeCache.get(key);
+    if (hit !== void 0 && now - hit.at < SESSION_SIZE_CACHE_TTL) return hit.size;
+    const root = dshHomePath("sessions-ay-dsh");
+    const dir = join3(root, projectKey(process.cwd()), encodeSegment(key));
+    let size;
+    for (const n of SESSION_LOG_NAMES) {
+      const p = join3(dir, n);
+      if (existsSync2(p)) {
+        size = statSync2(p).size;
+        break;
+      }
+    }
+    sessionSizeCache.set(key, { at: now, size });
+    return size;
+  } catch {
+  }
+  return void 0;
+}
+function tailConversationText(events, lastUserCount) {
+  const userSeqs = [];
+  const msgs = [];
+  for (const e2 of events) {
+    if (e2.type === "user/message" && e2.message?.source?.kind === "user") userSeqs.push(e2.seq);
+    if (e2.type === "user/message" || e2.type === "assistant/message") {
+      const text = (e2.message?.content ?? []).map((b) => b.type === "text" ? b.text : "").join("").trim();
+      if (text !== "") {
+        msgs.push({ seq: e2.seq, text: `${e2.type === "user/message" ? "\u7528\u6237" : "AI"}\uFF1A${text}` });
+      }
+    }
+  }
+  if (userSeqs.length === 0) return "";
+  const startSeq = userSeqs[Math.max(0, userSeqs.length - lastUserCount)];
+  return msgs.filter((m2) => m2.seq >= startSeq).map((m2) => m2.text).join("\n\n");
+}
+async function summarizeUserMessages(ctx, agent, texts, signal) {
+  const llm = ctx.get("llm");
+  if (llm === void 0 || typeof llm.stream !== "function" || texts.length === 0) return "";
+  const latest = agent.session.requestHeader?.()?.config;
+  const target = agent.options?.provider && agent.options?.model ? { provider: agent.options.provider, model: agent.options.model } : latest;
+  if (target === void 0) return "";
+  const joined = texts.slice(-12e3);
+  if (joined.length === 0) return "";
+  const instruction = "\u4F60\u662F\u5BF9\u8BDD\u6458\u8981\u52A9\u624B\u3002\u8BF7\u5BF9\u4E0B\u9762\u8FD9\u6BB5\u7528\u6237\u4E0E AI \u7684\u534F\u4F5C\u5BF9\u8BDD\u505A\u7B80\u660E\u6458\u8981\uFF0C\u4FDD\u7559\uFF1A\u5173\u952E\u95EE\u9898\u3001\u4EFB\u52A1\u76EE\u6807\u3001\u5DF2\u505A\u51FA\u7684\u51B3\u7B56\u3001\u5F85\u529E\u4E8B\u9879\u3001\u91CD\u8981\u7ED3\u8BBA\u3002\u53EA\u8F93\u51FA\u6458\u8981\u6B63\u6587\uFF0C\u4E0D\u8981\u89E3\u91CA\uFF0C\u63A7\u5236\u5728 300 \u5B57\u4EE5\u5185\u3002\n\n";
+  const messages = [
+    createUserMessage({
+      content: [{ type: "text", text: instruction + joined }],
+      source: { kind: "plugin", plugin: "dsh-vscode-host" }
+    })
+  ];
+  try {
+    const assembler = new BlockAssembler();
+    for await (const chunk of llm.stream({
+      provider: target.provider,
+      model: target.model,
+      messages,
+      maxTokens: 600,
+      sessionId: agent.session.id,
+      purpose: "rotate-session",
+      signal
+    })) {
+      assembler.push(chunk);
+    }
+    const text = assembler.blocks().map((b) => b.type === "text" ? b.text : "").join("").trim();
+    return text;
+  } catch (e2) {
+    log("warn", "rotate summary llm failed", e2 instanceof Error ? e2.message : String(e2));
+    return "";
+  }
+}
 function genOldSessionTitle(mtime, sessionId) {
   return `oldsession_${fmtTitleTime(mtime || Date.now())}_${sessionId}`;
 }
@@ -140848,7 +141124,16 @@ async function exportSession(ctx, sessionId) {
 }
 async function main() {
   const env2 = { ...process.env };
-  const pump2 = new EventPump();
+  let rotateCheckCb = null;
+  const pump2 = new EventPump(
+    () => agent === void 0 || agent.session === void 0 ? void 0 : sessionFileSize(String(agent.session.id)),
+    () => {
+      try {
+        rotateCheckCb?.();
+      } catch {
+      }
+    }
+  );
   const approvals = { nextId: /* @__PURE__ */ (() => {
     let n = 0;
     return () => ++n;
@@ -140859,9 +141144,90 @@ async function main() {
   let selection = null;
   let resetStepBudget = null;
   let shuttingDown = false;
+  let agentBusy = false;
+  let pendingSessionId = null;
   try {
     ctx = await bootTree();
     log("info", "DSH tree booted");
+    ctx.on("agent/status", ({ agent: a, status }) => {
+      if (agent !== void 0 && a === agent) agentBusy = status === "running";
+    });
+    const ROTATE_BYTES = (() => {
+      const n = Number(process.env.DSH_ROTATE_BYTES);
+      return Number.isFinite(n) && n > 0 ? n : 10 * 1024 * 1024;
+    })();
+    const ROTATE_SUMMARY_ENABLED = String(process.env.DSH_ROTATE_SUMMARY ?? "1") !== "0";
+    const ROTATE_FALLBACK_MSGS = (() => {
+      const n = Number(process.env.DSH_ROTATE_FALLBACK_MSGS);
+      return Number.isInteger(n) && n > 0 ? n : 5;
+    })();
+    const stripSeqSuffix = (t2) => String(t2).replace(/_\d+$/, "");
+    const nextSessionSeq = (t2) => {
+      const m2 = /_(\d+)$/.exec(String(t2));
+      return m2 ? Number(m2[1]) + 1 : 1;
+    };
+    async function maybeRotateSession() {
+      if (agent === void 0 || pendingSessionId !== null || shuttingDown || agentBusy) return;
+      try {
+        const size = sessionFileSize(agent.session.id);
+        if (size === void 0 || size <= ROTATE_BYTES) return;
+        const oldTitle = await currentSessionTitle(ctx, agent) || "\u4F1A\u8BDD";
+        const tailText = tailConversationText(agent.session.events, 30);
+        let summary = "";
+        if (ROTATE_SUMMARY_ENABLED && tailText !== "") {
+          try {
+            summary = await summarizeUserMessages(ctx, agent, tailText, new AbortController().signal);
+          } catch (e2) {
+            log("warn", "rotate summary failed, falling back to verbatim", e2 instanceof Error ? e2.message : String(e2));
+            summary = "";
+          }
+        }
+        if (summary === "") {
+          summary = tailConversationText(agent.session.events, ROTATE_FALLBACK_MSGS);
+        }
+        const newId = `dsh-vscode-${randomUUID()}`;
+        const seq2 = nextSessionSeq(oldTitle);
+        const newTitle = `${stripSeqSuffix(oldTitle)}_${seq2}`;
+        updateSessionMeta(newId, { title: newTitle, seedSummary: summary });
+        invalidateSessionsCache();
+        if (handle !== void 0) {
+          await handle.dispose();
+          handle = void 0;
+          agent = void 0;
+          resetStepBudget = null;
+        }
+        pendingSessionId = newId;
+        post({
+          t: "ready",
+          sessionId: newId,
+          cwd: process.cwd(),
+          provider: selection?.provider ?? "",
+          model: selection?.model ?? env2.DSH_VSCODE_MODEL ?? "",
+          version: CORE_VERSION,
+          sessionTitle: newTitle,
+          sessionBytes: sessionFileSize(newId)
+        });
+        post({ t: "history", sessionId: newId, events: [], hasMore: false, nextSeq: void 0, sessionBytes: sessionFileSize(newId) });
+        post({ t: "sessionRotated", oldTitle, newTitle, sessionBytes: sessionFileSize(newId) });
+        log("info", `session rotated: ${oldTitle} -> ${newTitle} (file ${size} bytes, summary ${summary.length} chars)`);
+      } catch (e2) {
+        log("warn", "session rotation failed", e2 instanceof Error ? e2.message : String(e2));
+      }
+    }
+    let rotateTimer = null;
+    rotateCheckCb = () => {
+      if (rotateTimer !== null) return;
+      rotateTimer = setTimeout(() => {
+        rotateTimer = null;
+        void maybeRotateSession();
+      }, 1e3);
+    };
+    setTimeout(() => {
+      void maybeRotateSession();
+    }, 6e4);
+    setInterval(() => {
+      void maybeRotateSession();
+    }, 60 * 60 * 1e3);
     installApprovalListener(ctx, approvals);
     log("info", "approval listener installed (root scope, covers all agents)");
     ctx.on("agent/created", ({ agent: createdAgent }) => {
@@ -140962,13 +141328,38 @@ async function main() {
             return;
           }
           if (agent === void 0) {
-            const created = await createAgent(ctx, { model: msg.model }, pump2, approvals);
+            const created = await createAgent(ctx, { model: msg.model, sessionId: pendingSessionId ?? void 0 }, pump2, approvals);
+            pendingSessionId = null;
             handle = created.handle;
             agent = created.agent;
             selection = created.selection;
             resetStepBudget = created.resetStepBudget;
-            updateSessionMeta(agent.session.id, { title: genTempTitle(text) });
+            if (!getSessionMeta(agent.session.id).title) {
+              updateSessionMeta(agent.session.id, { title: genTempTitle(text) });
+            }
             invalidateSessionsCache();
+          }
+          const meta3 = getSessionMeta(agent.session.id);
+          if (meta3?.seedSummary) {
+            try {
+              if (typeof meta3.title === "string" && meta3.title.trim() !== "") {
+                const titleSvc = ctx.get("sessionTitle");
+                if (titleSvc !== void 0 && typeof titleSvc.rename === "function") {
+                  Promise.resolve().then(() => titleSvc.rename(agent.session, meta3.title)).catch((error51) => {
+                    log("warn", "rotate session title pin failed", error51 instanceof Error ? error51.message : String(error51));
+                  });
+                }
+              }
+              agent.inject(createUserMessage({
+                content: [{ type: "text", text: `\u3010\u4E0A\u4E00\u4F1A\u8BDD\u6458\u8981\u3011
+${meta3.seedSummary}` }],
+                source: { kind: "user" }
+              }));
+              updateSessionMeta(agent.session.id, { seedSummary: void 0 });
+              log("info", `rotated session seed summary injected (${meta3.seedSummary.length} chars)`);
+            } catch (e2) {
+              log("warn", "rotate seed summary inject failed", e2 instanceof Error ? e2.message : String(e2));
+            }
           }
           resetStepBudget?.();
           post({
@@ -141026,6 +141417,7 @@ async function main() {
           break;
         }
         case "newSession": {
+          pendingSessionId = null;
           if (handle !== void 0) {
             await handle.dispose();
             handle = void 0;
@@ -141070,7 +141462,7 @@ async function main() {
               const hasMore = events.length > tail.length;
               const nextSeq = hasMore ? tail[0].seq : void 0;
               const stats = resolveSessionStats(getSessionMeta(msg.id).stats, events, msg.id);
-              post({ t: "history", sessionId: msg.id, events: tail, hasMore, nextSeq, stats });
+              post({ t: "history", sessionId: msg.id, events: tail, hasMore, nextSeq, stats, sessionBytes: sessionFileSize(msg.id) });
             }
           } catch (error51) {
             log("warn", "restorePreview preview failed", error51 instanceof Error ? error51.message : String(error51));
@@ -141127,6 +141519,7 @@ async function main() {
           break;
         }
         case "resumeSession": {
+          pendingSessionId = null;
           if (typeof msg.id !== "string" || msg.id.trim() === "") {
             post({ t: "sessionResumed", id: msg.id, ok: false, error: "invalid session id" });
             break;
@@ -141289,6 +141682,7 @@ async function main() {
           break;
         }
         case "deleteSession": {
+          pendingSessionId = null;
           const result = await deleteSession(ctx, msg.id);
           if (result.ok) invalidateSessionsCache();
           if (result.ok && agent !== void 0 && agent.session.id === msg.id) {
@@ -141661,6 +142055,7 @@ async function main() {
           break;
         }
         case "shutdown": {
+          pendingSessionId = null;
           await shutdown(0);
           break;
         }

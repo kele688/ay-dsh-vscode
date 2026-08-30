@@ -50,8 +50,8 @@ export interface SessionSummary {
 
 /** Host -> Extension */
 export type HostFrame =
-  | { t: "ready"; sessionId: string; cwd: string; provider: string; model: string; version: string; sessionTitle?: string }
-  | { t: "events"; events: SessionEvent[] }
+  | { t: "ready"; sessionId: string; cwd: string; provider: string; model: string; version: string; sessionTitle?: string; sessionBytes?: number }
+  | { t: "events"; events: SessionEvent[]; sessionBytes?: number }
   | { t: "status"; status: "idle" | "running" }
   | { t: "approval"; id: number; toolName: string; callId?: string; reason?: string; agentId?: string }
   | { t: "approvalGone"; id: number }
@@ -59,8 +59,8 @@ export type HostFrame =
   | { t: "attachmentResult"; id: number; ok: boolean; mediaType?: string; data?: string }
   | { t: "stopAck"; id: number }
   | { t: "sessions"; list: SessionSummary[]; error?: string }
-  | { t: "history"; sessionId: string; events: SessionEvent[]; hasMore?: boolean; nextSeq?: number; stats?: SessionStats }
-  | { t: "historyMore"; sessionId: string; events: SessionEvent[]; hasMore?: boolean; nextSeq?: number }
+  | { t: "history"; sessionId: string; events: SessionEvent[]; hasMore?: boolean; nextSeq?: number; stats?: SessionStats; sessionBytes?: number }
+  | { t: "historyMore"; sessionId: string; events: SessionEvent[]; hasMore?: boolean; nextSeq?: number; sessionBytes?: number }
   | { t: "sessionResumed"; id: string; ok: boolean; error?: string }
   | { t: "viewSession"; id: string }
   | { t: "viewSessionFailed"; id: string; error?: string }
@@ -78,6 +78,7 @@ export type HostFrame =
   | { t: "stepLimit"; maxSteps: number; steps: number }
   | { t: "modelAdapted"; provider: string; model: string; from: string; to: string }
   | { t: "stats"; stats: SessionStats }
+  | { t: "sessionRotated"; oldTitle?: string; newTitle?: string; sessionBytes?: number }
   | { t: "exit"; code: number; error?: string };
 
 /** Extension -> Host */
@@ -160,7 +161,7 @@ export type WebviewMessage =
 
 /** Extension -> Webview 的消息。 */
 export type ExtensionToWebview =
-  | { t: "bootstrap"; model: string; provider: string; cwd: string; sessionId: string; sessionTitle?: string; ready: boolean; locale: string; dshVersion?: string }
+  | { t: "bootstrap"; model: string; provider: string; cwd: string; sessionId: string; sessionTitle?: string; ready: boolean; locale: string; dshVersion?: string; sessionBytes?: number }
   | {
       t: "config";
       keyConfigured: boolean;
@@ -186,10 +187,12 @@ export type ExtensionToWebview =
   | { t: "attachmentResult"; id: number; ok: boolean; mediaType?: string; data?: string }
   | { t: "restarting" }
   | { t: "dshUpdate"; latest?: string; upgrading?: boolean }
-  | { t: "history"; sessionId: string; events: ViewEvent[]; hasMore?: boolean; nextSeq?: number }
-  | { t: "historyMore"; sessionId: string; events: ViewEvent[]; hasMore?: boolean; nextSeq?: number }
+  | { t: "history"; sessionId: string; events: ViewEvent[]; hasMore?: boolean; nextSeq?: number; sessionBytes?: number }
+  | { t: "historyMore"; sessionId: string; events: ViewEvent[]; hasMore?: boolean; nextSeq?: number; sessionBytes?: number }
   | { t: "viewSession"; id: string }
   | { t: "sessionDeleted"; id: string; ok: boolean; error?: string }
   | { t: "sessionRenamed"; id: string; ok: boolean; title?: string; error?: string }
   | { t: "sessionTitleSynced"; id: string; title: string }
-  | { t: "sessionExported"; ok: boolean; path?: string; error?: string };
+  | { t: "sessionExported"; ok: boolean; path?: string; error?: string }
+  | { t: "sessionRotated"; oldTitle?: string; newTitle?: string; sessionBytes?: number }
+  | { t: "sessionSize"; bytes: number };

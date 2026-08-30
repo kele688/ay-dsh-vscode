@@ -360,6 +360,8 @@ input.invalid {
 #cfgMaxParallel,
 #cfgCompactThreshold,
 #cfgCompactMaxTokens,
+#cfgRotateBytes,
+#cfgRotateFallbackMsgs,
 #meCtx,
 #meMax {
   max-width: 150px;

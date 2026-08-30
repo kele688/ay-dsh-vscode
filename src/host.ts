@@ -63,6 +63,12 @@ export interface AgentHostOptions {
   compactionThresholdRatio?: number;
   /** 上下文自动压缩摘要的 token 上限。 */
   compactionMaxTokens?: number;
+  /** 会话轮转：日志文件大小阈值（MB，默认 10）。 */
+  rotateBytes?: number;
+  /** 会话轮转：是否用 LLM 生成用户对话摘要（false = 直接取最近消息原文）。 */
+  rotateSummary?: boolean;
+  /** 会话轮转：摘要不可用时的 fallback 消息条数（默认 5）。 */
+  rotateFallbackMsgs?: number;
   /** 插件专属的 DSH home 目录（会话/配置均存于此，与官方 dsh 完全隔离）。 */
   dshHome: string;
   /** 旧 DSH home（用于一次性迁移历史会话）。 */
@@ -72,14 +78,14 @@ export interface AgentHostOptions {
 }
 
 export type HostEvent =
-  | { type: "ready"; sessionId: string; model: string; provider: string; cwd: string; sessionTitle?: string }
+  | { type: "ready"; sessionId: string; model: string; provider: string; cwd: string; sessionTitle?: string; sessionBytes?: number }
   | { type: "view"; event: ViewEvent }
   | { type: "status"; status: "idle" | "running" }
   | { type: "approval"; id: number; toolName: string; reason?: string; callId?: string; agentId?: string }
   | { type: "approvalGone"; id: number }
   | { type: "sessions"; list: SessionSummary[]; error?: string }
-  | { type: "history"; sessionId: string; events: ViewEvent[]; hasMore?: boolean; nextSeq?: number }
-  | { type: "historyMore"; sessionId: string; events: ViewEvent[]; hasMore?: boolean; nextSeq?: number }
+  | { type: "history"; sessionId: string; events: ViewEvent[]; hasMore?: boolean; nextSeq?: number; sessionBytes?: number }
+  | { type: "historyMore"; sessionId: string; events: ViewEvent[]; hasMore?: boolean; nextSeq?: number; sessionBytes?: number }
   | { type: "sessionResumed"; id: string; ok: boolean; error?: string }
   | { type: "viewSession"; id: string }
   | { type: "viewSessionFailed"; id: string; error?: string }
@@ -100,6 +106,8 @@ export type HostEvent =
   | { type: "compactDone"; ok: boolean; text?: string; error?: string }
   | { type: "stepLimit"; maxSteps: number; steps: number }
   | { type: "modelAdapted"; provider: string; model: string; from: string; to: string }
+  | { type: "sessionRotated"; oldTitle?: string; newTitle?: string; sessionBytes?: number }
+  | { type: "sessionSize"; bytes: number }
   | { type: "exit"; code: number; error?: string }
   | { type: "log"; level: string; message: string };
 
@@ -281,6 +289,9 @@ export class AgentHost {
       DSH_COMPACTION_AUTO: String(this.options.autoCompaction ?? true),
       DSH_COMPACTION_THRESHOLD_RATIO: String(this.options.compactionThresholdRatio ?? 0.8),
       DSH_COMPACTION_MAX_TOKENS: String(this.options.compactionMaxTokens ?? 8192),
+      DSH_ROTATE_BYTES: String((this.options.rotateBytes ?? 10) * 1024 * 1024),
+      DSH_ROTATE_SUMMARY: String(this.options.rotateSummary ?? true),
+      DSH_ROTATE_FALLBACK_MSGS: String(this.options.rotateFallbackMsgs ?? 5),
       DSH_TELEMETRY_DISABLED: "1",
       // 统一子进程文本编码为 UTF-8：Windows PowerShell 5.1 / Python 默认按
       // 系统代码页（GBK）输出中文，Node 侧按 UTF-8 读取会乱码。
@@ -372,6 +383,7 @@ export class AgentHost {
           provider: frame.provider,
           cwd: frame.cwd,
           sessionTitle: frame.sessionTitle,
+          sessionBytes: frame.sessionBytes,
         });
         break;
       }
@@ -385,6 +397,10 @@ export class AgentHost {
           this.trackStats(event);
           const view = this.translateEvent(event);
           if (view) this.emit({ type: "view", event: view });
+        }
+        // 会话日志大小随事件批附带（前端标题栏 KB 显示；16ms 攒批频率可接受）
+        if (frame.sessionBytes !== undefined) {
+          this.emit({ type: "sessionSize", bytes: frame.sessionBytes });
         }
         break;
       }
@@ -447,6 +463,7 @@ export class AgentHost {
           events: viewEvents,
           hasMore: frame.hasMore,
           nextSeq: frame.nextSeq,
+          sessionBytes: frame.sessionBytes,
         });
         // 重放历史后推送累计统计（标题/token/上下文窗口）
         this.emitStats();
@@ -464,7 +481,12 @@ export class AgentHost {
           events: viewEvents,
           hasMore: frame.hasMore,
           nextSeq: frame.nextSeq,
+          sessionBytes: frame.sessionBytes,
         });
+        break;
+      }
+      case "sessionRotated": {
+        this.emit({ type: "sessionRotated", oldTitle: frame.oldTitle, newTitle: frame.newTitle, sessionBytes: frame.sessionBytes });
         break;
       }
       case "sessionResumed": {
