@@ -43,7 +43,8 @@
     "onCommand:dshVscode.openWorkspace",
     "onCommand:dshVscode.focus",
     "onCommand:dshVscode.newSession",
-    "onCommand:dshVscode.stop"
+    "onCommand:dshVscode.stop",
+    "onCommand:dshVscode.restartHost"
   ],
   "contributes": {
     "viewsContainers": {
@@ -106,6 +107,11 @@
       {
         "command": "dshVscode.resetDshRuntime",
         "title": "DSH: Reset Runtime to Bundled"
+      },
+      {
+        "command": "dshVscode.restartHost",
+        "title": "DSH: Restart Host to Apply Saved Settings",
+        "icon": "$(sync)"
       }
     ],
     "keybindings": [
@@ -255,6 +261,36 @@
             }
           },
           "markdownDescription": "自动授权规则（工具级）：命中的工具调用按动作处理（allow 自动允许 / ask 询问 / deny 拒绝），不弹审批框。"
+        },
+        "dshVscode.rotateBytes": {
+          "type": "number",
+          "default": 10,
+          "markdownDescription": "会话日志轮转阈值（MB）：超过后自动轮转创建新会话继续（默认 10）。"
+        },
+        "dshVscode.rotateSummary": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "轮转时用 LLM 对最近对话生成摘要注入新会话；关闭则直接转移最近消息原文。"
+        },
+        "dshVscode.rotateFallbackMsgs": {
+          "type": "number",
+          "default": 5,
+          "markdownDescription": "LLM 摘要不可用时保留的最近消息条数（默认 5）。"
+        },
+        "dshVscode.enableCustom": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "启用定制：宿主启动时把“用户定制品格”（ay-dsh-custom.md）内容注入系统提示词。"
+        },
+        "dshVscode.enableLearning": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "启用经验：宿主启动时把“自动学习经验”（ay-dsh-learning.md）内容注入系统提示词。"
+        },
+        "dshVscode.enableAutoLearn": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "启动学习：宿主在对话中自动提炼用户明确提出的规则/被肯定的经验，写入学习文件。"
         }
       }
     }

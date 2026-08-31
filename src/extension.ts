@@ -203,6 +203,9 @@ function readConfig(): {
   rotateBytes: number;
   rotateSummary: boolean;
   rotateFallbackMsgs: number;
+  enableCustom: boolean;
+  enableLearning: boolean;
+  enableAutoLearn: boolean;
   autoApproveRules: { match: string; action: string }[];
 } {
   const cfg = vscode.workspace.getConfiguration(CONFIG_NS);
@@ -226,6 +229,10 @@ function readConfig(): {
   const rotateBytes = Math.max(1, Number(cfg.get<number>("rotateBytes") ?? 10) || 10);
   const rotateSummary = cfg.get<boolean>("rotateSummary") ?? true;
   const rotateFallbackMsgs = Math.max(1, Number(cfg.get<number>("rotateFallbackMsgs") ?? 5) || 5);
+  // 个性定制：启用定制/启用经验（agent 启动是否加载）/启动学习（是否自动学习）
+  const enableCustom = cfg.get<boolean>("enableCustom") ?? false;
+  const enableLearning = cfg.get<boolean>("enableLearning") ?? false;
+  const enableAutoLearn = cfg.get<boolean>("enableAutoLearn") ?? false;
   // 自动授权规则（工具级，Kilo Code 风格）：glob/grep/read 等只读工具可自动放行
   const rawRules = cfg.get<{ match?: string; action?: string }[]>("autoApproveRules");
   const autoApproveRules: { match: string; action: string }[] = Array.isArray(rawRules)
@@ -233,7 +240,7 @@ function readConfig(): {
         .map((r) => ({ match: String(r?.match ?? "").trim(), action: ["allow", "ask", "deny"].includes(String(r?.action)) ? String(r.action) : "ask" }))
         .filter((r) => r.match)
     : [];
-  return { apiKey, baseUrl, model, permissionMode, nodePath, maxSteps, subagentMaxDepth, maxParallelSubagents, autoCompaction, compactionThresholdRatio, compactionMaxTokens, rotateBytes, rotateSummary, rotateFallbackMsgs, autoApproveRules };
+  return { apiKey, baseUrl, model, permissionMode, nodePath, maxSteps, subagentMaxDepth, maxParallelSubagents, autoCompaction, compactionThresholdRatio, compactionMaxTokens, rotateBytes, rotateSummary, rotateFallbackMsgs, enableCustom, enableLearning, enableAutoLearn, autoApproveRules };
 }
 
 /** 配置摘要（推送给 UI 展示）。SecretStorage 密钥库是 API Key 的主存储，必须纳入判断。 */
@@ -336,6 +343,9 @@ async function ensureHost(context: vscode.ExtensionContext): Promise<AgentHost> 
       rotateBytes: cfg.rotateBytes,
       rotateSummary: cfg.rotateSummary,
       rotateFallbackMsgs: cfg.rotateFallbackMsgs,
+      enableCustom: cfg.enableCustom,
+      enableLearning: cfg.enableLearning,
+      enableAutoLearn: cfg.enableAutoLearn,
       autoApproveRules: cfg.autoApproveRules,
       dshHome: pluginDshHome(context),
       legacyDshHome: legacyDshHome(),
@@ -402,6 +412,7 @@ function openSettings(context: vscode.ExtensionContext): void {
   openConfigPanel(context, {
     readConfig,
     workspaceRoot,
+    dshHomePath: pluginDshHome(context),
     onConfigSaveStart: () => {
       configSaveTransaction = true;
     },
@@ -739,6 +750,22 @@ export function activate(context: vscode.ExtensionContext): void {
       void vscode.commands.executeCommand("dshVscode.chatView.focus").then(() => {
         provider?.appendInput(ref);
       });
+    }),
+    // 重启宿主应用配置：模态确认后统一重启宿主，使配置面板各组已保存的配置生效
+    // （保存只落盘不重启；重启才应用——与配置面板功能组菜单"重启应用"同一入口）。
+    vscode.commands.registerCommand("dshVscode.restartHost", async () => {
+      const CONFIRM = "确认";
+      const pick = await vscode.window.showWarningMessage(
+        "重启宿主进程后保存过的配置立即生效，确认要重启吗？",
+        { modal: true },
+        CONFIRM,
+        "取消"
+      );
+      if (pick !== CONFIRM) return;
+      provider?.noteHostRestart();
+      disposeHost();
+      provider?.restartHost();
+      provider?.pushConfigToView?.();
     })
   );
 

@@ -140542,6 +140542,19 @@ function attachAgent(ctx, handle, pump2) {
       sections: [...assembled.sections ?? [], multiAgentSection(process.env)]
     };
   });
+  const enableCustom = String(process.env.DSH_ENABLE_CUSTOM ?? "0") !== "0";
+  const enableLearning = String(process.env.DSH_ENABLE_LEARNING ?? "0") !== "0";
+  const customPrompt = enableCustom ? readTextFile(CUSTOM_PROMPT_FILE) : "";
+  const learningText = enableLearning ? readTextFile(LEARNING_FILE) : "";
+  agent.ctx.on("system-prompt/assemble", async (_assembly, _context, next) => {
+    const assembled = await next();
+    const sections = [...assembled.sections ?? []];
+    if (customPrompt) sections.push({ name: "user-custom-prompt", text: customPrompt });
+    if (learningText) sections.push({ name: "user-learning", text: `\u4EE5\u4E0B\u662F\u4ECE\u65E2\u5F80\u5BF9\u8BDD\u6C89\u6DC0\u7684\u5DE5\u4F5C\u7ECF\u9A8C\uFF0C\u8BF7\u81EA\u89C9\u9075\u5B88\uFF1A
+${learningText}` });
+    if (sections.length === (assembled.sections ?? []).length) return assembled;
+    return { ...assembled, sections };
+  });
   return { resetStepBudget };
 }
 function loadAutoApproveRules() {
@@ -140784,6 +140797,62 @@ async function summarizeUserMessages(ctx, agent, texts, signal) {
   } catch (e2) {
     log("warn", "rotate summary llm failed", e2 instanceof Error ? e2.message : String(e2));
     return "";
+  }
+}
+var CUSTOM_PROMPT_FILE = join3(resolveDshHome(), "ay-dsh-custom.md");
+var LEARNING_FILE = join3(resolveDshHome(), "ay-dsh-learning.md");
+function readTextFile(p) {
+  try {
+    if (!existsSync2(p)) return "";
+    return readFileSync2(p, "utf8").trim();
+  } catch {
+  }
+  return "";
+}
+var LEARNING_SIGNAL_RE = /记住|教训|经验|以后|规则|禁止|不要|千万别|务必|必须|always|never|remember|rule|lesson|do not|don't/i;
+async function maybeLearnFromTurn(ctx, agent, userText) {
+  if (String(process.env.DSH_ENABLE_LEARN ?? "0") === "0") return;
+  if (typeof userText !== "string" || userText.trim() === "") return;
+  if (!LEARNING_SIGNAL_RE.test(userText)) return;
+  const llm = ctx.get("llm");
+  if (llm === void 0 || typeof llm.stream !== "function") return;
+  const latest = agent.session.requestHeader?.()?.config;
+  const target = agent.options?.provider && agent.options?.model ? { provider: agent.options.provider, model: agent.options.model } : latest;
+  if (target === void 0) return;
+  const input = userText.trim().slice(0, 4e3);
+  const instruction = "\u4F60\u662F\u7ECF\u9A8C\u63D0\u70BC\u52A9\u624B\u3002\u4E0B\u9762\u662F\u4E00\u8F6E\u5BF9\u8BDD\u4E2D\u7528\u6237\u7684\u53D1\u8A00\uFF08\u53EF\u80FD\u542B\u5C11\u91CF AI \u56DE\u590D\uFF09\u3002\u8BF7\u63D0\u53D6\u7528\u6237**\u660E\u786E\u63D0\u51FA**\u7684\u5DE5\u4F5C\u89C4\u5219\u3001\u504F\u597D\u6216\u5BF9 AI \u884C\u4E3A\u7684\u80AF\u5B9A/\u7EA0\u6B63\uFF0C\u5199\u6210\u4E00\u6761\u7B80\u6D01\u7ECF\u9A8C\u3002\u8981\u6C42\uFF1A1) \u4E00\u6761\u4E00\u884C\uFF0C20~80 \u5B57\uFF0C\u9648\u8FF0\u53E5\uFF1B2) \u53EA\u63D0\u53D6\u660E\u786E\u9648\u8FF0\u7684\u89C4\u5219/\u7ECF\u9A8C\uFF0C\u5FFD\u7565\u95F2\u804A\u4E0E\u4E8B\u5B9E\u95EE\u7B54\uFF1B3) \u82E5\u6CA1\u6709\u4EFB\u4F55\u660E\u786E\u7684\u89C4\u5219\u6216\u7ECF\u9A8C\uFF0C\u53EA\u8F93\u51FA\u7A7A\u5B57\u7B26\u4E32\uFF0C\u4E0D\u8981\u7F16\u9020\u3002\n\n";
+  const messages = [
+    createUserMessage({
+      content: [{ type: "text", text: instruction + input }],
+      source: { kind: "plugin", plugin: "dsh-vscode-host" }
+    })
+  ];
+  try {
+    const assembler = new BlockAssembler();
+    for await (const chunk of llm.stream({
+      provider: target.provider,
+      model: target.model,
+      messages,
+      maxTokens: 200,
+      sessionId: agent.session.id,
+      signal: new AbortController().signal
+    })) {
+      assembler.push(chunk);
+    }
+    const text = assembler.blocks().map((b) => b.type === "text" ? b.text : "").join("").trim();
+    if (text.length === 0) return;
+    const clean = text.replace(/^[-•*\s]+/, "").slice(0, 200);
+    const file2 = LEARNING_FILE;
+    const existing = existsSync2(file2) ? readFileSync2(file2, "utf8") : "";
+    if (existing.includes(clean)) return;
+    const next = existing.trim() ? `${existing.trim()}
+
+- ${clean}` : `- ${clean}`;
+    mkdirSync2(dirname3(file2), { recursive: true });
+    writeFileSync2(file2, next, "utf8");
+    log("info", `learned rule: ${clean}`);
+  } catch (e2) {
+    log("warn", "auto-learn llm failed", e2 instanceof Error ? e2.message : String(e2));
   }
 }
 function genOldSessionTitle(mtime, sessionId) {
@@ -141399,6 +141468,8 @@ ${meta3.seedSummary}` }],
             })
           );
           await agent.whenIdle();
+          void maybeLearnFromTurn(ctx, agent, text).catch(() => {
+          });
           pump2.flush();
           post({ t: "chatDone", id: msg.id, ok: true });
           break;

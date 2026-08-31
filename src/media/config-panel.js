@@ -1,12 +1,33 @@
 /**
  * config-panel.js — DSH 完整配置面板前端（无框架）。
- * 与 src/configPanel.ts 配对：init 拉取当前配置 → 表单编辑 → save 保存并应用。
+ * 与 src/configPanel.ts 配对：init 拉取当前配置 → 表单编辑 → 各组"保存"落盘。
  * 消息协议（postMessage）：
  *   panel -> ext: {t:"init"} | {t:"save", values} | {t:"pickFolder", field} | {t:"cancel"}
  *                  | {t:"providerSave", provider, apiKey} | {t:"providerDelete", id}
  *                  | {t:"fetchModels", baseUrl, apiKey}
  *   ext -> panel: {t:"config", config, providers} | {t:"folder", field, path}
  *                  | {t:"saved", ok, message} | {t:"models", models, error?}
+ *
+ * ── 保存规则（各组独立"保存"按钮 + 功能组菜单"重启应用"，与 src/configPanel.ts 保持一致）──
+ *   · "模型配置" / "版本升级" 组：修改立即生效，无需保存、无需重启宿主，
+ *     组内无"保存"按钮。
+ *   · "运行环境" / "控制参数" / "日志管理" / "权限审批" / "个性定制" 五组
+ *     各自独立"保存"按钮（cfgSaveRuntime / cfgSaveControl / cfgSaveLog /
+ *     cfgSavePermission / cfgSavePersonal），点击**只落盘本组字段、绝不重启宿主**。
+ *   · 功能组菜单最下面"重启应用"功能组：本身是命令入口——点击即弹模态确认框，
+ *     确认后**统一重启宿主一次**，使所有已保存的配置生效；取消则停留在当前功能组。
+ *     （组内无按钮；命令 dshVscode.restartHost 为同一入口）
+ *   · 没点"保存"就不落盘、不生效；保存只落盘，重启才生效——两者完全解耦，
+ *     连续修改多组可最后统一重启一次应用。
+ *   · 生效机制区分（事先可确定）：
+ *       - **需要重启宿主才生效（多数）**：运行环境 / 控制参数 / 日志管理 /
+ *         权限审批 / 个性定制五组——宿主启动时从环境变量/文件快照读取，
+ *         保存后必须经"重启应用"功能组重启才生效。
+ *       - **不需要重启（少数）**：模型配置组——提供商/模型/API Key 保存后
+ *         立即落盘生效（热生效），无需重启宿主。
+ *   · 状态栏提示（由扩展在 VS Code 状态栏显示，面板内不显示文字）：保存中
+ *     "⏳ 正在保存配置…"、成功 "✅ 配置保存成功，重启宿主后生效"、失败
+ *     "✗ 配置保存失败：…"。面板收到 {t:"saved"} 只负责恢复各组保存按钮。
  */
 (function () {
   "use strict";
@@ -18,6 +39,12 @@
   const zh = document.body.dataset.locale === "zh";
   const L = {
     title: zh ? "DSH 配置" : "DSH Settings",
+    on: zh ? "开" : "On",
+    off: zh ? "关" : "Off",
+    restartConfirmTitle: zh ? "AY-DSH · 重启应用" : "AY-DSH · Restart & Apply",
+    restartConfirmText: zh ? "重启宿主进程后保存过的配置立即生效，确认要重启吗？" : "Saved settings take effect after the host restarts. Restart now?",
+    restartConfirmOk: zh ? "确认" : "Restart",
+    restartConfirmCancel: zh ? "取消" : "Cancel",
     addProvider: zh ? "＋ 添加提供商" : "+ Add provider",
     addCustomProvider: zh ? "＋ 自定义提供商" : "+ Custom provider",
     edit: zh ? "编辑" : "Edit",
@@ -85,6 +112,12 @@
     autoCompactionOff: zh ? "手动" : "Manual",
     rotateSummaryOn: zh ? "开" : "On",
     rotateSummaryOff: zh ? "关" : "Off",
+    enableCustomOn: zh ? "开启：宿主启动时会把“用户定制品格”的内容注入系统提示词（新会话或重启后生效）。" : "On: the host injects your custom persona into the system prompt at startup (effective on new session or restart).",
+    enableCustomOff: zh ? "关闭：即使“用户定制品格”有内容也不会注入系统提示词。" : "Off: your custom persona is not injected even if it has content.",
+    enableLearningOn: zh ? "开启：宿主启动时会把“自动学习经验”的内容注入系统提示词（新会话或重启后生效）。" : "On: the host injects your learned rules into the system prompt at startup (effective on new session or restart).",
+    enableLearningOff: zh ? "关闭：即使“自动学习经验”有内容也不会注入系统提示词。" : "Off: learned rules are not injected even if they exist.",
+    enableAutoLearnOn: zh ? "开启：宿主会在对话中自动提炼你明确提出的规则、被肯定的经验，写入“自动学习经验”。" : "On: the host auto-extracts rules you explicitly state or confirm and writes them to the learned-rules file.",
+    enableAutoLearnOff: zh ? "关闭：不会自动学习新经验（已有经验仍可按“启用经验”开关加载）。" : "Off: no auto-learning (existing rules can still be loaded via “Enable learned rules”).",
     permissionMatch: zh ? "工具名" : "Tool",
     permissionAction: zh ? "动作" : "Action",
     permissionActionAllow: zh ? "允许" : "Allow",
@@ -93,6 +126,8 @@
     permissionAdd: zh ? "＋ 添加规则" : "+ Add rule",
     permissionRemove: zh ? "删除" : "Delete",
     permissionEmpty: zh ? "（暂无规则；使用内置默认：glob / grep / read / find 自动允许）" : "(no rules; built-in defaults: glob / grep / read / find allowed)",
+    permissionSystemDefault: zh ? "系统默认规则" : "System default",
+    permissionDuplicate: zh ? "同名规则已存在，不能重复配置" : "A rule with this tool name already exists",
     permissionCommandRejected: zh ? "该配置不被接受：DSH 内核暂未提供具体命令参数，仅支持工具级（如 glob / grep / read），不支持带参数命令甄别" : "Rejected: command-level rules are unsupported (the DSH kernel does not expose command args). Use tool-level matches only (e.g. glob / grep / read)",
     permissionSave: zh ? "保存" : "Save",
     permissionCancel: zh ? "取消" : "Cancel",
@@ -105,7 +140,7 @@
     compactThresholdHint: zh ? "上下文用到窗口的多少比例时触发压缩（10% ~ 100%，默认 80%）" : "Compact when context reaches this share of the window (10%–100%, default 80%)",
     compactMaxTokens: zh ? "压缩摘要 token 上限" : "Compaction summary token cap",
     compactMaxTokensHint: zh ? "一次压缩生成的摘要最大 token 数（默认 8192）" : "Max tokens in one compaction summary (default 8192)",
-    save: zh ? "保存并应用" : "Save & Apply",
+    save: zh ? "保存" : "Save",
     cancel: zh ? "取消" : "Cancel",
     saved: zh ? "✓ 配置已保存，将在下次使用时生效" : "✓ Settings saved; they take effect on next use",
     apiKeySet: zh ? "API Key 已配置" : "API Key configured",
@@ -147,6 +182,9 @@
     rotateBytes: $("cfgRotateBytes"),
     rotateSummary: $("cfgRotateSummary"),
     rotateFallbackMsgs: $("cfgRotateFallbackMsgs"),
+    enableCustom: $("cfgEnableCustom"),
+    enableLearning: $("cfgEnableLearning"),
+    enableAutoLearn: $("cfgEnableAutoLearn"),
   };
   // 自动压缩开关旁的"自动/手动"状态随勾选框实时切换
   const autoCompactionState = $("cfgAutoCompactionState");
@@ -164,17 +202,37 @@
     }
   };
   fields.rotateSummary.addEventListener("change", updateRotateSummaryState);
+  // 个性定制：三个开关的"开/关"状态随勾选框实时切换（启用定制/启用经验/启动学习）
+  const personalSwitches = [
+    ["cfgEnableCustomState", "cfgEnableCustomHint", fields.enableCustom, "enableCustomOn", "enableCustomOff"],
+    ["cfgEnableLearningState", "cfgEnableLearningHint", fields.enableLearning, "enableLearningOn", "enableLearningOff"],
+    ["cfgEnableAutoLearnState", "cfgEnableAutoLearnHint", fields.enableAutoLearn, "enableAutoLearnOn", "enableAutoLearnOff"],
+  ];
+  const personalStateUpdaters = [];
+  for (const [stateId, hintId, field, onKey, offKey] of personalSwitches) {
+    const st = $(stateId);
+    const hint = $(hintId);
+    const update = () => {
+      const on = field.checked;
+      if (st) st.textContent = on ? L.on : L.off;
+      if (hint) hint.textContent = on ? L[onKey] : L[offKey];
+    };
+    personalStateUpdaters.push(update);
+    field.addEventListener("change", update);
+  }
 
   // ---- 权限审批组：工具级自动授权规则（Kilo Code 风格）----
+  // 系统默认规则 = DSH 宿主内置的无配置兜底（agent-host.mjs loadAutoApproveRules）：
+  // 只读展示（不可删除/修改，标注"系统默认规则"），也不参与保存（宿主已内置）。
+  // 用户自定义规则与其（及彼此）同名查重，保存时只写用户规则。
+  const SYSTEM_DEFAULT_RULES = [
+    { match: "glob", action: "allow", system: true },
+    { match: "grep", action: "allow", system: true },
+    { match: "read", action: "allow", system: true },
+    { match: "find", action: "allow", system: true },
+  ];
   const permissionRulesEl = $("permissionRules");
   const addPermissionBtn = $("cfgAddPermission");
-  // 内置默认白名单（工具级只读）：无配置时作为示例展示，用户可删除
-  const DEFAULT_PERMISSION_RULES = [
-    { match: "glob", action: "allow" },
-    { match: "grep", action: "allow" },
-    { match: "read", action: "allow" },
-    { match: "find", action: "allow" },
-  ];
   // 工具名合法性：仅字母/数字开头，允许点/下划线/连字符（命令行 token，拒绝中文/空格/特殊字符）
   const TOOL_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
   function validateToolName(name) {
@@ -202,14 +260,34 @@
     overlay.querySelector("#perrOk").addEventListener("click", close);
     overlay.addEventListener("click", (e) => { if (e.target === overlay) close(); });
   }
-  let permissionRules = []; // [{ match, action, saved, dirty, baseMatch, baseAction }]
-  /** 把当前全部有效规则整体写回 settings（前端为权威，避免单条保存丢失其它规则）。 */
-  function persistPermissionRules() {
-    const rules = permissionRules
-      .filter((r) => r.match && r.match.trim() !== "" && TOOL_NAME_RE.test(r.match.trim()))
-      .map((r) => ({ match: r.match.trim(), action: r.action }));
-    vscode.postMessage({ t: "savePermission", rules });
+  // "重启应用"确认框：配置页面内 modal（与权限校验弹框同一风格，标题 AY-DSH）。
+  // 不用 VS Code 原生弹框（标题固定为 Visual Studio Code，且会多出重复"取消"）。
+  function showRestartConfirm() {
+    const esc = (s) => String(s ?? "").replace(/"/g, "&quot;");
+    const overlay = document.createElement("div");
+    overlay.className = "modal-overlay";
+    overlay.innerHTML = `
+      <div class="modal confirm-modal" style="width:min(400px,92vw)">
+        <h3>${esc(L.restartConfirmTitle)}</h3>
+        <p class="confirm-text" style="white-space:nowrap">${esc(L.restartConfirmText)}</p>
+        <div class="row" style="justify-content:flex-end;gap:8px">
+          <button type="button" class="secondary" id="restartCancel">${esc(L.restartConfirmCancel)}</button>
+          <button type="button" class="primary" id="restartOk">${esc(L.restartConfirmOk)}</button>
+        </div>
+      </div>`;
+    document.body.appendChild(overlay);
+    const close = () => overlay.remove();
+    overlay.querySelector("#restartCancel").addEventListener("click", close);
+    overlay.querySelector("#restartOk").addEventListener("click", () => {
+      close();
+      vscode.postMessage({ t: "restartApply" });
+    });
+    overlay.addEventListener("click", (e) => { if (e.target === overlay) close(); });
   }
+  let permissionRules = []; // [{ match, action, saved, dirty, baseMatch, baseAction }]
+  // 权限规则不再按条单独写盘：所有规则统一由本组"保存"按钮
+  // （t:"save" 携带 autoApproveRules）写盘并重启宿主生效，
+  // 保证"没点保存不落盘、点了统一落盘 + 最多一次重启"行为一致。
   function renderPermissionRules() {
     if (!permissionRulesEl) return;
     permissionRulesEl.innerHTML = "";
@@ -225,7 +303,7 @@
       inp.value = rule.match || "";
       inp.placeholder = "glob";
       inp.spellcheck = false;
-      inp.readOnly = rule.saved; // 已配置的规则工具名只读
+      inp.readOnly = rule.saved || rule.system === true; // 已配置 / 系统默认：工具名只读
       inp.addEventListener("input", () => {
         rule.match = inp.value;
         rule.dirty = true;
@@ -233,12 +311,13 @@
       const sel = document.createElement("select");
       sel.innerHTML = `<option value="allow">${L.permissionActionAllow}</option><option value="ask">${L.permissionActionAsk}</option><option value="deny">${L.permissionActionDeny}</option>`;
       sel.value = ["allow", "ask", "deny"].includes(rule.action) ? rule.action : "ask";
+      if (rule.system === true) sel.disabled = true; // 系统默认：动作下拉只读
       sel.addEventListener("change", () => {
         rule.action = sel.value;
         rule.dirty = true;
         renderPermissionRules(); // 有变化：显示"保存/取消"
       });
-      // 保存：整体写回（含该条）；取消：已配置恢复原值 / 新增则放弃该行
+      // 保存：确认该行编辑（不单独落盘）；**查重**——与系统默认或其余规则同名则拒绝
       const save = document.createElement("button");
       save.type = "button";
       save.className = "secondary";
@@ -246,7 +325,8 @@
       save.addEventListener("click", () => {
         const err = validateToolName(rule.match);
         if (err) { showPermissionError(err); return; }
-        persistPermissionRules();
+        const dup = permissionRules.some((r2, j) => j !== i && r2.match === rule.match.trim());
+        if (dup) { showPermissionError(L.permissionDuplicate); return; }
         rule.saved = true;
         rule.dirty = false;
         rule.baseMatch = rule.match.trim();
@@ -267,17 +347,20 @@
         }
         renderPermissionRules();
       });
-      // 删除：移除该行并立即同步写回（明确"删除"，非取消）
+      // 删除：仅用户规则可删（系统默认不可删、不显示按钮）
       const rm = document.createElement("button");
       rm.type = "button";
       rm.className = "secondary";
       rm.textContent = L.permissionRemove;
       rm.addEventListener("click", () => {
         permissionRules.splice(i, 1);
-        persistPermissionRules();
         renderPermissionRules();
       });
-      row.append(inp, sel, ...(rule.dirty ? [save, cancel] : []), rm);
+      // 系统默认标注（只读展示，不显示保存/删除按钮）
+      const badge = document.createElement("span");
+      badge.className = "permission-system-badge";
+      badge.textContent = L.permissionSystemDefault;
+      row.append(inp, sel, ...(rule.dirty ? [save, cancel] : []), ...(rule.system === true ? [badge] : [rm]));
       permissionRulesEl.appendChild(row);
     });
   }
@@ -288,7 +371,6 @@
     });
   }
 
-  const saveBtn = $("cfgSave");
   const cwdEl = $("cfgCwd");
 
   /** 知名供应商的公开 API 地址（选择供应商/「默认」按钮使用；DSH 目录不提供 baseUrl）。 */
@@ -349,31 +431,25 @@
   // ---- 左右布局：左侧菜单切换分组、组内 tab 切换面板（多 tab 预留） ----
   const sidebar = $("cfgSidebar");
   let activeGroup = "model";
-  // 底部按钮随组切换：权限审批组显示"立即应用"（规则已按条单独保存，点击重启宿主生效）；
-  // 模型/升级组隐藏；运行/控制组显示"保存并应用"。
-  function updateFooterForGroup() {
-    const footer = saveBtn.closest(".cfg-footer");
-    if (activeGroup === "permission") {
-      if (footer) footer.style.display = "";
-      saveBtn.textContent = L.permissionApplyNow;
-    } else if (activeGroup === "upgrade" || activeGroup === "model") {
-      if (footer) footer.style.display = "none";
-    } else {
-      if (footer) footer.style.display = "";
-      saveBtn.textContent = L.save;
-    }
-  }
+  // 各组独立"保存"按钮（运行环境/控制参数/日志管理/权限审批/个性定制）——
+  // 点击只落盘不重启；模型配置/版本升级组修改立即生效、组内无保存按钮。
+  // 功能组菜单最下面"重启应用"是命令入口：点击直接弹确认框重启宿主（不切换页面），
+  // 取消则停留在当前功能组；组内无按钮。
   sidebar.addEventListener("click", (ev) => {
     const btn = ev.target.closest(".cfg-nav");
     if (!btn) return;
+    if (btn.dataset.group === "restartApply") {
+      // "重启应用"是命令入口：弹配置页面内确认框（标题 AY-DSH、确认/取消各一个），
+      // 确认后才发消息重启宿主；取消则停留在当前功能组（不切换页面）。
+      showRestartConfirm();
+      return;
+    }
     activeGroup = btn.dataset.group;
     sidebar.querySelectorAll(".cfg-nav").forEach((b) => b.classList.toggle("active", b === btn));
     document.querySelectorAll(".cfg-group").forEach((el) => {
       el.classList.toggle("active", el.dataset.group === btn.dataset.group);
     });
-    updateFooterForGroup();
   });
-  updateFooterForGroup(); // 初始化：默认模型组隐藏底部按钮
   document.querySelectorAll(".cfg-tabs").forEach((tabs) => {
     tabs.addEventListener("click", (ev) => {
       const tab = ev.target.closest(".cfg-tab");
@@ -1006,29 +1082,46 @@
   $("cfgPickWorkspace").addEventListener("click", () => vscode.postMessage({ t: "pickFolder", field: "defaultWorkspace" }));
   $("cfgPickNode").addEventListener("click", () => vscode.postMessage({ t: "pickFolder", field: "nodePath" }));
 
-  saveBtn.addEventListener("click", () => {
-    saveBtn.disabled = true;
-    // 权限审批组：规则已按条单独保存，此按钮 = "立即应用"（重启宿主使规则生效）
-    if (activeGroup === "permission") {
-      vscode.postMessage({ t: "applyPermission" });
-      saveBtn.disabled = false;
-      return;
-    }
-    // 保存中/结果提示统一由扩展显示在 VS Code 状态栏，面板内不再显示任何文字
-    // （避免挤占/移动保存按钮位置）
-    // 权限规则校验：DSH 内核暂未提供命令参数，仅支持工具级匹配——含空白=命令级，拒绝保存
-    const cmdRule = permissionRules.find((r) => /\s/.test(r.match));
-    if (cmdRule) {
-      showPermissionError(L.permissionCommandRejected);
-      saveBtn.disabled = false;
-      return;
-    }
+  // 个性定制组：编辑按钮用 VS Code 编辑器打开文件（首次自动创建）；
+  // "个性定制"组"编辑"按钮：用 VS Code 编辑器打开文件（首次编辑自动创建）。
+  $("btnEditCustom").addEventListener("click", () => vscode.postMessage({ t: "editCustomFile", kind: "custom" }));
+  $("btnEditLearning").addEventListener("click", () => vscode.postMessage({ t: "editCustomFile", kind: "learning" }));
+
+  // ── 各组独立"保存"按钮（规则详见文件头部注释）──
+  // 点击**只落盘本组字段、绝不重启宿主**；生效由功能组菜单"重启应用"统一触发。
+  // 状态栏提示由扩展显示（保存中/成功/失败）；面板内不显示文字；
+  // 按钮恢复由扩展回发 {t:"saved"} 统一处理。
+  const groupSaveBtns = [
+    "cfgSaveRuntime",
+    "cfgSaveControl",
+    "cfgSaveLog",
+    "cfgSavePermission",
+    "cfgSavePersonal",
+  ];
+  const disableGroupSaves = (disabled) => {
+    groupSaveBtns.forEach((id) => {
+      const el = document.getElementById(id);
+      if (el) el.disabled = disabled;
+    });
+  };
+  // 运行环境组：默认工作目录 + Node 路径
+  $("cfgSaveRuntime").addEventListener("click", () => {
+    disableGroupSaves(true);
+    vscode.postMessage({
+      t: "save",
+      values: {
+        defaultWorkspace: fields.defaultWorkspace.value.trim(),
+        nodePath: fields.nodePath.value.trim(),
+      },
+    });
+  });
+  // 控制参数组：权限模式 + 运行/压缩参数
+  $("cfgSaveControl").addEventListener("click", () => {
+    disableGroupSaves(true);
     vscode.postMessage({
       t: "save",
       values: {
         permissionMode: fields.permissionMode.value,
-        nodePath: fields.nodePath.value.trim(),
-        defaultWorkspace: fields.defaultWorkspace.value.trim(),
         maxOutputChars: parseInt(fields.maxOutputChars.value, 10) || 40000,
         maxSteps: parseInt(fields.maxSteps.value, 10) || 0,
         subagentMaxDepth: parseInt(fields.subagentMaxDepth.value, 10) || 3,
@@ -1036,13 +1129,43 @@
         autoCompaction: fields.autoCompaction.checked,
         compactionThresholdRatio: (parseFloat(fields.compactionThresholdRatio.value) || 80) / 100,
         compactionMaxTokens: parseInt(fields.compactionMaxTokens.value, 10) || 8192,
-        rotateBytes: parseInt(fields.rotateBytes.value, 10) || 10,
-        rotateSummary: fields.rotateSummary.checked,
-        rotateFallbackMsgs: parseInt(fields.rotateFallbackMsgs.value, 10) || 5,
-        autoApproveRules: permissionRules.filter((r) => r.match && r.match.trim() !== "").map((r) => ({ match: r.match.trim(), action: r.action })),
       },
     });
   });
+  // 日志管理组：轮转参数
+  $("cfgSaveLog").addEventListener("click", () => {
+    disableGroupSaves(true);
+    vscode.postMessage({
+      t: "save",
+      values: {
+        rotateBytes: parseInt(fields.rotateBytes.value, 10) || 10,
+        rotateSummary: fields.rotateSummary.checked,
+        rotateFallbackMsgs: parseInt(fields.rotateFallbackMsgs.value, 10) || 5,
+      },
+    });
+  });
+  // 权限审批组：整体写回规则列表（只落盘，不重启）
+  $("cfgSavePermission").addEventListener("click", () => {
+    disableGroupSaves(true);
+    vscode.postMessage({
+      t: "savePermission",
+      rules: permissionRules.filter((r) => !r.system && r.match && r.match.trim() !== "").map((r) => ({ match: r.match.trim(), action: r.action })),
+    });
+  });
+  // 个性定制组：三个开关（个性文件内容随编辑即时落盘，重启后注入生效）
+  $("cfgSavePersonal").addEventListener("click", () => {
+    disableGroupSaves(true);
+    vscode.postMessage({
+      t: "saveCustom",
+      values: {
+        enableCustom: fields.enableCustom.checked,
+        enableLearning: fields.enableLearning.checked,
+        enableAutoLearn: fields.enableAutoLearn.checked,
+      },
+    });
+  });
+  // （"重启应用"功能组菜单项本身就是命令入口，已在 sidebar click 中拦截处理，
+  //  无需页面内按钮。）
 
   // 取消 = 直接关闭配置页面（无"取消"按钮；关闭面板即取消，无需消息）
 
@@ -1063,12 +1186,26 @@
     fields.rotateSummary.checked = c.rotateSummary !== false;
     updateRotateSummaryState();
     fields.rotateFallbackMsgs.value = String(c.rotateFallbackMsgs ?? 5);
-    permissionRules = Array.isArray(c.autoApproveRules) && c.autoApproveRules.length > 0
-      ? c.autoApproveRules.map((r) => ({ match: String(r.match ?? ""), action: ["allow", "ask", "deny"].includes(r.action) ? r.action : "ask", saved: true, dirty: false, baseMatch: String(r.match ?? ""), baseAction: ["allow", "ask", "deny"].includes(r.action) ? r.action : "ask" }))
-      : DEFAULT_PERMISSION_RULES.map((r) => ({ ...r, saved: true, dirty: false, baseMatch: r.match, baseAction: r.action }));
+    // 三个开关默认值统一为 false（与后端 readConfig ?? false 一致），
+    // 未配置时显示"关"，避免 UI 显示与宿主实际行为不一致。
+    fields.enableCustom.checked = c.enableCustom === true;
+    fields.enableLearning.checked = c.enableLearning === true;
+    fields.enableAutoLearn.checked = c.enableAutoLearn === true;
+    personalStateUpdaters.forEach((fn) => fn());
+    // 权限规则 = 系统默认（只读展示，宿主内置）+ 用户自定义（可增删改）：
+    // 配置中与系统默认同名的条目被系统默认覆盖（宿主内置即生效，无需重复写盘）；
+    // 用户规则彼此同名在行级保存时查重拒绝。
+    const sysMatches = new Set(SYSTEM_DEFAULT_RULES.map((r) => r.match));
+    const userRules = Array.isArray(c.autoApproveRules)
+      ? c.autoApproveRules.map((r) => ({ match: String(r.match ?? ""), action: ["allow", "ask", "deny"].includes(r.action) ? r.action : "ask", saved: true, dirty: false, baseMatch: String(r.match ?? ""), baseAction: ["allow", "ask", "deny"].includes(r.action) ? r.action : "ask", system: false }))
+      : [];
+    permissionRules = [
+      ...SYSTEM_DEFAULT_RULES.map((r) => ({ ...r, saved: true, dirty: false, baseMatch: r.match, baseAction: r.action })),
+      ...userRules.filter((r) => !sysMatches.has(r.match)),
+    ];
     renderPermissionRules();
     cwdEl.value = c.cwd || "";
-    saveBtn.disabled = false;
+    disableGroupSaves(false);
   }
 
   window.addEventListener("message", (ev) => {
@@ -1095,10 +1232,18 @@
           else fields.nodePath.value = msg.path;
         }
         break;
+      case "customFiles": {
+        // 个性定制：只读预览两个文件内容（markdown 渲染；编辑走 VS Code 编辑器）
+        const c = $("cfgCustomPrompt");
+        const l = $("cfgLearning");
+        if (c) c.innerHTML = renderMarkdown(msg.custom?.text || "");
+        if (l) l.innerHTML = renderMarkdown(msg.learning?.text || "");
+        break;
+      }
       case "saved":
         // 保存中/成功/失败提示全部由扩展显示在 VS Code 状态栏；
-        // 面板内只负责恢复按钮（绝不显示文字、不挤占按钮位置）。
-        saveBtn.disabled = false;
+        // 面板内只负责恢复各组保存按钮（绝不显示文字、不挤占按钮位置）。
+        disableGroupSaves(false);
         break;
       case "providersCatalog":
         if (applyCatalogRef) {
