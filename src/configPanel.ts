@@ -8,8 +8,32 @@
  * 消息协议（postMessage）：
  *   panel -> ext: {t:"init"} | {t:"save", values} | {t:"pickFolder", field} | {t:"cancel"}
  *   ext -> panel: {t:"config", config} | {t:"folder", field, path} | {t:"saved", ok, message}
+ *
+ * ── 保存规则（各组独立"保存"按钮 + 功能组菜单"重启应用"，与 src/media/config-panel.js 保持一致）──
+ *   · "模型配置" / "版本升级" 组：修改立即生效，无需保存、无需重启宿主，
+ *     组内无"保存"按钮。
+ *   · "运行环境" / "控制参数" / "日志管理" / "权限审批" / "个性定制" 五组
+ *     各自独立"保存"按钮（cfgSaveRuntime / cfgSaveControl / cfgSaveLog /
+ *     cfgSavePermission / cfgSavePersonal），点击**只落盘本组字段、绝不重启宿主**。
+ *   · 功能组菜单最下面"重启应用"功能组：本身是命令入口——点击即弹模态确认框，
+ *     确认后**统一重启宿主一次**，使所有已保存的配置生效；取消则停留在当前功能组。
+ *     （组内无按钮；命令 dshVscode.restartHost 为同一入口）
+ *   · 没点"保存"就不落盘、不生效；保存只落盘，重启才生效——两者完全解耦，
+ *     连续修改多组可最后统一重启一次应用。
+ *   · 生效机制区分（事先可确定）：
+ *       - **需要重启宿主才生效（多数）**：运行环境 / 控制参数 / 日志管理 /
+ *         权限审批 / 个性定制五组——宿主启动时从环境变量/文件快照读取
+ *         （maxSteps、轮转参数、autoApproveRules、个性提示词注入等），
+ *         保存后必须经"重启应用"功能组重启才生效。
+ *       - **不需要重启（少数）**：模型配置组——提供商/模型/API Key 保存后
+ *         立即落盘生效（热生效），无需重启宿主。
+ *   · 状态栏提示（VS Code 状态栏，非弹窗）：保存中 "⏳ 正在保存配置…"、
+ *     成功 "✅ 配置保存成功，重启宿主后生效"、失败 "✗ 配置保存失败：…"。
+ *     面板内不显示文字，只负责恢复按钮。
  */
 import * as vscode from "vscode";
+import { existsSync, readFileSync, writeFileSync, statSync } from "node:fs";
+import { join } from "node:path";
 import type { ProviderApplyItem } from "./protocol";
 import type { UpgradeVersionInfo } from "./upgradeCenter";
 
@@ -64,10 +88,15 @@ export interface ConfigPanelDeps {
     rotateBytes: number;
     rotateSummary: boolean;
     rotateFallbackMsgs: number;
+    enableCustom: boolean;
+    enableLearning: boolean;
+    enableAutoLearn: boolean;
     autoApproveRules: { match: string; action: string }[];
   };
   /** 当前 Agent 工作目录（展示用）。 */
   workspaceRoot: () => string;
+  /** DSH home 路径（个性定制文件 ay-dsh-custom.md / ay-dsh-learning.md 所在）。 */
+  dshHomePath: string;
   /**
    * 配置保存**事务边界**：onConfigSaveStart 在保存开始（首次写配置前）调用，
    * onConfigSaveEnd 在保存结束（无论成败）调用。期间扩展忽略逐项配置变更事件，
@@ -121,6 +150,37 @@ export function openConfigPanel(context: vscode.ExtensionContext, deps: ConfigPa
     }
   );
   activePanel = panel;
+  // 个性定制文件（DSH home 固定路径固定文件名，跨项目共享）
+  const customPromptFile = join(deps.dshHomePath, "ay-dsh-custom.md");
+  const learningFile = join(deps.dshHomePath, "ay-dsh-learning.md");
+  let customMtime = 0;
+  let learningMtime = 0;
+  const readCustomFile = (p: string): string => {
+    try {
+      return existsSync(p) ? readFileSync(p, "utf8") : "";
+    } catch {
+      return "";
+    }
+  };
+  const mtimeOf = (p: string): number => {
+    try {
+      return existsSync(p) ? statSync(p).mtimeMs : 0;
+    } catch {
+      return 0;
+    }
+  };
+  /** 刷新个性定制预览（显示用；mtime 保持基准值，供"保存"检测编辑）。 */
+  const refreshCustomFiles = (): void => {
+    panel.webview.postMessage({
+      t: "customFiles",
+      custom: { text: readCustomFile(customPromptFile), mtime: customMtime },
+      learning: { text: readCustomFile(learningFile), mtime: learningMtime },
+    });
+  };
+  // 从编辑器切回配置面板时刷新个性定制预览（用户编辑保存后可见新内容）
+  panel.onDidChangeViewState(() => {
+    if (panel.visible) refreshCustomFiles();
+  });
   panel.onDidDispose(() => {
     if (activePanel === panel) activePanel = undefined;
   });
@@ -199,6 +259,9 @@ export function openConfigPanel(context: vscode.ExtensionContext, deps: ConfigPa
           rotateBytes: Number.isFinite(cfg.get<number>("rotateBytes")) && (cfg.get<number>("rotateBytes") ?? 0) > 0 ? cfg.get<number>("rotateBytes") : 10,
           rotateSummary: cfg.get<boolean>("rotateSummary") ?? true,
           rotateFallbackMsgs: Number.isFinite(cfg.get<number>("rotateFallbackMsgs")) && (cfg.get<number>("rotateFallbackMsgs") ?? 0) > 0 ? cfg.get<number>("rotateFallbackMsgs") : 5,
+          enableCustom: cfg.get<boolean>("enableCustom") ?? false,
+          enableLearning: cfg.get<boolean>("enableLearning") ?? false,
+          enableAutoLearn: cfg.get<boolean>("enableAutoLearn") ?? false,
           autoApproveRules: cfg.get<{ match: string; action: string }[]>("autoApproveRules") ?? [],
           cwd: deps.workspaceRoot(),
         },
@@ -296,6 +359,59 @@ export function openConfigPanel(context: vscode.ExtensionContext, deps: ConfigPa
       case "init": {
         await sendConfig();
         pushUpgradeState();
+        // 个性定制文件（DSH home 固定名）：记录 mtime 基准（"保存"比对用）
+        customMtime = mtimeOf(customPromptFile);
+        learningMtime = mtimeOf(learningFile);
+        refreshCustomFiles();
+        break;
+      }
+      case "editCustomFile": {
+        // 打开 VS Code 编辑器编辑个性文件（首次编辑时创建）
+        const file = msg.kind === "learning" ? learningFile : customPromptFile;
+        if (!existsSync(file)) {
+          writeFileSync(file, msg.kind === "learning" ? "# 自动学习的工作经验\n\n" : "# 用户定制提示词\n\n", "utf8");
+        }
+        await vscode.window.showTextDocument(await vscode.workspace.openTextDocument(file));
+        break;
+      }
+      case "saveCustom": {
+        // "个性定制"组"保存"：落盘三个开关（enableCustom/enableLearning/enableAutoLearn）
+        // + 保存打开中的 dirty 文档 + 更新 mtime 基准。**不重启宿主**——生效由
+        // 功能组菜单"重启应用"（restartApply）统一触发（见文件头部"保存规则"注释）。
+        const sv = (msg as { values?: Record<string, unknown> }).values ?? {};
+        deps.onConfigSaveStart();
+        try {
+          for (const doc of vscode.workspace.textDocuments) {
+            if (doc.isDirty && (doc.uri.fsPath === customPromptFile || doc.uri.fsPath === learningFile)) {
+              await doc.save();
+            }
+          }
+          const cfg = vscode.workspace.getConfiguration(CONFIG_NS);
+          if (typeof sv.enableCustom === "boolean") {
+            await cfg.update("enableCustom", sv.enableCustom, vscode.ConfigurationTarget.Global);
+          }
+          if (typeof sv.enableLearning === "boolean") {
+            await cfg.update("enableLearning", sv.enableLearning, vscode.ConfigurationTarget.Global);
+          }
+          if (typeof sv.enableAutoLearn === "boolean") {
+            await cfg.update("enableAutoLearn", sv.enableAutoLearn, vscode.ConfigurationTarget.Global);
+          }
+          customMtime = mtimeOf(customPromptFile);
+          learningMtime = mtimeOf(learningFile);
+          deps.onSaved(false);
+          vscode.window.setStatusBarMessage(
+            zh ? "✅ 配置保存成功，重启宿主后生效" : "✅ Settings saved; effective after host restart",
+            5000
+          );
+          panel.webview.postMessage({ t: "saved", ok: true, message: zh ? "配置保存成功，重启宿主后生效" : "Settings saved; effective after host restart" });
+          await sendConfig();
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          vscode.window.setStatusBarMessage(zh ? `✗ 配置保存失败：${message}` : `✗ Failed to save settings: ${message}`, 8000);
+          panel.webview.postMessage({ t: "saved", ok: false, message });
+        } finally {
+          deps.onConfigSaveEnd();
+        }
         break;
       }
       case "pickFolder": {
@@ -425,73 +541,14 @@ export function openConfigPanel(context: vscode.ExtensionContext, deps: ConfigPa
       }
       case "save": {
         const v = msg.values ?? {};
-        // 无变化秒回：先归一化比较运行参数 + 判断是否有 API Key 操作。
-        // 都没有变化时直接返回（不写配置、不重启、不刷新），避免"点保存转半天"。
-        const prevC0 = deps.readConfig();
-        const prevCfg0 = vscode.workspace.getConfiguration(CONFIG_NS);
-        const prev0 = {
-          permissionMode: prevC0.permissionMode,
-          nodePath: prevC0.nodePath,
-          defaultWorkspace: prevCfg0.get<string>("defaultWorkspace") ?? "",
-          maxOutputChars: prevCfg0.get<number>("maxOutputChars") ?? 40000,
-          maxSteps: Number.isFinite(prevC0.maxSteps) && prevC0.maxSteps >= 0 ? prevC0.maxSteps : 100,
-          subagentMaxDepth: Number.isFinite(prevC0.subagentMaxDepth) && prevC0.subagentMaxDepth > 0 ? prevC0.subagentMaxDepth : 3,
-          maxParallelSubagents: Number.isFinite(prevC0.maxParallelSubagents) && prevC0.maxParallelSubagents > 0 ? prevC0.maxParallelSubagents : 5,
-          autoCompaction: prevC0.autoCompaction ?? true,
-          compactionThresholdRatio: Number.isFinite(prevC0.compactionThresholdRatio) && prevC0.compactionThresholdRatio > 0 ? prevC0.compactionThresholdRatio : 0.8,
-          compactionMaxTokens: Number.isFinite(prevC0.compactionMaxTokens) && prevC0.compactionMaxTokens > 0 ? prevC0.compactionMaxTokens : 8192,
-          rotateBytes: Number.isFinite(prevC0.rotateBytes) && prevC0.rotateBytes > 0 ? prevC0.rotateBytes : 10,
-          rotateSummary: prevC0.rotateSummary ?? true,
-          rotateFallbackMsgs: Number.isFinite(prevC0.rotateFallbackMsgs) && prevC0.rotateFallbackMsgs > 0 ? prevC0.rotateFallbackMsgs : 5,
-        };
-        const next0 = {
-          permissionMode: ["workspace-write", "read-only", "danger-full-access"].includes(v.permissionMode) ? v.permissionMode : "workspace-write",
-          nodePath: typeof v.nodePath === "string" ? v.nodePath.trim() : "",
-          defaultWorkspace: typeof v.defaultWorkspace === "string" ? v.defaultWorkspace.trim() : "",
-          maxOutputChars: Number.isFinite(v.maxOutputChars) && v.maxOutputChars > 0 ? v.maxOutputChars : 40000,
-          maxSteps: Number.isFinite(v.maxSteps) && v.maxSteps >= 0 ? v.maxSteps : 100,
-          subagentMaxDepth: Number.isFinite(v.subagentMaxDepth) && v.subagentMaxDepth > 0 ? v.subagentMaxDepth : 3,
-          maxParallelSubagents: Number.isFinite(v.maxParallelSubagents) && v.maxParallelSubagents > 0 ? v.maxParallelSubagents : 5,
-          autoCompaction: typeof v.autoCompaction === "boolean" ? v.autoCompaction : true,
-          compactionThresholdRatio: Number.isFinite(v.compactionThresholdRatio) && v.compactionThresholdRatio > 0 ? Math.min(1, v.compactionThresholdRatio) : 0.8,
-          compactionMaxTokens: Number.isFinite(v.compactionMaxTokens) && v.compactionMaxTokens > 0 ? v.compactionMaxTokens : 8192,
-          rotateBytes: Number.isFinite(v.rotateBytes) && v.rotateBytes > 0 ? v.rotateBytes : 10,
-          rotateSummary: typeof v.rotateSummary === "boolean" ? v.rotateSummary : true,
-          rotateFallbackMsgs: Number.isFinite(v.rotateFallbackMsgs) && v.rotateFallbackMsgs > 0 ? v.rotateFallbackMsgs : 5,
-        };
-        const keyOp = v.clearKey === true || (typeof v.apiKey === "string" && v.apiKey.trim() !== "");
-        if (JSON.stringify(prev0) === JSON.stringify(next0) && !keyOp) {
-          vscode.window.setStatusBarMessage(zh ? "✅ 配置无变化，无需保存" : "✅ No changes to save", 3000);
-          panel.webview.postMessage({ t: "saved", ok: true, message: zh ? "配置无变化" : "No changes" });
-          break;
-        }
-        // 保存事务开始：扩展侧忽略逐项配置变更事件，等 onSaved 统一处理
+        // 方案 B：各组独立"保存"按钮 → 本分支**只落盘本次提供的字段**（部分更新），
+        // 绝不重启宿主；生效由功能组菜单"重启应用"（restartApply）统一触发。
+        // 事务标志：抑制 onDidChangeConfiguration 的自动重启，保存本身不重启宿主。
         deps.onConfigSaveStart();
-        // 保存中提示常显（60s 兜底），保存完成时被成功/失败/无变化提示立即覆盖——
-        // 保证"保存并应用"执行全程（含宿主重启，可能数秒）状态栏都有明确反馈
+        // 保存中提示常显（60s 兜底），保存完成时被成功/失败提示立即覆盖——
+        // 保证保存全程状态栏都有明确反馈
         vscode.window.setStatusBarMessage(zh ? "⏳ 正在保存配置…" : "⏳ Saving settings…", 60000);
         try {
-          // 记录保存前生效的宿主运行参数（判断本次保存是否真的改变了需要重启的配置）
-          const prevC = deps.readConfig();
-          const prevCfg = vscode.workspace.getConfiguration(CONFIG_NS);
-          // 两侧都用同一套归一化逻辑，避免"读到的原始值"与"保存后的归一化值"
-          // 直接比较产生误判（如 maxSteps 未设置时 prev=undefined vs next=100，
-          // 会导致未改动也判定"运行参数变化"而重启宿主）。
-          const prev = {
-            permissionMode: prevC.permissionMode,
-            nodePath: prevC.nodePath,
-            defaultWorkspace: prevCfg.get<string>("defaultWorkspace") ?? "",
-            maxOutputChars: prevCfg.get<number>("maxOutputChars") ?? 40000,
-            maxSteps: Number.isFinite(prevC.maxSteps) && prevC.maxSteps >= 0 ? prevC.maxSteps : 100,
-            subagentMaxDepth: Number.isFinite(prevC.subagentMaxDepth) && prevC.subagentMaxDepth > 0 ? prevC.subagentMaxDepth : 3,
-            maxParallelSubagents: Number.isFinite(prevC.maxParallelSubagents) && prevC.maxParallelSubagents > 0 ? prevC.maxParallelSubagents : 5,
-            autoCompaction: prevC.autoCompaction ?? true,
-            compactionThresholdRatio: Number.isFinite(prevC.compactionThresholdRatio) && prevC.compactionThresholdRatio > 0 ? prevC.compactionThresholdRatio : 0.8,
-            compactionMaxTokens: Number.isFinite(prevC.compactionMaxTokens) && prevC.compactionMaxTokens > 0 ? prevC.compactionMaxTokens : 8192,
-            rotateBytes: Number.isFinite(prevC.rotateBytes) && prevC.rotateBytes > 0 ? prevC.rotateBytes : 10,
-            rotateSummary: prevC.rotateSummary ?? true,
-            rotateFallbackMsgs: Number.isFinite(prevC.rotateFallbackMsgs) && prevC.rotateFallbackMsgs > 0 ? prevC.rotateFallbackMsgs : 5,
-          };
           // 1. API Key：清除 / 写入密钥库（写入时清空设置项，保持"密钥库优先"策略）
           if (v.clearKey) {
             await context.secrets.delete(SECRET_KEY);
@@ -501,8 +558,8 @@ export function openConfigPanel(context: vscode.ExtensionContext, deps: ConfigPa
               .getConfiguration(CONFIG_NS)
               .update("apiKey", "", vscode.ConfigurationTarget.Global);
           }
-          // 2. 普通配置项（Global）。model/baseUrl 已归入提供商管理（面板不再发送）——
-          // 仅当面板显式提供时才更新，避免"保存运行环境配置"把当前模型重置为默认。
+          // 2. 普通配置项（Global）：**仅更新本次提供的字段**（未提供 = 不触碰），
+          //    避免"保存运行环境组"把控制参数/日志字段重置为默认值。
           const cfg = vscode.workspace.getConfiguration(CONFIG_NS);
           if (typeof v.model === "string" && v.model.trim() !== "") {
             await cfg.update("model", v.model.trim(), vscode.ConfigurationTarget.Global);
@@ -510,107 +567,57 @@ export function openConfigPanel(context: vscode.ExtensionContext, deps: ConfigPa
           if (typeof v.baseUrl === "string") {
             await cfg.update("baseUrl", v.baseUrl.trim(), vscode.ConfigurationTarget.Global);
           }
-          await cfg.update(
-            "permissionMode",
-            ["workspace-write", "read-only", "danger-full-access"].includes(v.permissionMode) ? v.permissionMode : "workspace-write",
-            vscode.ConfigurationTarget.Global
-          );
+          if (typeof v.permissionMode === "string") {
+            await cfg.update(
+              "permissionMode",
+              ["workspace-write", "read-only", "danger-full-access"].includes(v.permissionMode) ? v.permissionMode : "workspace-write",
+              vscode.ConfigurationTarget.Global
+            );
+          }
           // 运行环境相关参数（nodePath/defaultWorkspace/maxOutputChars）存入**工作区设置**：
           // 跟随项目目录、按环境天然隔离（本地 / Remote 各自读写本机的 .vscode/settings.json），
           // 不受 VS Code 设置同步（Settings Sync）的跨环境污染；无工作区时回退用户设置。
           const runtimeTarget = vscode.workspace.workspaceFolders?.[0]
             ? vscode.ConfigurationTarget.Workspace
             : vscode.ConfigurationTarget.Global;
-          await cfg.update("nodePath", typeof v.nodePath === "string" ? v.nodePath.trim() : "", runtimeTarget);
-          await cfg.update("defaultWorkspace", typeof v.defaultWorkspace === "string" ? v.defaultWorkspace.trim() : "", runtimeTarget);
-          await cfg.update(
-            "maxOutputChars",
-            Number.isFinite(v.maxOutputChars) && v.maxOutputChars > 0 ? v.maxOutputChars : 40000,
-            runtimeTarget
-          );
-          await cfg.update(
-            "maxSteps",
-            Number.isFinite(v.maxSteps) && v.maxSteps >= 0 ? v.maxSteps : 100,
-            vscode.ConfigurationTarget.Global
-          );
-          await cfg.update(
-            "subagentMaxDepth",
-            Number.isFinite(v.subagentMaxDepth) && v.subagentMaxDepth > 0 ? v.subagentMaxDepth : 3,
-            vscode.ConfigurationTarget.Global
-          );
-          await cfg.update(
-            "maxParallelSubagents",
-            Number.isFinite(v.maxParallelSubagents) && v.maxParallelSubagents > 0 ? v.maxParallelSubagents : 5,
-            vscode.ConfigurationTarget.Global
-          );
-          await cfg.update(
-            "autoCompaction",
-            typeof v.autoCompaction === "boolean" ? v.autoCompaction : true,
-            vscode.ConfigurationTarget.Global
-          );
-          await cfg.update(
-            "compactionThresholdRatio",
-            Number.isFinite(v.compactionThresholdRatio) && v.compactionThresholdRatio > 0 ? Math.min(1, v.compactionThresholdRatio) : 0.8,
-            vscode.ConfigurationTarget.Global
-          );
-          await cfg.update(
-            "compactionMaxTokens",
-            Number.isFinite(v.compactionMaxTokens) && v.compactionMaxTokens > 0 ? v.compactionMaxTokens : 8192,
-            vscode.ConfigurationTarget.Global
-          );
-          await cfg.update(
-            "rotateBytes",
-            Number.isFinite(v.rotateBytes) && v.rotateBytes > 0 ? v.rotateBytes : 10,
-            vscode.ConfigurationTarget.Global
-          );
-          await cfg.update(
-            "rotateSummary",
-            typeof v.rotateSummary === "boolean" ? v.rotateSummary : true,
-            vscode.ConfigurationTarget.Global
-          );
-          await cfg.update(
-            "rotateFallbackMsgs",
-            Number.isFinite(v.rotateFallbackMsgs) && v.rotateFallbackMsgs > 0 ? v.rotateFallbackMsgs : 5,
-            vscode.ConfigurationTarget.Global
-          );
-          await cfg.update(
-            "autoApproveRules",
-            Array.isArray(v.autoApproveRules)
-              ? (v.autoApproveRules as { match?: string; action?: string }[])
-                  .filter((r) => r && String(r.match ?? "").trim() !== "")
-                  .map((r) => ({ match: String(r.match ?? "").trim(), action: ["allow", "ask", "deny"].includes(String(r.action)) ? String(r.action) : "ask" }))
-              : [],
-            vscode.ConfigurationTarget.Global
-          );
-          // 3. 应用：对比保存前后的宿主运行参数——只有确实变化才重启宿主；
-          //    提供商配置（经 llm-pi-ai settings 热生效）与无变化的保存都不重启。
-          const next = {
-            permissionMode: ["workspace-write", "read-only", "danger-full-access"].includes(v.permissionMode) ? v.permissionMode : "workspace-write",
-            nodePath: typeof v.nodePath === "string" ? v.nodePath.trim() : "",
-            defaultWorkspace: typeof v.defaultWorkspace === "string" ? v.defaultWorkspace.trim() : "",
-            maxOutputChars: Number.isFinite(v.maxOutputChars) && v.maxOutputChars > 0 ? v.maxOutputChars : 40000,
-            maxSteps: Number.isFinite(v.maxSteps) && v.maxSteps >= 0 ? v.maxSteps : 100,
-            subagentMaxDepth: Number.isFinite(v.subagentMaxDepth) && v.subagentMaxDepth > 0 ? v.subagentMaxDepth : 3,
-            maxParallelSubagents: Number.isFinite(v.maxParallelSubagents) && v.maxParallelSubagents > 0 ? v.maxParallelSubagents : 5,
-            autoCompaction: typeof v.autoCompaction === "boolean" ? v.autoCompaction : true,
-            compactionThresholdRatio: Number.isFinite(v.compactionThresholdRatio) && v.compactionThresholdRatio > 0 ? Math.min(1, v.compactionThresholdRatio) : 0.8,
-            compactionMaxTokens: Number.isFinite(v.compactionMaxTokens) && v.compactionMaxTokens > 0 ? v.compactionMaxTokens : 8192,
-            rotateBytes: Number.isFinite(v.rotateBytes) && v.rotateBytes > 0 ? v.rotateBytes : 10,
-            rotateSummary: typeof v.rotateSummary === "boolean" ? v.rotateSummary : true,
-            rotateFallbackMsgs: Number.isFinite(v.rotateFallbackMsgs) && v.rotateFallbackMsgs > 0 ? v.rotateFallbackMsgs : 5,
-          };
-          const hostChanged = JSON.stringify(prev) !== JSON.stringify(next);
-          deps.onSaved(hostChanged);
-          // 保存结果提示显示在 VS Code 状态栏（非阻塞，几秒后自动消失）
-          vscode.window.setStatusBarMessage(
-            zh ? "✅ 配置已保存，将在下次使用时生效" : "✅ Settings saved; effective on next use",
-            5000
-          );
-          panel.webview.postMessage({
-            t: "saved",
-            ok: true,
-            message: zh ? "配置已保存，将在下次使用时生效" : "Settings saved; effective on next use",
-          });
+          if (typeof v.nodePath === "string") {
+            await cfg.update("nodePath", v.nodePath.trim(), runtimeTarget);
+          }
+          if (typeof v.defaultWorkspace === "string") {
+            await cfg.update("defaultWorkspace", v.defaultWorkspace.trim(), runtimeTarget);
+          }
+          if (typeof v.maxOutputChars === "number") {
+            await cfg.update("maxOutputChars", v.maxOutputChars > 0 ? v.maxOutputChars : 40000, runtimeTarget);
+          }
+          if (typeof v.maxSteps === "number") {
+            await cfg.update("maxSteps", v.maxSteps >= 0 ? v.maxSteps : 100, vscode.ConfigurationTarget.Global);
+          }
+          if (typeof v.subagentMaxDepth === "number") {
+            await cfg.update("subagentMaxDepth", v.subagentMaxDepth > 0 ? v.subagentMaxDepth : 3, vscode.ConfigurationTarget.Global);
+          }
+          if (typeof v.maxParallelSubagents === "number") {
+            await cfg.update("maxParallelSubagents", v.maxParallelSubagents > 0 ? v.maxParallelSubagents : 5, vscode.ConfigurationTarget.Global);
+          }
+          if (typeof v.autoCompaction === "boolean") {
+            await cfg.update("autoCompaction", v.autoCompaction, vscode.ConfigurationTarget.Global);
+          }
+          if (typeof v.compactionThresholdRatio === "number") {
+            await cfg.update("compactionThresholdRatio", v.compactionThresholdRatio > 0 ? Math.min(1, v.compactionThresholdRatio) : 0.8, vscode.ConfigurationTarget.Global);
+          }
+          if (typeof v.compactionMaxTokens === "number") {
+            await cfg.update("compactionMaxTokens", v.compactionMaxTokens > 0 ? v.compactionMaxTokens : 8192, vscode.ConfigurationTarget.Global);
+          }
+          if (typeof v.rotateBytes === "number") {
+            await cfg.update("rotateBytes", v.rotateBytes > 0 ? v.rotateBytes : 10, vscode.ConfigurationTarget.Global);
+          }
+          if (typeof v.rotateSummary === "boolean") {
+            await cfg.update("rotateSummary", v.rotateSummary, vscode.ConfigurationTarget.Global);
+          }
+          if (typeof v.rotateFallbackMsgs === "number") {
+            await cfg.update("rotateFallbackMsgs", v.rotateFallbackMsgs > 0 ? v.rotateFallbackMsgs : 5, vscode.ConfigurationTarget.Global);
+          }
+          // （enableCustom/enableLearning/enableAutoLearn 由"个性定制"组保存处理；
+          //  autoApproveRules 由"权限审批"组保存处理——本分支不再触碰，避免跨组覆盖）
           // 刷新面板状态：API Key 提示（keyConfigured）与各字段回显保存后的真实值
           await sendConfig();
         } catch (err) {
@@ -667,21 +674,32 @@ export function openConfigPanel(context: vscode.ExtensionContext, deps: ConfigPa
         break;
       }
       case "savePermission": {
-        // 权限审批：前端为权威，整体写回工具级规则列表 {match, action}
+        // "权限审批"组"保存"：整体写回工具级规则列表 {match, action}。**只落盘，不重启**
+        // ——autoApproveRules 变更在扩展侧已单独排除自动重启（onDidChangeConfiguration），
+        // 生效由功能组菜单"重启应用"（restartApply）统一触发。
         const raw = (msg as { rules?: unknown }).rules;
         const rules = Array.isArray(raw)
           ? raw
               .filter((r): r is { match?: string; action?: string } => Boolean(r) && typeof r === "object")
               .map((r) => ({ match: String(r.match ?? "").trim(), action: ["allow", "ask", "deny"].includes(String(r.action)) ? String(r.action) : "ask" }))
               .filter((r) => r.match && /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(r.match))
+              // 防御性查重：同名规则只保留第一条（前端已查重，此处兜底）
+              .filter((r, idx, arr) => arr.findIndex((x) => x.match === r.match) === idx)
           : [];
         await vscode.workspace.getConfiguration(CONFIG_NS).update("autoApproveRules", rules, vscode.ConfigurationTarget.Global);
+        deps.onSaved(false);
+        vscode.window.setStatusBarMessage(
+          zh ? "✅ 配置保存成功，重启宿主后生效" : "✅ Settings saved; effective after host restart",
+          5000
+        );
+        panel.webview.postMessage({ t: "saved", ok: true, message: zh ? "配置保存成功，重启宿主后生效" : "Settings saved; effective after host restart" });
         await sendConfig();
         break;
       }
-      case "applyPermission": {
-        // 权限审批"立即应用"：重启宿主使最新规则生效（规则本身已按条单独保存，不在此重复保存）
-        deps.onSaved(true);
+      case "restartApply": {
+        // "重启应用"功能组（命令入口）：确认弹框已由前端在配置**页面内**完成
+        // （modal 风格、标题 AY-DSH、确认/取消各一个），此处只执行重启。
+        deps.onSaved(true); // 锁定 UI + 重启宿主 + 就绪后自动恢复原会话
         break;
       }
       case "dshQuery":
@@ -717,6 +735,18 @@ function renderHtml(webview: vscode.Webview, scriptUri: vscode.Uri, styleUri: vs
     groupRuntime: zh ? "运行环境" : "Runtime",
     groupControl: zh ? "控制参数" : "Control",
     groupLog: zh ? "日志管理" : "Logs",
+    groupPersonal: zh ? "个性定制" : "Personalization",
+    customPromptTitle: zh ? "用户定制品格" : "Custom persona",
+    learningTitle: zh ? "自动学习经验" : "Learned rules",
+    editBtn: zh ? "编辑" : "Edit",
+    enableCustom: zh ? "启用定制" : "Enable customization",
+    enableLearning: zh ? "启用经验" : "Enable learned rules",
+    enableAutoLearn: zh ? "启动学习" : "Auto-learn",
+    on: zh ? "开" : "On",
+    off: zh ? "关" : "Off",
+    customPromptHint: zh ? "点击“编辑”用 VS Code 编辑器修改“用户定制品格”内容（首次编辑自动创建文件）；改完点本组“保存”落盘，再到左侧“重启应用”功能组重启宿主后生效。" : "Click Edit to modify your custom persona in the VS Code editor (auto-created on first edit); then Save in this group, and restart the host via the “Restart & Apply” group on the left.",
+    learningHint: zh ? "点击“编辑”用 VS Code 编辑器修改“自动学习经验”内容（首次编辑自动创建文件）；改完点本组“保存”落盘，再到左侧“重启应用”功能组重启宿主后生效。" : "Click Edit to modify your learned rules in the VS Code editor (auto-created on first edit); then Save in this group, and restart the host via the “Restart & Apply” group on the left.",
+    saveCustom: zh ? "保存" : "Save",
     rotateBytes: zh ? "会话轮转阈值（MB）" : "Session rotation threshold (MB)",
     rotateBytesHint: zh ? "会话日志超过该大小（MB）时自动轮转，创建新会话继续（默认 10）" : "Rotate when the session log exceeds this size (MB); a new session continues (default 10)",
     rotateSummary: zh ? "轮转时生成对话摘要" : "Summarize conversation on rotation",
@@ -725,7 +755,7 @@ function renderHtml(webview: vscode.Webview, scriptUri: vscode.Uri, styleUri: vs
     rotateSummaryOff: zh ? "关" : "Off",
     rotateFallbackMsgs: zh ? "摘要失败时保留的消息条数" : "Messages kept when summarization fails",
     rotateFallbackMsgsHint: zh ? "LLM 摘要不可用时，从倒数第 N 条用户输入起保留对话原文（默认 5）" : "When the LLM summary fails, keep conversation from the Nth-last user input (default 5)",
-    saveLog: zh ? "保存并应用" : "Save & Apply",
+    saveLog: zh ? "保存" : "Save",
     workspace: zh ? "默认工作目录（未打开文件夹时）" : "Default working directory (when no folder is open)",
     workspaceHint: zh ? "Agent 生成的文件保存位置；留空使用 ~/ay-dsh-workspace" : "Where agent files are saved; empty uses ~/ay-dsh-workspace",
     cwd: zh ? "当前工作目录" : "Current working directory",
@@ -744,8 +774,8 @@ function renderHtml(webview: vscode.Webview, scriptUri: vscode.Uri, styleUri: vs
     maxParallelHint: zh ? "多 Agent 模式下同时派发的子代理数量上限（默认 5）" : "Max concurrently dispatched subagents in multi-agent mode (default 5)",
     autoCompaction: zh ? "自动压缩上下文" : "Auto compact context",
     autoCompactionHint: zh ? "上下文占比接近上限时自动归纳为摘要，释放空间" : "When context share nears the limit, summarize older history to free space",
-    groupPermission: zh ? "权限审批" : "Approval",
-    permissionHint: zh ? "自动授权规则：命中的工具调用按所选动作处理——允许 = 自动放行，不再弹审批框；询问 = 仍会弹框请您确认；拒绝 = 直接拒绝。仅对命中的工具生效，其余调用照常审批。" : "Auto-approval rules: a matched tool call follows the selected action — Allow = auto-approved without prompting; Ask = still prompts for your confirmation; Deny = rejected outright. Only matched tools are affected; others keep normal approval.",
+    groupPermission: zh ? "自动授权规则" : "Auto-approval rules",
+    permissionHint: zh ? "命中的工具调用按所选动作处理——允许 = 自动放行，不再弹审批框；询问 = 仍会弹框请您确认；拒绝 = 直接拒绝。仅对命中的工具生效，其余调用照常审批。" : "A matched tool call follows the selected action — Allow = auto-approved without prompting; Ask = still prompts for your confirmation; Deny = rejected outright. Only matched tools are affected; others keep normal approval.",
     permissionCommandNote: zh ? "由于 DSH 内核暂未提供具体命令参数，这里仅支持工具级匹配（如 glob / grep / read），暂不支持带参数命令甄别（如 git status）。" : "Because the DSH kernel does not expose command arguments yet, only tool-level matches are supported here (e.g. glob / grep / read); command-level rules (e.g. git status) are not supported.",
     permissionMatch: zh ? "工具名" : "Tool",
     permissionAction: zh ? "动作" : "Action",
@@ -763,8 +793,9 @@ function renderHtml(webview: vscode.Webview, scriptUri: vscode.Uri, styleUri: vs
     compactMaxTokens: zh ? "压缩摘要 token 上限" : "Compaction summary token cap",
     compactMaxTokensHint: zh ? "一次压缩生成的摘要最大 token 数（默认 8192）" : "Max tokens in one compaction summary (default 8192)",
     browse: zh ? "浏览…" : "Browse…",
-    save: zh ? "保存并应用" : "Save & Apply",
+    save: zh ? "保存" : "Save",
     groupUpgrade: zh ? "版本升级" : "Upgrades",
+    groupRestartApply: zh ? "重启应用" : "Restart & Apply",
     dshSection: zh ? "DSH 核心升级" : "DSH Core",
     pluginSection: zh ? "AY-DSH-VSCode 插件升级" : "AY-DSH-VSCode extension",
     dshCurrent: zh ? "当前 DSH 核心版本" : "Current DSH core version",
@@ -815,7 +846,9 @@ function renderHtml(webview: vscode.Webview, scriptUri: vscode.Uri, styleUri: vs
     <button type="button" class="cfg-nav" data-group="control">${L.groupControl}</button>
     <button type="button" class="cfg-nav" data-group="permission">${L.groupPermission}</button>
     <button type="button" class="cfg-nav" data-group="log">${L.groupLog}</button>
+    <button type="button" class="cfg-nav" data-group="personal">${L.groupPersonal}</button>
     <button type="button" class="cfg-nav" data-group="upgrade">${L.groupUpgrade}</button>
+    <button type="button" class="cfg-nav" data-group="restartApply">${L.groupRestartApply}</button>
   </nav>
 
   <section class="cfg-content">
@@ -855,6 +888,9 @@ function renderHtml(webview: vscode.Webview, scriptUri: vscode.Uri, styleUri: vs
             <button type="button" class="secondary" id="cfgPickNode">${L.browse}</button>
           </div>
           <span class="hint">${L.nodePathHint}</span>
+        </div>
+        <div class="cfg-group-actions">
+          <button type="button" class="primary" id="cfgSaveRuntime">${L.save}</button>
         </div>
       </div>
     </div>
@@ -909,6 +945,9 @@ function renderHtml(webview: vscode.Webview, scriptUri: vscode.Uri, styleUri: vs
           <input type="number" id="cfgCompactMaxTokens" min="1" step="1000" value="8192">
           <span class="hint">${L.compactMaxTokensHint}</span>
         </div>
+        <div class="cfg-group-actions">
+          <button type="button" class="primary" id="cfgSaveControl">${L.save}</button>
+        </div>
       </div>
     </div>
 
@@ -921,6 +960,9 @@ function renderHtml(webview: vscode.Webview, scriptUri: vscode.Uri, styleUri: vs
           <button type="button" class="secondary" id="cfgAddPermission">${L.permissionAdd}</button>
         </div>
         <p class="hint permission-note">${L.permissionCommandNote}</p>
+        <div class="cfg-group-actions">
+          <button type="button" class="primary" id="cfgSavePermission">${L.save}</button>
+        </div>
       </div>
     </div>
 
@@ -943,6 +985,51 @@ function renderHtml(webview: vscode.Webview, scriptUri: vscode.Uri, styleUri: vs
           <label for="cfgRotateFallbackMsgs">${L.rotateFallbackMsgs}</label>
           <input type="number" id="cfgRotateFallbackMsgs" min="1" step="1" value="5">
           <span class="hint">${L.rotateFallbackMsgsHint}</span>
+        </div>
+        <div class="cfg-group-actions">
+          <button type="button" class="primary" id="cfgSaveLog">${L.save}</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="cfg-group" data-group="personal">
+      <div class="cfg-pane active" data-pane="main">
+        <div class="field">
+          <div class="checkbox-row">
+            <input type="checkbox" id="cfgEnableCustom" checked>
+            <span class="hint" id="cfgEnableCustomState">${L.on}</span>
+            <label for="cfgEnableCustom">${L.enableCustom}</label>
+          </div>
+          <span class="hint" id="cfgEnableCustomHint">…</span>
+          <div class="field-label-row">
+            <label for="cfgCustomPrompt">${L.customPromptTitle}</label>
+            <button type="button" id="btnEditCustom" class="icon-btn small">${L.editBtn}</button>
+          </div>
+          <div id="cfgCustomPrompt" class="readonly-box markdown-box"></div>
+          <span class="hint">${L.customPromptHint}</span>
+        </div>
+        <div class="field">
+          <div class="checkbox-row">
+            <input type="checkbox" id="cfgEnableLearning" checked>
+            <span class="hint" id="cfgEnableLearningState">${L.on}</span>
+            <label for="cfgEnableLearning">${L.enableLearning}</label>
+          </div>
+          <span class="hint" id="cfgEnableLearningHint">…</span>
+          <div class="checkbox-row">
+            <input type="checkbox" id="cfgEnableAutoLearn" checked>
+            <span class="hint" id="cfgEnableAutoLearnState">${L.on}</span>
+            <label for="cfgEnableAutoLearn">${L.enableAutoLearn}</label>
+          </div>
+          <span class="hint" id="cfgEnableAutoLearnHint">…</span>
+          <div class="field-label-row">
+            <label for="cfgLearning">${L.learningTitle}</label>
+            <button type="button" id="btnEditLearning" class="icon-btn small">${L.editBtn}</button>
+          </div>
+          <div id="cfgLearning" class="readonly-box markdown-box"></div>
+          <span class="hint">${L.learningHint}</span>
+        </div>
+        <div class="cfg-group-actions">
+          <button type="button" class="primary" id="cfgSavePersonal">${L.save}</button>
         </div>
       </div>
     </div>
@@ -985,13 +1072,8 @@ function renderHtml(webview: vscode.Webview, scriptUri: vscode.Uri, styleUri: vs
         </div>
       </div>
     </div>
-  </section>
-</div>
 
-<div class="cfg-footer">
-  <div class="actions">
-    <button type="button" class="primary" id="cfgSave">${L.save}</button>
-  </div>
+  </section>
 </div>
 
 <script src="${scriptUri.toString()}"></script>

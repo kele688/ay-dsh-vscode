@@ -1047,6 +1047,25 @@ function attachAgent(ctx, handle, pump) {
     };
   });
 
+  // 用户自定义系统提示词 + 自动学习经验（DSH home 固定文件，跨项目共享）。
+  // **agent 启动时快照一次，本 agent 生命周期内保持稳定**——频繁变化的系统
+  // 提示词会使模型 KV 缓存前缀失效，每次变化都是费用灾难。新内容在宿主重启
+  // （配置面板"保存并应用"）或新建会话（agent 重建 → 重新快照）后生效。
+  // "启用定制"/"启用经验"开关（DSH_ENABLE_CUSTOM / DSH_ENABLE_LEARNING=0 关闭）
+  // 关闭时即使文件有内容也不加载。
+  const enableCustom = String(process.env.DSH_ENABLE_CUSTOM ?? "0") !== "0";
+  const enableLearning = String(process.env.DSH_ENABLE_LEARNING ?? "0") !== "0";
+  const customPrompt = enableCustom ? readTextFile(CUSTOM_PROMPT_FILE) : "";
+  const learningText = enableLearning ? readTextFile(LEARNING_FILE) : "";
+  agent.ctx.on("system-prompt/assemble", async (_assembly, _context, next) => {
+    const assembled = await next();
+    const sections = [...(assembled.sections ?? [])];
+    if (customPrompt) sections.push({ name: "user-custom-prompt", text: customPrompt });
+    if (learningText) sections.push({ name: "user-learning", text: `以下是从既往对话沉淀的工作经验，请自觉遵守：\n${learningText}` });
+    if (sections.length === (assembled.sections ?? []).length) return assembled;
+    return { ...assembled, sections };
+  });
+
   return { resetStepBudget };
 }
 
@@ -1374,6 +1393,80 @@ async function summarizeUserMessages(ctx, agent, texts, signal) {
   } catch (e) {
     log("warn", "rotate summary llm failed", e instanceof Error ? e.message : String(e));
     return "";
+  }
+}
+
+/** 用户自定义提示词 / 自动学习经验文件（DSH home 固定路径固定文件名）：
+ *  跨项目全局共享（非每个项目一份）；本地与 Remote 的 DSH home 各自独立维护。
+ *  文件不存在/为空即不注入，不影响默认提示词。 */
+const CUSTOM_PROMPT_FILE = join(resolveDshHome(), "ay-dsh-custom.md");
+const LEARNING_FILE = join(resolveDshHome(), "ay-dsh-learning.md");
+
+/** 读文件文本（不存在/空/异常返回空串）。 */
+function readTextFile(p) {
+  try {
+    if (!existsSync(p)) return "";
+    return readFileSync(p, "utf8").trim();
+  } catch { /* ignore */ }
+  return "";
+}
+
+/** 自动学习信号：用户消息出现明确的规则/指示表达才触发提炼（避免每轮都调 LLM）。 */
+const LEARNING_SIGNAL_RE = /记住|教训|经验|以后|规则|禁止|不要|千万别|务必|必须|always|never|remember|rule|lesson|do not|don't/i;
+
+/** 自动学习：检测用户消息中的"明确规则/被肯定经验"信号，用 LLM 提炼一条简洁
+ *  经验，追加到工作区学习文件（去重：已存在相同条目则跳过）。异步、静默失败。 */
+async function maybeLearnFromTurn(ctx, agent, userText) {
+  // "启动学习"开关（DSH_ENABLE_LEARN=0 关闭）：关闭时不做自动学习
+  if (String(process.env.DSH_ENABLE_LEARN ?? "0") === "0") return;
+  if (typeof userText !== "string" || userText.trim() === "") return;
+  if (!LEARNING_SIGNAL_RE.test(userText)) return;
+  const llm = ctx.get("llm");
+  if (llm === undefined || typeof llm.stream !== "function") return;
+  const latest = agent.session.requestHeader?.()?.config;
+  const target = (agent.options?.provider && agent.options?.model)
+    ? { provider: agent.options.provider, model: agent.options.model }
+    : latest;
+  if (target === undefined) return;
+  const input = userText.trim().slice(0, 4000);
+  const instruction =
+    "你是经验提炼助手。下面是一轮对话中用户的发言（可能含少量 AI 回复）。"
+    + "请提取用户**明确提出**的工作规则、偏好或对 AI 行为的肯定/纠正，写成一条简洁经验。"
+    + "要求：1) 一条一行，20~80 字，陈述句；2) 只提取明确陈述的规则/经验，忽略闲聊与事实问答；"
+    + "3) 若没有任何明确的规则或经验，只输出空字符串，不要编造。\n\n";
+  const messages = [
+    createUserMessage({
+      content: [{ type: "text", text: instruction + input }],
+      source: { kind: "plugin", plugin: "dsh-vscode-host" },
+    }),
+  ];
+  try {
+    const assembler = new BlockAssembler();
+    for await (const chunk of llm.stream({
+      provider: target.provider,
+      model: target.model,
+      messages,
+      maxTokens: 200,
+      sessionId: agent.session.id,
+      signal: new AbortController().signal,
+    })) {
+      assembler.push(chunk);
+    }
+    const text = assembler.blocks()
+      .map((b) => (b.type === "text" ? b.text : ""))
+      .join("")
+      .trim();
+    if (text.length === 0) return;
+    const clean = text.replace(/^[-•*\s]+/, "").slice(0, 200);
+    const file = LEARNING_FILE;
+    const existing = existsSync(file) ? readFileSync(file, "utf8") : "";
+    if (existing.includes(clean)) return; // 简单去重：已存在相同条目
+    const next = existing.trim() ? `${existing.trim()}\n\n- ${clean}` : `- ${clean}`;
+    mkdirSync(dirname(file), { recursive: true });
+    writeFileSync(file, next, "utf8");
+    log("info", `learned rule: ${clean}`);
+  } catch (e) {
+    log("warn", "auto-learn llm failed", e instanceof Error ? e.message : String(e));
   }
 }
 
@@ -2143,6 +2236,9 @@ async function main() {
               })
             );
             await agent.whenIdle();
+            // 自动学习：本轮用户消息含明确"规则/经验"信号时，LLM 提炼并追加到
+            // 工作区学习文件（异步、静默，不阻塞 chatDone；失败不影响对话）
+            void maybeLearnFromTurn(ctx, agent, text).catch(() => {});
             // 关键：chatDone 前必须 flush 事件泵，否则最后一条 assistant/message
             // （含最终总结文本与 usage）会晚于"完成"信号到达扩展，导致 UI 已显示
             // 完成但总结文本缺失（表现为"卡在最后总结阶段"）。

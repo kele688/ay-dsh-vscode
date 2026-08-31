@@ -69,6 +69,12 @@ export interface AgentHostOptions {
   rotateSummary?: boolean;
   /** 会话轮转：摘要不可用时的 fallback 消息条数（默认 5）。 */
   rotateFallbackMsgs?: number;
+  /** 个性定制：agent 启动时是否加载 ay-dsh-custom.md（默认 true）。 */
+  enableCustom?: boolean;
+  /** 个性定制：agent 启动时是否加载 ay-dsh-learning.md 经验（默认 true）。 */
+  enableLearning?: boolean;
+  /** 个性定制：是否自动学习（宿主提炼用户明确规则写入学习文件，默认 true）。 */
+  enableAutoLearn?: boolean;
   /** 插件专属的 DSH home 目录（会话/配置均存于此，与官方 dsh 完全隔离）。 */
   dshHome: string;
   /** 旧 DSH home（用于一次性迁移历史会话）。 */
@@ -290,8 +296,14 @@ export class AgentHost {
       DSH_COMPACTION_THRESHOLD_RATIO: String(this.options.compactionThresholdRatio ?? 0.8),
       DSH_COMPACTION_MAX_TOKENS: String(this.options.compactionMaxTokens ?? 8192),
       DSH_ROTATE_BYTES: String((this.options.rotateBytes ?? 10) * 1024 * 1024),
-      DSH_ROTATE_SUMMARY: String(this.options.rotateSummary ?? true),
       DSH_ROTATE_FALLBACK_MSGS: String(this.options.rotateFallbackMsgs ?? 5),
+      // 布尔开关统一注入 "0"/"1"：与宿主侧 `!== "0"` / `=== "0"` 检查格式一致。
+      // （此前注入 String(false)="false"，被宿主误判为开启——关闭状态全部失效，
+      //  表现为未使能"启动学习"仍在写入自动学习经验。）
+      DSH_ENABLE_CUSTOM: this.options.enableCustom ? "1" : "0",
+      DSH_ENABLE_LEARNING: this.options.enableLearning ? "1" : "0",
+      DSH_ENABLE_LEARN: this.options.enableAutoLearn ? "1" : "0",
+      DSH_ROTATE_SUMMARY: (this.options.rotateSummary ?? true) ? "1" : "0",
       DSH_TELEMETRY_DISABLED: "1",
       // 统一子进程文本编码为 UTF-8：Windows PowerShell 5.1 / Python 默认按
       // 系统代码页（GBK）输出中文，Node 侧按 UTF-8 读取会乱码。

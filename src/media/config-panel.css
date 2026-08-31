@@ -114,6 +114,19 @@ h1 {
 .cfg-footer .actions {
   margin-top: 0;
 }
+.cfg-group-actions {
+  /* 组内"保存"按钮：右下角靠右、与上方配置区明显拉开距离（延续原底部 footer 经验） */
+  margin-top: 48px;
+  padding: 0 20px;
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 14px;
+}
+/* 确认弹框按钮：文字不换行（避免"确认"/"取消"在窄弹框里被折断） */
+.modal.confirm-modal .row button {
+  white-space: nowrap;
+}
 
 /* ---- 已接入提供商：列表 / 按钮 / 编辑表单 ---- */
 .sub-title {
@@ -367,6 +380,76 @@ input.invalid {
   max-width: 150px;
 }
 #cfgPermissionMode,
+/* 个性定制：标签与"编辑"按钮同一行（左标签右按钮） */
+.field-label-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin: 8px 0 4px;
+}
+/* 只读预览框（markdown 渲染）：最小 10 行、最大 20 行，内容再多出现滚动条 */
+.readonly-box {
+  width: 100%;
+  min-height: calc(1.5em * 10 + 12px);
+  max-height: calc(1.5em * 20 + 12px);
+  overflow-y: auto;
+  resize: vertical;
+  box-sizing: border-box;
+  font-family: var(--vscode-editor-font-family, inherit);
+  font-size: 12px;
+  line-height: 1.5;
+  padding: 6px 8px;
+  background: var(--vscode-input-background, #1e1e1e);
+  color: var(--vscode-input-foreground, #cccccc);
+  border: 1px solid var(--vscode-input-border, transparent);
+  border-radius: 3px;
+}
+.readonly-box h1,
+.readonly-box h2,
+.readonly-box h3,
+.readonly-box h4,
+.readonly-box h5,
+.readonly-box h6 {
+  margin: 0.4em 0 0.2em;
+  font-weight: 600;
+  line-height: 1.3;
+}
+.readonly-box h1 { font-size: 1.4em; }
+.readonly-box h2 { font-size: 1.25em; }
+.readonly-box h3 { font-size: 1.1em; }
+.readonly-box p { margin: 0.3em 0; }
+.readonly-box li { margin: 0.15em 0; }
+.readonly-box pre {
+  background: var(--vscode-textCodeBlock-background, rgba(127, 127, 127, 0.15));
+  padding: 6px;
+  border-radius: 3px;
+  overflow-x: auto;
+}
+.readonly-box code {
+  font-family: var(--vscode-editor-font-family, inherit);
+  font-size: 0.95em;
+}
+.readonly-box a {
+  color: var(--vscode-textLink-foreground, #3794ff);
+}
+/* 个性定制：开关文字与勾选框下边沿对齐、更贴近勾选框 */
+.cfg-group[data-group="personal"] .checkbox-row {
+  align-items: flex-end;
+  gap: 4px;
+}
+/* 个性定制：编辑按钮与主按钮一致的蓝色 */
+.cfg-group[data-group="personal"] .field-label-row .icon-btn {
+  background: var(--vscode-button-background, #0e639c);
+  color: var(--vscode-button-foreground, #ffffff);
+  border: none;
+  border-radius: 3px;
+}
+/* 个性定制：上下两个配置区（用户定制品格 / 自动学习经验）明显分隔 */
+.cfg-group[data-group="personal"] .field + .field {
+  margin-top: 20px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border, #ddd);
+}
 #pfProtocol {
   max-width: 380px;
 }
@@ -427,6 +510,20 @@ input.invalid {
 }
 .permission-rule-row:last-child {
   border-bottom: none;
+}
+/* 系统默认规则标注（只读展示）：弱化样式 + 左侧分隔 */
+.permission-system-badge {
+  font-size: 11px;
+  color: var(--vscode-descriptionForeground);
+  opacity: 0.8;
+  white-space: nowrap;
+  padding-left: 8px;
+  border-left: 1px solid var(--vscode-widget-border, rgba(128, 128, 128, 0.35));
+}
+.permission-rule-row input[type="text"]:read-only,
+.permission-rule-row select:disabled {
+  cursor: default;
+  color: var(--vscode-descriptionForeground);
 }
 .permission-rule-row input[type="text"],
 .permission-rule-row select {
