@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.5.0] - 2026-08-31
+
+- per-group Save buttons persist only (no host restart)
+- Restart & Apply group/command restarts host once after confirmation
+- fix boolean env switch injection so off-state actually disables
+- register 6 missing config keys (rotate*/enable*)
+- approval rules show read-only system defaults and reject duplicate tool names
+- personality prompt injection + auto-learning gated by enable switches
+- fix missing L.on/L.off i18n keys
+
 ## [0.4.1] - 2026-08-27
 
 - tool-level auto-approval rules

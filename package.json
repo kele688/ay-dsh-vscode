@@ -2,7 +2,7 @@
   "name": "ay-dsh-vscode",
   "displayName": "ay-dsh-vscode",
   "description": "AI coding agent powered by DeepSeek Harness (DSH): multi-agent orchestration, long-running goal tasks, transparent tool usage, sandboxed approvals — in a Kilo Code style chat.",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "publisher": "kele688",
   "license": "MIT",
   "icon": "media/icon.png",
