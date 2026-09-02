@@ -1,5 +1,9 @@
 # 更新日志
 
+## [0.5.1] - 2026-09-02
+
+- fix: session rotation summary/title & idle-check, stats reset, ripgrep exec, bump lock sync
+
 ## [0.5.0] - 2026-08-31
 
 - 各组独立保存按钮仅落盘不重启

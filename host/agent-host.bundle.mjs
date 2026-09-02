@@ -140003,7 +140003,7 @@ function installModelSelection(agentCtx, selection) {
 
 // host/agent-host.mjs
 var NAME2 = "dsh-vscode-host";
-var CORE_VERSION = "0.5.0";
+var CORE_VERSION = "0.5.1";
 var SESSION_PREFIX = "dsh-vscode-";
 var workMode = "single";
 var getWorkMode = () => workMode;

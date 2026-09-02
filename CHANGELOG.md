@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.5.1] - 2026-09-02
+
+- fix: session rotation summary/title & idle-check, stats reset, ripgrep exec, bump lock sync
+
 ## [0.5.0] - 2026-08-31
 
 - per-group Save buttons persist only (no host restart)
