@@ -79,6 +79,8 @@ export type HostFrame =
   | { t: "modelAdapted"; provider: string; model: string; from: string; to: string }
   | { t: "stats"; stats: SessionStats }
   | { t: "sessionRotated"; oldTitle?: string; newTitle?: string; sessionBytes?: number }
+  | { t: "rotateRequest"; oldTitle?: string; sessionBytes?: number }
+  | { t: "rotateWorking" }
   | { t: "exit"; code: number; error?: string };
 
 /** Extension -> Host */
@@ -107,6 +109,7 @@ export type ExtensionFrame =
       id: number;
       providers: { id: string; name?: string; baseUrl?: string; protocol?: string; models?: { id: string; displayName?: string; contextWindow?: number | string; maxOutput?: number | string }[]; apiKey?: string }[];
     }
+  | { t: "rotateConfirm"; ok: boolean }
   | { t: "shutdown" };
 
 /** 提供商配置同步项（配置面板 → 宿主 llm-pi-ai settings，热生效）。 */
@@ -157,7 +160,8 @@ export type WebviewMessage =
   | { t: "hint"; text: string }
   | { t: "dshUpgrade" }
   | { t: "dshIgnore" }
-  | { t: "dshDetails" };
+  | { t: "dshDetails" }
+  | { t: "rotateConfirm"; ok: boolean };
 
 /** Extension -> Webview 的消息。 */
 export type ExtensionToWebview =
@@ -195,4 +199,6 @@ export type ExtensionToWebview =
   | { t: "sessionTitleSynced"; id: string; title: string }
   | { t: "sessionExported"; ok: boolean; path?: string; error?: string }
   | { t: "sessionRotated"; oldTitle?: string; newTitle?: string; sessionBytes?: number }
+  | { t: "rotateRequest"; oldTitle?: string; sessionBytes?: number }
+  | { t: "rotateWorking" }
   | { t: "sessionSize"; bytes: number };

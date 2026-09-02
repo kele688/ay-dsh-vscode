@@ -113,6 +113,8 @@ export type HostEvent =
   | { type: "stepLimit"; maxSteps: number; steps: number }
   | { type: "modelAdapted"; provider: string; model: string; from: string; to: string }
   | { type: "sessionRotated"; oldTitle?: string; newTitle?: string; sessionBytes?: number }
+  | { type: "rotateRequest"; oldTitle?: string; sessionBytes?: number }
+  | { type: "rotateWorking" }
   | { type: "sessionSize"; bytes: number }
   | { type: "exit"; code: number; error?: string }
   | { type: "log"; level: string; message: string };
@@ -501,6 +503,16 @@ export class AgentHost {
         this.emit({ type: "sessionRotated", oldTitle: frame.oldTitle, newTitle: frame.newTitle, sessionBytes: frame.sessionBytes });
         break;
       }
+      case "rotateRequest": {
+        // 会话轮转**确认请求**（日志超限）：请求前端弹确认框，用户确认后才轮转
+        this.emit({ type: "rotateRequest", oldTitle: frame.oldTitle, sessionBytes: frame.sessionBytes });
+        break;
+      }
+      case "rotateWorking": {
+        // 轮转执行中（摘要生成/新会话创建）：前端锁定发送并提示状态
+        this.emit({ type: "rotateWorking" });
+        break;
+      }
       case "sessionResumed": {
         this.emit({ type: "sessionResumed", id: frame.id, ok: frame.ok, error: frame.error });
         break;
@@ -874,6 +886,11 @@ export class AgentHost {
 
   exportSession(id: string): void {
     this.send({ t: "exportSession", id });
+  }
+
+  /** 会话轮转确认（用户在前端确认框选择）：ok=true 立即轮转；ok=false 当天不再检测。 */
+  rotateConfirm(ok: boolean): void {
+    this.send({ t: "rotateConfirm", ok });
   }
 
   /** 请求宿主上报可用的 provider / model 列表与当前选择（下拉选择器数据源）。 */

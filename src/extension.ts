@@ -537,7 +537,33 @@ function openDshDetails(version: string): void {
 
 
 
+/**
+ * 跨平台打包修复：vsce 在 Windows 上打 VSIX（zip）不保留 Unix 可执行权限位，
+ * 远端 Linux/macOS（remote-ssh / remote-wsl）解压后，打包的
+ * `@vscode/ripgrep-<plat>/bin/rg` 无执行权限 → grep/glob 工具 spawn 失败
+ * （EACCES / "ripgrep launch failed"）。激活时对平台包 rg 补 chmod +x。
+ * （Windows 无 exec 位概念，跳过；失败不影响扩展启动，仅 grep/glob 下次仍失败。）
+ */
+function fixPackagedRipgrepExec(extensionPath: string): void {
+  if (process.platform !== "linux" && process.platform !== "darwin") return;
+  try {
+    const scoped = path.join(extensionPath, "node_modules", "@vscode");
+    if (!fs.existsSync(scoped)) return;
+    for (const entry of fs.readdirSync(scoped)) {
+      if (!/^ripgrep-(linux|darwin)-/.test(entry)) continue;
+      const rg = path.join(scoped, entry, "bin", "rg");
+      if (fs.existsSync(rg)) {
+        fs.chmodSync(rg, 0o755);
+      }
+    }
+  } catch {
+    // 修复失败不阻塞扩展启动（grep/glob 调用点有独立错误处理）
+  }
+}
+
 export function activate(context: vscode.ExtensionContext): void {
+  // 远端平台：恢复打包 ripgrep 的可执行权限（见 fixPackagedRipgrepExec 注释）
+  fixPackagedRipgrepExec(context.extensionPath);
   provider = new ChatViewProvider({
     extensionUri: context.extensionUri,
     // 当前生效 DSH 版本（升级后 = 采纳版本；未升级 = VSIX 内置），顶栏展示

@@ -140003,7 +140003,7 @@ function installModelSelection(agentCtx, selection) {
 
 // host/agent-host.mjs
 var NAME2 = "dsh-vscode-host";
-var CORE_VERSION = "0.4.1";
+var CORE_VERSION = "0.5.0";
 var SESSION_PREFIX = "dsh-vscode-";
 var workMode = "single";
 var getWorkMode = () => workMode;
@@ -140752,9 +140752,11 @@ function tailConversationText(events, lastUserCount) {
   const userSeqs = [];
   const msgs = [];
   for (const e2 of events) {
-    if (e2.type === "user/message" && e2.message?.source?.kind === "user") userSeqs.push(e2.seq);
+    const d = e2.data ?? {};
+    if (e2.type === "user/message" && d.source?.kind === "user") userSeqs.push(e2.seq);
     if (e2.type === "user/message" || e2.type === "assistant/message") {
-      const text = (e2.message?.content ?? []).map((b) => b.type === "text" ? b.text : "").join("").trim();
+      const content = e2.type === "user/message" ? d.content : d.message?.content ?? d.content;
+      const text = (content ?? []).map((b) => b.type === "text" ? b.text : "").join("").trim();
       if (text !== "") {
         msgs.push({ seq: e2.seq, text: `${e2.type === "user/message" ? "\u7528\u6237" : "AI"}\uFF1A${text}` });
       }
@@ -140770,9 +140772,9 @@ async function summarizeUserMessages(ctx, agent, texts, signal) {
   const latest = agent.session.requestHeader?.()?.config;
   const target = agent.options?.provider && agent.options?.model ? { provider: agent.options.provider, model: agent.options.model } : latest;
   if (target === void 0) return "";
-  const joined = texts.slice(-12e3);
+  const joined = texts.slice(-15e4);
   if (joined.length === 0) return "";
-  const instruction = "\u4F60\u662F\u5BF9\u8BDD\u6458\u8981\u52A9\u624B\u3002\u8BF7\u5BF9\u4E0B\u9762\u8FD9\u6BB5\u7528\u6237\u4E0E AI \u7684\u534F\u4F5C\u5BF9\u8BDD\u505A\u7B80\u660E\u6458\u8981\uFF0C\u4FDD\u7559\uFF1A\u5173\u952E\u95EE\u9898\u3001\u4EFB\u52A1\u76EE\u6807\u3001\u5DF2\u505A\u51FA\u7684\u51B3\u7B56\u3001\u5F85\u529E\u4E8B\u9879\u3001\u91CD\u8981\u7ED3\u8BBA\u3002\u53EA\u8F93\u51FA\u6458\u8981\u6B63\u6587\uFF0C\u4E0D\u8981\u89E3\u91CA\uFF0C\u63A7\u5236\u5728 300 \u5B57\u4EE5\u5185\u3002\n\n";
+  const instruction = "\u4F60\u662F\u5BF9\u8BDD\u6458\u8981\u52A9\u624B\u3002\u8BF7\u901A\u8BFB\u4EE5\u4E0B\u4F1A\u8BDD\u5185\u5BB9\uFF08\u53EF\u80FD\u662F\u5F88\u957F\u5BF9\u8BDD\u7684\u6700\u8FD1\u90E8\u5206\uFF09\uFF0C\u8F93\u51FA\u8BE5\u4F1A\u8BDD\u7684\u7B80\u660E\u6458\u8981\uFF0C\u8986\u76D6\uFF1A\u6574\u4F53\u4EFB\u52A1\u76EE\u6807\u3001\u5DF2\u5B8C\u6210\u7684\u91CD\u70B9\u5DE5\u4F5C\u3001\u5173\u952E\u51B3\u7B56\u4E0E\u7ED3\u8BBA\u3001\u5F53\u524D\u8FDB\u5EA6\u3001\u5F85\u529E\u4E8B\u9879\u3002\u4E0D\u8981\u590D\u8FF0\u5BF9\u8BDD\u8FC7\u7A0B\uFF0C\u53EA\u8F93\u51FA\u6458\u8981\u6B63\u6587\uFF0C\u63A7\u5236\u5728 500 \u5B57\u4EE5\u5185\u3002\n\n";
   const messages = [
     createUserMessage({
       content: [{ type: "text", text: instruction + joined }],
@@ -140785,7 +140787,9 @@ async function summarizeUserMessages(ctx, agent, texts, signal) {
       provider: target.provider,
       model: target.model,
       messages,
-      maxTokens: 600,
+      // maxTokens 需覆盖推理模型的 reasoning 消耗：600 会被思考吃光导致正文截断，
+      // 2048 保证 reasoning + 摘要正文都有余量
+      maxTokens: 2048,
       sessionId: agent.session.id,
       purpose: "rotate-session",
       signal
@@ -141193,15 +141197,9 @@ async function exportSession(ctx, sessionId) {
 }
 async function main() {
   const env2 = { ...process.env };
-  let rotateCheckCb = null;
   const pump2 = new EventPump(
     () => agent === void 0 || agent.session === void 0 ? void 0 : sessionFileSize(String(agent.session.id)),
-    () => {
-      try {
-        rotateCheckCb?.();
-      } catch {
-      }
-    }
+    void 0
   );
   const approvals = { nextId: /* @__PURE__ */ (() => {
     let n = 0;
@@ -141213,8 +141211,13 @@ async function main() {
   let selection = null;
   let resetStepBudget = null;
   let shuttingDown = false;
+  let rotateRetryTimer = null;
   let agentBusy = false;
   let pendingSessionId = null;
+  let rotateRejectedDate = "";
+  let rotateConfirmResolve = null;
+  let rotateConfirmOk = false;
+  let rotating = false;
   try {
     ctx = await bootTree();
     log("info", "DSH tree booted");
@@ -141236,12 +141239,35 @@ async function main() {
       return m2 ? Number(m2[1]) + 1 : 1;
     };
     async function maybeRotateSession() {
-      if (agent === void 0 || pendingSessionId !== null || shuttingDown || agentBusy) return;
+      if (agent === void 0 || pendingSessionId !== null || shuttingDown) return;
+      if (agentBusy) {
+        if (rotateRetryTimer === null) {
+          rotateRetryTimer = setTimeout(() => {
+            rotateRetryTimer = null;
+            void maybeRotateSession();
+          }, 3e4);
+        }
+        return;
+      }
+      if (rotateRejectedDate === (/* @__PURE__ */ new Date()).toDateString()) return;
       try {
         const size = sessionFileSize(agent.session.id);
         if (size === void 0 || size <= ROTATE_BYTES) return;
+        if (rotateConfirmResolve !== null) return;
         const oldTitle = await currentSessionTitle(ctx, agent) || "\u4F1A\u8BDD";
-        const tailText = tailConversationText(agent.session.events, 30);
+        post({ t: "rotateRequest", oldTitle, sessionBytes: size });
+        rotateConfirmOk = false;
+        await new Promise((resolve4) => {
+          rotateConfirmResolve = resolve4;
+        });
+        rotateConfirmResolve = null;
+        if (!rotateConfirmOk) {
+          rotateRejectedDate = (/* @__PURE__ */ new Date()).toDateString();
+          return;
+        }
+        rotating = true;
+        post({ t: "rotateWorking" });
+        const tailText = tailConversationText(agent.session.events, 60);
         let summary = "";
         if (ROTATE_SUMMARY_ENABLED && tailText !== "") {
           try {
@@ -141257,7 +141283,7 @@ async function main() {
         const newId = `dsh-vscode-${randomUUID()}`;
         const seq2 = nextSessionSeq(oldTitle);
         const newTitle = `${stripSeqSuffix(oldTitle)}_${seq2}`;
-        updateSessionMeta(newId, { title: newTitle, seedSummary: summary });
+        updateSessionMeta(newId, { title: newTitle, seedSummary: void 0, rotated: true });
         invalidateSessionsCache();
         if (handle !== void 0) {
           await handle.dispose();
@@ -141265,7 +141291,33 @@ async function main() {
           agent = void 0;
           resetStepBudget = null;
         }
-        pendingSessionId = newId;
+        let seedEvents = [];
+        try {
+          const created = await createAgent(ctx, { sessionId: newId }, pump2, approvals);
+          handle = created.handle;
+          agent = created.agent;
+          selection = created.selection;
+          resetStepBudget = created.resetStepBudget;
+          if (summary !== "") {
+            agent.inject(createUserMessage({
+              content: [{ type: "text", text: `\u3010\u4E0A\u4E00\u4F1A\u8BDD\u6458\u8981\u3011
+${summary}` }],
+              source: { kind: "user" }
+            }));
+            seedEvents = [{
+              type: "user/message",
+              seq: 1,
+              time: Date.now(),
+              data: { content: [{ type: "text", text: `\u3010\u4E0A\u4E00\u4F1A\u8BDD\u6458\u8981\u3011
+${summary}` }] }
+            }];
+          }
+          log("info", `rotated session created with seed summary (${summary.length} chars)`);
+        } catch (e2) {
+          log("warn", "rotate new agent create failed, deferring to lazy create", e2 instanceof Error ? e2.message : String(e2));
+          pendingSessionId = newId;
+          updateSessionMeta(newId, { seedSummary: summary });
+        }
         post({
           t: "ready",
           sessionId: newId,
@@ -141276,24 +141328,18 @@ async function main() {
           sessionTitle: newTitle,
           sessionBytes: sessionFileSize(newId)
         });
-        post({ t: "history", sessionId: newId, events: [], hasMore: false, nextSeq: void 0, sessionBytes: sessionFileSize(newId) });
+        post({ t: "history", sessionId: newId, events: seedEvents, hasMore: false, nextSeq: void 0, sessionBytes: sessionFileSize(newId) });
         post({ t: "sessionRotated", oldTitle, newTitle, sessionBytes: sessionFileSize(newId) });
         log("info", `session rotated: ${oldTitle} -> ${newTitle} (file ${size} bytes, summary ${summary.length} chars)`);
       } catch (e2) {
         log("warn", "session rotation failed", e2 instanceof Error ? e2.message : String(e2));
+      } finally {
+        rotating = false;
       }
     }
-    let rotateTimer = null;
-    rotateCheckCb = () => {
-      if (rotateTimer !== null) return;
-      rotateTimer = setTimeout(() => {
-        rotateTimer = null;
-        void maybeRotateSession();
-      }, 1e3);
-    };
     setTimeout(() => {
       void maybeRotateSession();
-    }, 6e4);
+    }, 5 * 60 * 1e3);
     setInterval(() => {
       void maybeRotateSession();
     }, 60 * 60 * 1e3);
@@ -141396,6 +141442,10 @@ async function main() {
             post({ t: "chatDone", id: msg.id, ok: false, error: "empty message" });
             return;
           }
+          if (rotating) {
+            post({ t: "chatDone", id: msg.id, ok: false, error: "rotation in progress" });
+            return;
+          }
           if (agent === void 0) {
             const created = await createAgent(ctx, { model: msg.model, sessionId: pendingSessionId ?? void 0 }, pump2, approvals);
             pendingSessionId = null;
@@ -141409,16 +141459,16 @@ async function main() {
             invalidateSessionsCache();
           }
           const meta3 = getSessionMeta(agent.session.id);
+          if (meta3?.rotated === true && typeof meta3.title === "string" && meta3.title.trim() !== "") {
+            const titleSvc = ctx.get("sessionTitle");
+            if (titleSvc !== void 0 && typeof titleSvc.rename === "function") {
+              Promise.resolve().then(() => titleSvc.rename(agent.session, meta3.title)).catch((error51) => {
+                log("warn", "rotate session title pin failed", error51 instanceof Error ? error51.message : String(error51));
+              });
+            }
+          }
           if (meta3?.seedSummary) {
             try {
-              if (typeof meta3.title === "string" && meta3.title.trim() !== "") {
-                const titleSvc = ctx.get("sessionTitle");
-                if (titleSvc !== void 0 && typeof titleSvc.rename === "function") {
-                  Promise.resolve().then(() => titleSvc.rename(agent.session, meta3.title)).catch((error51) => {
-                    log("warn", "rotate session title pin failed", error51 instanceof Error ? error51.message : String(error51));
-                  });
-                }
-              }
               agent.inject(createUserMessage({
                 content: [{ type: "text", text: `\u3010\u4E0A\u4E00\u4F1A\u8BDD\u6458\u8981\u3011
 ${meta3.seedSummary}` }],
@@ -141777,6 +141827,11 @@ ${meta3.seedSummary}` }],
         case "exportSession": {
           const result = await exportSession(ctx, msg.id);
           post({ t: "sessionExported", id: msg.id, ok: result.ok, path: result.path, error: result.error });
+          break;
+        }
+        case "rotateConfirm": {
+          rotateConfirmOk = msg.ok === true;
+          rotateConfirmResolve?.();
           break;
         }
         case "setModel": {
