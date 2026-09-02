@@ -12,7 +12,18 @@
   const approvalEl = $("approval");
   const rotateEl = $("rotate");
   const btnRotateOk = $("btnRotateOk");
+  const btnRotateYes = $("btnRotateYes");
+  const btnRotateNo = $("btnRotateNo");
   btnRotateOk?.addEventListener("click", () => rotateEl.classList.add("hidden"));
+  // 轮转确认：确认→通知宿主立即轮转；暂不→通知宿主当天不再检测
+  btnRotateYes?.addEventListener("click", () => {
+    rotateEl.classList.add("hidden");
+    vscode.postMessage({ t: "rotateConfirm", ok: true });
+  });
+  btnRotateNo?.addEventListener("click", () => {
+    rotateEl.classList.add("hidden");
+    vscode.postMessage({ t: "rotateConfirm", ok: false });
+  });
   const btnAllow = $("btnAllow");
   const btnDeny = $("btnDeny");
   const btnSend = $("btnSend");
@@ -48,6 +59,8 @@
     sessionId: null, // 当前会话 id（bootstrap 时更新）
     viewSessionId: null, // 只读浏览中的会话 id（子代理会话；非 null = 浏览模式，发送禁用）
     stats: null, // 最近一次会话统计
+    rotating: false, // 轮转执行中（摘要生成/新会话创建）：锁定发送
+    seedShown: null, // 轮转摘要去重标记：history 已显示的【上一会话摘要】文本
     modelInfo: null, // （历史遗留字段，无读取方；保留以兼容旧帧结构）
     providerModels: {}, // 按提供商分组的模型（provider -> model id 列表），模型下拉过滤用
     suppressSelectorEvents: false, // 填充下拉时抑制 change 事件
@@ -74,6 +87,12 @@
       approvalAsk: (name) => `Agent 请求调用工具 <strong>${name}</strong>`,
       runningHint: "模型运行中：可先编辑输入准备下一轮（模型停止后按 Enter 发送）",
       sessionRotatedBody: (newTitle) => `会话历史已满，已创建新会话「${newTitle || "未命名"}」继续。`,
+      sessionRotatedTitle: "会话已轮转",
+      rotateWorkingHint: "正在生成会话摘要并准备轮转，请稍候…",
+      rotateConfirmTitle: "会话日志已超限",
+      rotateConfirmBody: "是否轮转并开启新会话继续？摘要将自动继承到新会话。",
+      rotateYes: "确认轮转",
+      rotateNo: "暂不轮转",
       sessionSizeTitle: (kb) => `会话日志大小：${kb} KB`,
       approvalQueue: (n) => `⏳ 队列中还有 ${n} 个待授权请求（逐个处理）`,
       approvalAgent: (id) => `🧩 子任务 …${id} 请求：`,
@@ -168,6 +187,12 @@
       approvalAsk: (name) => `Agent requests to call tool <strong>${name}</strong>`,
       runningHint: "Model is running: you can type your next message now (press Enter to send once it finishes)",
       sessionRotatedBody: (newTitle) => `Session history is full; a new session "${newTitle || "untitled"}" has been created.`,
+      sessionRotatedTitle: "Session Rotated",
+      rotateWorkingHint: "Generating session summary and preparing rotation, please wait…",
+      rotateConfirmTitle: "Session log limit reached",
+      rotateConfirmBody: "Rotate and continue in a new session? The summary will be carried over.",
+      rotateYes: "Rotate",
+      rotateNo: "Not now",
       sessionSizeTitle: (kb) => `Session log size: ${kb} KB`,
       approvalQueue: (n) => `⏳ Queue: ${n} pending approval(s) — handled one by one`,
       approvalAgent: (id) => `🧩 Subtask …${id} requests:`,
@@ -343,26 +368,29 @@
   /**
    * 智能滚动：滚动容器在底部时自动跟随最新输出；
    * 用户向上拉动后保持用户位置，滚回底部后恢复跟随。
+   * onAfterScroll：每次滚动/贴底后调用（用于更新"一键到底"按钮显隐——内容
+   * 追加只增长 scrollHeight 不触发 scroll 事件，必须在贴底回调里也更新）。
    */
-  function attachStickyScroll(el) {
+  function attachStickyScroll(el, onAfterScroll) {
     let stick = true;
     let raf = null;
     el.addEventListener("scroll", () => {
       const near = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
       stick = near;
+      onAfterScroll?.();
     });
     return () => {
-      if (!stick) return;
       if (raf !== null) return; // 每帧最多一次滚动：避免每 delta 强制重排占满主线程
       raf = requestAnimationFrame(() => {
         raf = null;
-        el.scrollTop = el.scrollHeight;
+        if (stick) el.scrollTop = el.scrollHeight;
+        onAfterScroll?.(); // 内容增长后同步按钮显隐（未贴底且回滚超 1 页才显示）
       });
     };
   }
 
   // 真正的滚动容器是 #messages（overflow-y: auto）；body 不滚动
-  const scrollToBottom = attachStickyScroll(messagesEl);
+  const scrollToBottom = attachStickyScroll(messagesEl, updateJumpDown);
 
   // 一键拉到底按钮：回滚超过 1 页时悬浮在消息区右下，点击回到底部并隐藏
   const btnJumpDown = el("button", "jump-down hidden", "▼");
@@ -374,6 +402,15 @@
     btnJumpDown.classList.add("hidden");
   });
   document.body.appendChild(btnJumpDown);
+
+  /** 一键拉到底按钮显隐：距底超过 1 个视口高时显示，贴底（<1 视口）隐藏。
+   *  由 scroll 事件与内容增长（scrollToBottom 贴底回调）两处驱动——否则
+   *  AI 输出中内容追加只增长 scrollHeight、不触发 scroll 事件，按钮不出现。 */
+  function updateJumpDown() {
+    if (!btnJumpDown) return;
+    const dist = messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight;
+    btnJumpDown.classList.toggle("hidden", dist < messagesEl.clientHeight);
+  }
 
   /** 空态占位：无消息时显示欢迎语；有消息时隐藏。 */
   function updateEmptyState() {
@@ -405,11 +442,8 @@
         });
       }, 250);
     }
-    // 一键拉到底：回滚超过 1 页（距底 > 视口高）时显示向下箭头，贴底隐藏
-    if (btnJumpDown) {
-      const distToBottom = messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight;
-      btnJumpDown.classList.toggle("hidden", distToBottom < messagesEl.clientHeight);
-    }
+    // 一键拉到底显隐（scroll 事件驱动；内容追加由 scrollToBottom 贴底回调驱动）
+    updateJumpDown();
   });
 
   function escapeHtml(s) {
@@ -824,6 +858,15 @@
   function addUserMessage(text, images) {
     // 系统指令（宿主自动注入）：模型可见、界面不渲染
     if (isSystemDirective(text)) return;
+    // 轮转摘要去重：history 帧已显示的【上一会话摘要】，在用户首条消息的 events 批
+    // 再次出现（inject 入队落地持久化）时跳过，避免重复显示
+    if (state.seedShown !== null) {
+      if (text === state.seedShown) { state.seedShown = null; return; }
+      state.seedShown = null; // 出现不同消息：清除标记（后续不再去重）
+    }
+    if (state.seedShown === null && text.startsWith("【上一会话摘要】")) {
+      state.seedShown = text; // 首次显示轮转摘要：记录文本供后续 events 批去重
+    }
     const wrap = el("div", "msg user");
     const body = el("div", "bubble");
     if (Array.isArray(images) && images.length > 0) {
@@ -1192,7 +1235,7 @@
    */
   function updateButtons() {
     const running = state.running;
-    const locked = state.compacting || state.resuming || state.viewSessionId !== null;
+    const locked = state.compacting || state.resuming || state.rotating || state.viewSessionId !== null;
     btnSend.classList.toggle("stop", running);
     btnSend.textContent = running ? t("stop") : t("send");
     btnSend.title = running ? t("stopTitle") : "";
@@ -1481,11 +1524,13 @@
           messagesEl.innerHTML = "";
           state.stats = null;
           sessionTitleEl.textContent = "";
+          stepsEl.textContent = "🔄 0"; // 新会话清零 AI 调用计数（此前漏重置）
           contextPctEl.textContent = "🧠 —";
           tokensInEl.textContent = "↗ 0";
           tokensCacheEl.textContent = "⇄ 0";
           tokensOutEl.textContent = "↘ 0";
         }
+        state.rotating = false; // 轮转完成（新会话 ready）：解除发送锁定
         state.sessionId = msg.sessionId || null;
         // 会话大小标签：bootstrap 携带时立即显示（轮转/恢复场景），否则隐藏，
         // 后续 events 批（宿主每次写日志）持续刷新
@@ -1677,9 +1722,32 @@
         }
         break;
       }
+      case "rotateRequest": {
+        // 会话轮转**确认请求**（日志超限）：弹确认框，用户确认后才轮转；
+        // 拒绝则当天不再检测（回传 rotateConfirm 由宿主记录）。
+        const titleEl = document.querySelector("#rotate .approval-title");
+        if (titleEl) titleEl.textContent = t("rotateConfirmTitle");
+        const bodyEl = $("rotateBody");
+        if (bodyEl) bodyEl.textContent = t("rotateConfirmBody");
+        $("btnRotateYes")?.classList.remove("hidden");
+        $("btnRotateNo")?.classList.remove("hidden");
+        $("btnRotateOk")?.classList.add("hidden");
+        rotateEl.classList.remove("hidden");
+        break;
+      }
+      case "rotateWorking": {
+        // 轮转执行中（摘要生成/新会话创建）：锁定发送 + 状态提示，
+        // 避免期间继续对话造成相互干扰；新会话 ready（bootstrap）时恢复
+        state.rotating = true;
+        updateButtons();
+        setHint(t("rotateWorkingHint"));
+        break;
+      }
       case "sessionRotated": {
         // 会话轮转（历史文件超限自动新建）：bootstrap 帧已切新会话 id 并更新标题，
         // 这里更新标题栏 + 弹面板提示（webview 禁用 alert，用与审批同款的居中 modal）
+        const titleEl = document.querySelector("#rotate .approval-title");
+        if (titleEl) titleEl.textContent = t("sessionRotatedTitle");
         if (msg.newTitle) {
           sessionTitleEl.textContent = msg.newTitle;
           sessionTitleEl.title = msg.newTitle;
@@ -1687,6 +1755,9 @@
         const bodyEl = $("rotateBody");
         if (bodyEl) {
           bodyEl.textContent = t("sessionRotatedBody", msg.newTitle ?? "");
+          $("btnRotateYes")?.classList.add("hidden");
+          $("btnRotateNo")?.classList.add("hidden");
+          $("btnRotateOk")?.classList.remove("hidden");
           rotateEl.classList.remove("hidden");
         }
         // 轮转帧携带新会话日志大小：立即刷新标题栏标签（不依赖首条消息的 events 批）

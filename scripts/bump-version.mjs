@@ -2,26 +2,32 @@
 /**
  * bump-version.mjs — 版本号自动递增（semver）并同步 CHANGELOG（中英双语文件）。
  *
- * 同步三处版本号 + 两个 CHANGELOG：
+ * 同步五份版本相关文件：
  *   1. package.json 的 version（VSIX 打包/市场版本）
- *   2. host/agent-host.mjs 的 CORE_VERSION（宿主上报 UI 的版本，必须同步）
- *   3. CHANGELOG.md（英文版，对外默认）
- *   4. CHANGELOG.zh-CN.md（中文版，按用户本地语言引用展示）
+ *   2. package-lock.json 的 version（root 与 packages[""] 两处，与 package.json 保持一致）
+ *   3. host/agent-host.mjs 的 CORE_VERSION（宿主上报 UI 的版本，必须同步）
+ *   4. CHANGELOG.md（英文版，对外默认）
+ *   5. CHANGELOG.zh-CN.md（中文版，按用户本地语言引用展示）
+ *
+ * CHANGELOG 条目来源（自动）：**上个 release tag 以来全部非 merge commit** 的
+ *   subject 汇总（`git log <lastTag>..HEAD --no-merges`）——保证条目覆盖整个
+ *   release 周期的所有变更，而非只取上一个 commit。可另传 --message-en /
+ *   --message-zh 作为条目顶部的人工摘要行（如中文要点提炼）；未传时仅用
+ *   commit 列表（commit 为英文，双语 CHANGELOG 共用同一列表）。
  *
  * 用法：
  *   node scripts/bump-version.mjs [patch|minor|major] \
- *     --message-en "change1; change2" --message-zh "变更1；变更2"
+ *     [--message-en "summary line"] [--message-zh "摘要行"]
  *   node scripts/bump-version.mjs --dry-run ...   # 只打印，不写文件
- *
- * 说明：--message-en / --message-zh 分别提供英文、中文摘要；未提供某一语言时
- *   使用该语言的通用文案（建议发布前都补充）。
  */
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { spawnSync } from "node:child_process";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const pkgPath = join(root, "package.json");
+const lockPath = join(root, "package-lock.json");
 const hostPath = join(root, "host", "agent-host.mjs");
 const changelogPath = join(root, "CHANGELOG.md");
 const changelogZhPath = join(root, "CHANGELOG.zh-CN.md");
@@ -46,31 +52,48 @@ function now() {
   return new Date().toISOString().slice(0, 10);
 }
 
+/** 最近的 release tag（v*，按 semver 倒序取第一个）；无 tag 返回 null。 */
+function lastReleaseTag() {
+  const r = spawnSync("git", ["tag", "--list", "v*", "--sort=-v:refname"], { cwd: root, encoding: "utf8" });
+  if (r.status !== 0) return null;
+  const tags = String(r.stdout).split("\n").map((t) => t.trim()).filter(Boolean);
+  return tags[0] ?? null;
+}
+
+/** 收集上个 release tag 以来全部非 merge commit 的 subject；无 tag 时取全部历史。 */
+function collectCommits(tag) {
+  const range = tag ? `${tag}..HEAD` : "HEAD";
+  const r = spawnSync("git", ["log", range, "--no-merges", "--pretty=format:%s"], { cwd: root, encoding: "utf8" });
+  if (r.status !== 0) return [];
+  return String(r.stdout).split("\n").map((s) => s.trim()).filter(Boolean);
+}
+
 // ---- 读取 ----
 const pkg = JSON.parse(readFileSync(pkgPath, "utf8"));
 const oldVersion = pkg.version;
 const newVersion = bumpSemver(oldVersion, level);
 const date = now();
 
-// ---- 组装双语摘要 ----
-const enLines = (enArg ?? "Routine update (bug fixes and experience improvements)")
-  .split(/[;；]/)
-  .map((s) => s.trim())
-  .filter(Boolean)
-  .map((s) => `- ${s}`);
-const zhLines = (zhArg ?? "常规更新（bug 修复与体验改进）")
-  .split(/[;；]/)
-  .map((s) => s.trim())
-  .filter(Boolean)
-  .map((s) => `- ${s}`);
+// ---- CHANGELOG 条目：上个 release 以来全部 commit（+ 可选人工摘要行）----
+const tag = lastReleaseTag();
+const commits = collectCommits(tag);
+const commitLines = commits.map((s) => `- ${s}`);
+const source = tag
+  ? `since ${tag}: ${commits.length} commit(s)`
+  : `full history: ${commits.length} commit(s) (no release tag found)`;
+const enLines = [
+  ...(enArg ? enArg.split(/[;；]/).map((s) => s.trim()).filter(Boolean).map((s) => `- ${s}`) : []),
+  ...commitLines,
+];
+const zhLines = [
+  ...(zhArg ? zhArg.split(/[;；]/).map((s) => s.trim()).filter(Boolean).map((s) => `- ${s}`) : []),
+  ...commitLines,
+];
+if (enLines.length === 0) enLines.push("- Routine update (bug fixes and experience improvements)");
+if (zhLines.length === 0) zhLines.push("- 常规更新（bug 修复与体验改进）");
 
-// ---- 双语 CHANGELOG 条目 ----
-const entryEn =
-  `## [${newVersion}] - ${date}\n\n` +
-  `${enLines.join("\n")}\n\n`;
-const entryZh =
-  `## [${newVersion}] - ${date}\n\n` +
-  `${zhLines.join("\n")}\n\n`;
+const entryEn = `## [${newVersion}] - ${date}\n\n${enLines.join("\n")}\n\n`;
+const entryZh = `## [${newVersion}] - ${date}\n\n${zhLines.join("\n")}\n\n`;
 
 // ---- 准备写入 ----
 const hostSrc = readFileSync(hostPath, "utf8");
@@ -80,6 +103,15 @@ const hostNext = hostSrc.replace(
 );
 if (!hostNext.includes(`"${newVersion}"`)) {
   throw new Error(`host/agent-host.mjs 中未找到 CORE_VERSION 常量，无法同步版本`);
+}
+
+/** 同步 package-lock.json 的 version：root 与 packages[""] 两处（缺漏修复）。 */
+function syncLockVersion() {
+  if (!existsSync(lockPath)) return;
+  const lock = JSON.parse(readFileSync(lockPath, "utf8"));
+  lock.version = newVersion;
+  if (lock.packages && lock.packages[""]) lock.packages[""].version = newVersion;
+  writeFileSync(lockPath, JSON.stringify(lock, null, 2) + "\n", "utf8");
 }
 
 /** 更新一个 CHANGELOG 文件：不存在则创建（含标题/维护注释），在标题后插入新条目。 */
@@ -97,7 +129,9 @@ function writeChangelog(path, title, note, entry) {
 
 if (dryRun) {
   console.log(`[dry-run] package.json  version: ${oldVersion} -> ${newVersion}`);
+  console.log(`[dry-run] package-lock.json version: ${oldVersion} -> ${newVersion}（root + packages[""] 两处）`);
   console.log(`[dry-run] agent-host.mjs CORE_VERSION: ${oldVersion} -> ${newVersion}`);
+  console.log(`[dry-run] CHANGELOG 条目来源：${source}`);
   console.log(`[dry-run] CHANGELOG.md 新增条目 (EN):\n${entryEn.trim()}`);
   console.log(`[dry-run] CHANGELOG.zh-CN.md 新增条目 (ZH):\n${entryZh.trim()}`);
   console.log("[dry-run] 未写入任何文件");
@@ -107,6 +141,7 @@ if (dryRun) {
 // ---- 写入 ----
 pkg.version = newVersion;
 writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + "\n", "utf8");
+syncLockVersion();
 writeFileSync(hostPath, hostNext, "utf8");
 writeChangelog(changelogPath, "# Changelog", "Maintained by scripts/bump-version.mjs.", entryEn);
 writeChangelog(
@@ -117,4 +152,5 @@ writeChangelog(
 );
 
 console.log(`✅ 版本 ${oldVersion} -> ${newVersion}（${level}）`);
-console.log(`   已同步：package.json / host/agent-host.mjs (CORE_VERSION) / CHANGELOG.md (EN) / CHANGELOG.zh-CN.md (ZH)`);
+console.log(`   已同步：package.json / package-lock.json / host/agent-host.mjs (CORE_VERSION) / CHANGELOG.md (EN) / CHANGELOG.zh-CN.md (ZH)`);
+console.log(`   CHANGELOG 条目来源：${source}`);

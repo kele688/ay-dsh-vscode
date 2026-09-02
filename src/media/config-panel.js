@@ -204,18 +204,15 @@
   fields.rotateSummary.addEventListener("change", updateRotateSummaryState);
   // 个性定制：三个开关的"开/关"状态随勾选框实时切换（启用定制/启用经验/启动学习）
   const personalSwitches = [
-    ["cfgEnableCustomState", "cfgEnableCustomHint", fields.enableCustom, "enableCustomOn", "enableCustomOff"],
-    ["cfgEnableLearningState", "cfgEnableLearningHint", fields.enableLearning, "enableLearningOn", "enableLearningOff"],
-    ["cfgEnableAutoLearnState", "cfgEnableAutoLearnHint", fields.enableAutoLearn, "enableAutoLearnOn", "enableAutoLearnOff"],
+    ["cfgEnableCustomHint", fields.enableCustom, "enableCustomOn", "enableCustomOff"],
+    ["cfgEnableLearningHint", fields.enableLearning, "enableLearningOn", "enableLearningOff"],
+    ["cfgEnableAutoLearnHint", fields.enableAutoLearn, "enableAutoLearnOn", "enableAutoLearnOff"],
   ];
   const personalStateUpdaters = [];
-  for (const [stateId, hintId, field, onKey, offKey] of personalSwitches) {
-    const st = $(stateId);
+  for (const [hintId, field, onKey, offKey] of personalSwitches) {
     const hint = $(hintId);
     const update = () => {
-      const on = field.checked;
-      if (st) st.textContent = on ? L.on : L.off;
-      if (hint) hint.textContent = on ? L[onKey] : L[offKey];
+      if (hint) hint.textContent = field.checked ? L[onKey] : L[offKey];
     };
     personalStateUpdaters.push(update);
     field.addEventListener("change", update);

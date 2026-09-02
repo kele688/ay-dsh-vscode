@@ -744,8 +744,8 @@ function renderHtml(webview: vscode.Webview, scriptUri: vscode.Uri, styleUri: vs
     enableAutoLearn: zh ? "启动学习" : "Auto-learn",
     on: zh ? "开" : "On",
     off: zh ? "关" : "Off",
-    customPromptHint: zh ? "点击“编辑”用 VS Code 编辑器修改“用户定制品格”内容（首次编辑自动创建文件）；改完点本组“保存”落盘，再到左侧“重启应用”功能组重启宿主后生效。" : "Click Edit to modify your custom persona in the VS Code editor (auto-created on first edit); then Save in this group, and restart the host via the “Restart & Apply” group on the left.",
-    learningHint: zh ? "点击“编辑”用 VS Code 编辑器修改“自动学习经验”内容（首次编辑自动创建文件）；改完点本组“保存”落盘，再到左侧“重启应用”功能组重启宿主后生效。" : "Click Edit to modify your learned rules in the VS Code editor (auto-created on first edit); then Save in this group, and restart the host via the “Restart & Apply” group on the left.",
+    customPromptHint: zh ? "点击“编辑”在VSCode编辑器修改（首次编辑自动创建文件）；点击“保存”落盘，重启宿主后生效。" : "Click Edit to modify your custom persona in the VS Code editor (auto-created on first edit); then click Save, and restart the host via the “Restart & Apply” group on the left.",
+    learningHint: zh ? "点击“编辑”用VSCode编辑器修改（首次编辑自动创建文件）；点击“保存”落盘，重启宿主后生效。" : "Click Edit to modify your learned rules in the VS Code editor (auto-created on first edit); then click Save, and restart the host via the “Restart & Apply” group on the left.",
     saveCustom: zh ? "保存" : "Save",
     rotateBytes: zh ? "会话轮转阈值（MB）" : "Session rotation threshold (MB)",
     rotateBytesHint: zh ? "会话日志超过该大小（MB）时自动轮转，创建新会话继续（默认 10）" : "Rotate when the session log exceeds this size (MB); a new session continues (default 10)",
@@ -997,7 +997,6 @@ function renderHtml(webview: vscode.Webview, scriptUri: vscode.Uri, styleUri: vs
         <div class="field">
           <div class="checkbox-row">
             <input type="checkbox" id="cfgEnableCustom" checked>
-            <span class="hint" id="cfgEnableCustomState">${L.on}</span>
             <label for="cfgEnableCustom">${L.enableCustom}</label>
           </div>
           <span class="hint" id="cfgEnableCustomHint">…</span>
@@ -1011,13 +1010,11 @@ function renderHtml(webview: vscode.Webview, scriptUri: vscode.Uri, styleUri: vs
         <div class="field">
           <div class="checkbox-row">
             <input type="checkbox" id="cfgEnableLearning" checked>
-            <span class="hint" id="cfgEnableLearningState">${L.on}</span>
             <label for="cfgEnableLearning">${L.enableLearning}</label>
           </div>
           <span class="hint" id="cfgEnableLearningHint">…</span>
           <div class="checkbox-row">
             <input type="checkbox" id="cfgEnableAutoLearn" checked>
-            <span class="hint" id="cfgEnableAutoLearnState">${L.on}</span>
             <label for="cfgEnableAutoLearn">${L.enableAutoLearn}</label>
           </div>
           <span class="hint" id="cfgEnableAutoLearnHint">…</span>

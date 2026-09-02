@@ -1328,14 +1328,18 @@ function sessionFileSize(sessionId) {
 }
 
 /** 从倒数第 n 条用户输入起，截取之后（含）所有 user/assistant 消息文本，保持时间顺序。
- *  用于轮转摘要：摘要取 n=30、fallback 取 n=5。 */
+ *  用于轮转摘要：摘要取 n=30、fallback 取 n=5。
+ *  **实证**：内核 user/message 事件结构为 `{ type, seq, time, data: { content, source, role, id } }`
+ *  （无 message 字段）——必须读 `e.data.content`，此前误读 `e.message` 导致摘要恒为空。 */
 function tailConversationText(events, lastUserCount) {
   const userSeqs = [];
   const msgs = []; // { seq, text }：只收 user/assistant 消息，跳过海量 assistant/chunk（单遍遍历）
   for (const e of events) {
-    if (e.type === "user/message" && e.message?.source?.kind === "user") userSeqs.push(e.seq);
+    const d = e.data ?? {};
+    if (e.type === "user/message" && d.source?.kind === "user") userSeqs.push(e.seq);
     if (e.type === "user/message" || e.type === "assistant/message") {
-      const text = (e.message?.content ?? [])
+      const content = e.type === "user/message" ? d.content : (d.message?.content ?? d.content);
+      const text = (content ?? [])
         .map((b) => (b.type === "text" ? b.text : ""))
         .join("")
         .trim();
@@ -1359,13 +1363,15 @@ async function summarizeUserMessages(ctx, agent, texts, signal) {
     ? { provider: agent.options.provider, model: agent.options.model }
     : latest;
   if (target === undefined) return "";
-  // texts 是 tailConversationText 拼好的字符串，取末尾 12000 字符（偏重最近对话）
-  const joined = texts.slice(-12000);
+  // texts 是 tailConversationText 拼好的字符串（倒数 30 条用户消息起的对话）。
+  // **不按 12000 字符截断**（此前导致大会话只摘要到最近一两轮、丢上下文），
+  // 仅设 150000 字符上限，防止超长输入打爆摘要调用（token 成本：一次性摘要可接受）。
+  const joined = texts.slice(-150000);
   if (joined.length === 0) return "";
   const instruction =
-    "你是对话摘要助手。请对下面这段用户与 AI 的协作对话做简明摘要，"
-    + "保留：关键问题、任务目标、已做出的决策、待办事项、重要结论。"
-    + "只输出摘要正文，不要解释，控制在 300 字以内。\n\n";
+    "你是对话摘要助手。请通读以下会话内容（可能是很长对话的最近部分），"
+    + "输出该会话的简明摘要，覆盖：整体任务目标、已完成的重点工作、关键决策与结论、"
+    + "当前进度、待办事项。不要复述对话过程，只输出摘要正文，控制在 500 字以内。\n\n";
   const messages = [
     createUserMessage({
       content: [{ type: "text", text: instruction + joined }],
@@ -1378,7 +1384,9 @@ async function summarizeUserMessages(ctx, agent, texts, signal) {
       provider: target.provider,
       model: target.model,
       messages,
-      maxTokens: 600,
+      // maxTokens 需覆盖推理模型的 reasoning 消耗：600 会被思考吃光导致正文截断，
+      // 2048 保证 reasoning + 摘要正文都有余量
+      maxTokens: 2048,
       sessionId: agent.session.id,
       purpose: "rotate-session",
       signal,
@@ -1888,11 +1896,11 @@ async function exportSession(ctx, sessionId) {
 
 async function main() {
   const env = { ...process.env };
-  /** 写日志后触发的轮转检查回调（try 块内绑定，避免 1h 定时器粒度太粗）。 */
-  let rotateCheckCb = null;
+  // 轮转检测**不挂在写日志/事件 flush 上**（恢复会话重放也会 flush 造成误触发，
+  // 且每次写日志都检查降低效率）——改由定时器**闲时**检查日志文件大小（见下方定时器）。
   const pump = new EventPump(
     () => (agent === undefined || agent.session === undefined ? undefined : sessionFileSize(String(agent.session.id))),
-    () => { try { rotateCheckCb?.(); } catch { /* ignore */ } }
+    undefined
   );
   const approvals = { nextId: (() => { let n = 0; return () => ++n; })(), pending: new Map() };
 
@@ -1904,10 +1912,19 @@ async function main() {
   /** 当前 agent 的"重置本轮思考步数预算"回调（chat 入口在每条用户消息前调用）。 */
   let resetStepBudget = null;
   let shuttingDown = false;
+  /** 轮转检查退避定时器（对话进行中 → 30s 后重试；等闲下来再做，不取消检查）。 */
+  let rotateRetryTimer = null;
   /** 主 agent 是否正在回复（由内核 agent/status 事件维护；轮转须避开运行期）。 */
   let agentBusy = false;
   /** 会话轮转：历史文件超限后预建的下一会话 id（agent 惰性创建于首条消息）。 */
   let pendingSessionId = null;
+  /** 用户当天拒绝轮转的日期（拒绝后当天不再检测）。 */
+  let rotateRejectedDate = "";
+  /** 轮转确认框待回复（非 null 时等待前端 rotateConfirm 消息）。 */
+  let rotateConfirmResolve = null;
+  let rotateConfirmOk = false;
+  /** 轮转执行中（摘要生成/新会话创建）：期间阻止新对话，避免相互干扰。 */
+  let rotating = false;
 
   try {
     ctx = await bootTree();
@@ -1935,14 +1952,43 @@ async function main() {
       return m ? Number(m[1]) + 1 : 1;
     };
     async function maybeRotateSession() {
-      if (agent === undefined || pendingSessionId !== null || shuttingDown || agentBusy) return;
+      if (agent === undefined || pendingSessionId !== null || shuttingDown) return;
+      // 对话进行中：**退避不取消**——30s 后重试（或等 agent/status 变空闲时立即补查），
+      // 绝不打断进行中的对话
+      if (agentBusy) {
+        if (rotateRetryTimer === null) {
+          rotateRetryTimer = setTimeout(() => {
+            rotateRetryTimer = null;
+            void maybeRotateSession();
+          }, 30_000);
+        }
+        return;
+      }
+      // 用户当天已明确拒绝轮转：当天不再检测
+      if (rotateRejectedDate === new Date().toDateString()) return;
       try {
         const size = sessionFileSize(agent.session.id);
         if (size === undefined || size <= ROTATE_BYTES) return;
+        // 轮转前**请求用户确认**（不自动轮转）：确认后执行；拒绝则当天不再检测
+        if (rotateConfirmResolve !== null) return; // 已有确认框在等
         const oldTitle = (await currentSessionTitle(ctx, agent)) || "会话";
+        post({ t: "rotateRequest", oldTitle, sessionBytes: size });
+        rotateConfirmOk = false;
+        await new Promise((resolve) => { rotateConfirmResolve = resolve; });
+        rotateConfirmResolve = null;
+        if (!rotateConfirmOk) {
+          rotateRejectedDate = new Date().toDateString();
+          return;
+        }
+        // 轮转执行中：通知前端锁定发送并提示状态（摘要生成可能耗时数秒），
+        // 期间 chat 分支拒绝新消息，避免与新会话创建/摘要生成相互干扰
+        rotating = true;
+        post({ t: "rotateWorking" });
         // 1) 生成**用户对话摘要**（含 AI 回复；不再调用 compaction.compactNow：
         //    那是同会话上下文压缩，摘要复用系统提示词，不适合跨会话迁移）
-        const tailText = tailConversationText(agent.session.events, 30);
+        // 覆盖最近 60 条用户消息起的对话（配合 summarizeUserMessages 内 150K 上限，
+        // 避免大会会话只摘要到最近一两轮）
+        const tailText = tailConversationText(agent.session.events, 60);
         let summary = "";
         if (ROTATE_SUMMARY_ENABLED && tailText !== "") {
           try {
@@ -1957,16 +2003,49 @@ async function main() {
           // user/assistant 消息原文（默认 N=5），不丢失记忆
           summary = tailConversationText(agent.session.events, ROTATE_FALLBACK_MSGS);
         }
-        // 2) 预建新会话：meta 先绑定（标题 _N + seedSummary），agent 惰性创建
+        // 2) 创建新会话：**立即创建 agent 并注入摘要**（轮转经用户确认，新会话应
+        //    直接可用并继承前会话摘要——不等首条消息，摘要即显示在对话面板）
         const newId = `dsh-vscode-${randomUUID()}`;
         const seq = nextSessionSeq(oldTitle);
         const newTitle = `${stripSeqSuffix(oldTitle)}_${seq}`;
-        updateSessionMeta(newId, { title: newTitle, seedSummary: summary });
+        updateSessionMeta(newId, { title: newTitle, seedSummary: undefined, rotated: true });
         invalidateSessionsCache();
-        // 3) 关闭旧 agent（新会话 agent 等首条消息再惰性创建）
+        // 3) 关闭旧 agent
         if (handle !== undefined) { await handle.dispose(); handle = undefined; agent = undefined; resetStepBudget = null; }
-        pendingSessionId = newId;
-        // 4) 前端自动切换到新会话 + 弹框提示
+        // 4) 立即创建新 agent + 注入上一会话摘要（作为新会话首条 user 消息，
+        //    持久化到日志，随 history 帧立即显示，用户不再面对空会话）
+        let seedEvents = [];
+        try {
+          const created = await createAgent(ctx, { sessionId: newId }, pump, approvals);
+          handle = created.handle;
+          agent = created.agent;
+          selection = created.selection;
+          resetStepBudget = created.resetStepBudget;
+          if (summary !== "") {
+            agent.inject(createUserMessage({
+              content: [{ type: "text", text: `【上一会话摘要】\n${summary}` }],
+              source: { kind: "user" },
+            }));
+            // inject 仅入队不落地（内核语义 wakeup=false，等待下次唤醒才写入日志），
+            // 立即读 agent.session.events 拿不到——直接构造摘要事件供 history 帧显示；
+            // 持久化由用户首条消息时 driver 处理队列完成（前端据此文本去重，避免重复显示）。
+            // 注意：user/message 事件的 data 结构是 `content`（host.ts translateEvent
+            // 读 data.content 做 blocksToText），不是 messages 包装。
+            seedEvents = [{
+              type: "user/message",
+              seq: 1,
+              time: Date.now(),
+              data: { content: [{ type: "text", text: `【上一会话摘要】\n${summary}` }] },
+            }];
+          }
+          log("info", `rotated session created with seed summary (${summary.length} chars)`);
+        } catch (e) {
+          // 创建失败：回退惰性创建（首条消息时经 agent.inject 再注入摘要），不阻塞轮转
+          log("warn", "rotate new agent create failed, deferring to lazy create", e instanceof Error ? e.message : String(e));
+          pendingSessionId = newId;
+          updateSessionMeta(newId, { seedSummary: summary });
+        }
+        // 5) 前端自动切换到新会话 + 弹框提示
         post({
           t: "ready",
           sessionId: newId,
@@ -1977,27 +2056,25 @@ async function main() {
           sessionTitle: newTitle,
           sessionBytes: sessionFileSize(newId),
         });
-        // 4.5) 补发新会话 history 帧（空事件）：前端 history 分支会清空旧消息区，
-        // 呈现"新会话"空态（摘要将在首条消息时经 agent.inject 持久化并随 events
-        // 批渲染），避免旧会话内容残留造成"看起来没切换"。
-        post({ t: "history", sessionId: newId, events: [], hasMore: false, nextSeq: undefined, sessionBytes: sessionFileSize(newId) });
+        // 5.5) 补发新会话 history 帧（携带摘要 events）：前端渲染摘要消息
+        //（不再是无内容的空会话），避免旧会话内容残留造成"看起来没切换"。
+        post({ t: "history", sessionId: newId, events: seedEvents, hasMore: false, nextSeq: undefined, sessionBytes: sessionFileSize(newId) });
         post({ t: "sessionRotated", oldTitle, newTitle, sessionBytes: sessionFileSize(newId) });
         log("info", `session rotated: ${oldTitle} -> ${newTitle} (file ${size} bytes, summary ${summary.length} chars)`);
       } catch (e) {
         log("warn", "session rotation failed", e instanceof Error ? e.message : String(e));
+      } finally {
+        rotating = false; // 无论成败：轮转结束，恢复对话
       }
     }
-    // 写日志后顺带检查（1s 防抖）：比 1h 定时器更及时地"封顶"，避免两次检查间日志暴涨
-    let rotateTimer = null;
-    rotateCheckCb = () => {
-      if (rotateTimer !== null) return;
-      rotateTimer = setTimeout(() => {
-        rotateTimer = null;
-        void maybeRotateSession();
-      }, 1000);
-    };
-    // 兜底定时器：events 长期不流动时仍能轮转
-    setTimeout(() => { void maybeRotateSession(); }, 60_000);
+    // 轮转检测：**仅定时器、闲时检查**（超限不是致命问题，不追求精准）。
+    // - 启动后延迟 5 分钟首次检查（不抢启动；agentBusy 时 maybeRotateSession 直接
+    //   return，**绝不打断进行中的对话**）；
+    // - 之后每 1 小时检查一次当前会话日志文件大小，超限才请求用户确认
+    //   （用户拒绝则当天不再检测）。
+    // **不在写日志/事件 flush 时检测**（恢复会话重放也会 flush，会造成"一打开就
+    // 提示轮转"；且每次写日志都检查降低效率）。
+    setTimeout(() => { void maybeRotateSession(); }, 5 * 60 * 1000);
     setInterval(() => { void maybeRotateSession(); }, 60 * 60 * 1000);
 
     // 全局审批监听（根 ctx，一次）：覆盖主 agent 与所有 subagent 的越界请求
@@ -2132,6 +2209,11 @@ async function main() {
               post({ t: "chatDone", id: msg.id, ok: false, error: "empty message" });
               return;
             }
+            // 轮转执行中：拒绝新消息（前端已锁定发送，此处兜底防并发干扰）
+            if (rotating) {
+              post({ t: "chatDone", id: msg.id, ok: false, error: "rotation in progress" });
+              return;
+            }
             // 惰性创建：用户发出第一条消息时才创建会话（绝不预先创建空会话）
             // 注意：此处**不**写会话 meta——lazy session 策略下，未持久化的
             // 会话不视为有效会话，提前记录会产生孤儿 meta 条目（会话从未
@@ -2163,26 +2245,26 @@ async function main() {
               }
               invalidateSessionsCache(); // 新会话入列表，丢弃旧缓存
             }
-            // 轮转摘要注入：新会话首条消息时，把上一会话的用户对话摘要作为
-            // user/message 注入（agent.inject 持久化为日志首条 user 消息，位于
-            // 本次用户消息之前；注入后清除 meta 标记，只注入一次）。
+            // 轮转标题钉住：仅对**轮转新会话**（meta.rotated=true）钉住 _N 标题——
+            // 调用内核 rename 后，后续自动标题（source=user）被 supersede，不再覆盖。
+            // 普通新会话无此标记，内核自动标题仍正常生成（不误伤）。
+            // （此前钉住逻辑误挂在 seedSummary 块内；摘要改用 inject 持久化后
+            //  seedSummary 被清除，导致轮转标题失去保护被自动标题覆盖）
             const meta = getSessionMeta(agent.session.id);
+            if (meta?.rotated === true && typeof meta.title === "string" && meta.title.trim() !== "") {
+              const titleSvc = ctx.get("sessionTitle");
+              if (titleSvc !== undefined && typeof titleSvc.rename === "function") {
+                Promise.resolve()
+                  .then(() => titleSvc.rename(agent.session, meta.title))
+                  .catch((error) => {
+                    log("warn", "rotate session title pin failed", error instanceof Error ? error.message : String(error));
+                  });
+              }
+            }
+            // 轮转摘要注入（兼容旧轮转：meta.seedSummary 仍在时注入一次；新轮转
+            // 已改为轮转时直接 inject，seedSummary 已清除，此处不重复）
             if (meta?.seedSummary) {
               try {
-                // 1) 钉住轮转标题（_N）：内核 rename（source=user）后自动标题被
-                //    supersede，不再覆盖我们设置的会话标题（保持会话关联）。
-                //    内核 sessionTitle.rename 是同步方法，经 Promise 包装兼容。
-                if (typeof meta.title === "string" && meta.title.trim() !== "") {
-                  const titleSvc = ctx.get("sessionTitle");
-                  if (titleSvc !== undefined && typeof titleSvc.rename === "function") {
-                    Promise.resolve()
-                      .then(() => titleSvc.rename(agent.session, meta.title))
-                      .catch((error) => {
-                        log("warn", "rotate session title pin failed", error instanceof Error ? error.message : String(error));
-                      });
-                  }
-                }
-                // 2) 注入上一会话摘要
                 agent.inject(createUserMessage({
                   content: [{ type: "text", text: `【上一会话摘要】\n${meta.seedSummary}` }],
                   source: { kind: "user" },
@@ -2606,6 +2688,12 @@ async function main() {
           case "exportSession": {
             const result = await exportSession(ctx, msg.id);
             post({ t: "sessionExported", id: msg.id, ok: result.ok, path: result.path, error: result.error });
+            break;
+          }
+          case "rotateConfirm": {
+            // 用户在前端确认框的选择：确认→继续轮转；拒绝→当天不再检测
+            rotateConfirmOk = msg.ok === true;
+            rotateConfirmResolve?.();
             break;
           }
           case "setModel": {

@@ -432,9 +432,9 @@ input.invalid {
 .readonly-box a {
   color: var(--vscode-textLink-foreground, #3794ff);
 }
-/* 个性定制：开关文字与勾选框下边沿对齐、更贴近勾选框 */
+/* 个性定制：开关文字与勾选框中线对齐、更贴近勾选框 */
 .cfg-group[data-group="personal"] .checkbox-row {
-  align-items: flex-end;
+  align-items: center;
   gap: 4px;
 }
 /* 个性定制：编辑按钮与主按钮一致的蓝色 */

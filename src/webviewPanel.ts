@@ -274,6 +274,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         case "deleteSession":
           this.host?.deleteSession(msg.id);
           break;
+        case "rotateConfirm":
+          // 会话轮转确认（用户在前端确认框选择）：确认→轮转；拒绝→当天不再检测
+          this.host?.rotateConfirm(msg.ok === true);
+          break;
         case "exportSession":
           this.host?.exportSession(msg.id);
           break;
@@ -668,6 +672,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         // 这里透传旧/新标题与大小，前端更新标题栏并弹出面板提示
         this.push({ t: "sessionRotated", oldTitle: e.oldTitle, newTitle: e.newTitle, sessionBytes: e.sessionBytes });
         break;
+      case "rotateRequest":
+        // 会话轮转**确认请求**（日志超限）：前端弹确认框，用户确认后才轮转
+        this.push({ t: "rotateRequest", oldTitle: e.oldTitle, sessionBytes: e.sessionBytes });
+        break;
+      case "rotateWorking":
+        // 轮转执行中（摘要生成/新会话创建）：前端锁定发送并提示状态
+        this.push({ t: "rotateWorking" });
+        break;
       case "sessionSize":
         // 会话日志大小随 events 批刷新（每次写日志）：透传前端标题栏 KB 标签
         this.push({ t: "sessionSize", bytes: e.bytes });
@@ -800,6 +812,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       allow: zh ? "允许" : "Allow",
       sessionRotatedTitle: zh ? "会话已轮转" : "Session Rotated",
       sessionRotatedOk: zh ? "知道了" : "Got it",
+      rotateOk: zh ? "确认轮转" : "Rotate",
+      rotateCancel: zh ? "暂不轮转" : "Not now",
       placeholder: zh ? "给 AY-DSH 下达任务…（可以粘贴图片，Enter 发送，Shift+Enter 换行）" : "Ask AY-DSH a task… (paste images, Enter to send, Shift+Enter for newline)",
       send: zh ? "发送" : "Send",
       stop: zh ? "停止" : "Stop",
@@ -880,13 +894,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       </div>
     </div>
   </div>
-  <!-- 会话轮转提示 modal：历史文件超限自动新建会话后弹出（webview 禁用 alert，用面板内 modal） -->
+  <!-- 会话轮转提示 modal：确认轮转（rotateRequest）或轮转完成提示（sessionRotated）共用 -->
   <div id="rotate" class="approval-modal hidden">
     <div class="approval-backdrop"></div>
     <div class="approval-card rotate-card">
       <div class="approval-title">${L.sessionRotatedTitle}</div>
       <div id="rotateBody" class="approval-body"></div>
       <div class="approval-actions">
+        <button id="btnRotateNo" class="btn deny hidden">${L.rotateCancel}</button>
+        <button id="btnRotateYes" class="btn allow hidden">${L.rotateOk}</button>
         <button id="btnRotateOk" class="btn allow">${L.sessionRotatedOk}</button>
       </div>
     </div>
