@@ -81,6 +81,7 @@ export type HostFrame =
   | { t: "sessionRotated"; oldTitle?: string; newTitle?: string; sessionBytes?: number }
   | { t: "rotateRequest"; oldTitle?: string; sessionBytes?: number }
   | { t: "rotateWorking" }
+  | { t: "hint"; text: string }
   | { t: "exit"; code: number; error?: string };
 
 /** Extension -> Host */

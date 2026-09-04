@@ -538,6 +538,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         this.lastStatus = e.status;
         this.push({ t: "status", status: e.status });
         break;
+      case "hint": {
+        // 宿主提示（会话被占用 / 遗留自动目标已暂停等）：状态栏短暂显示。
+        // 宿主已按界面语言本地化（DSH_LOCALE），此处直接展示无需再翻译。
+        if (typeof e.text === "string" && e.text !== "") {
+          vscode.window.setStatusBarMessage(e.text, 6000);
+        }
+        break;
+      }        break;
       case "approval":
         // 缓存未决审批（webview 重建/未就绪时补发），并推送到界面。
         // 授权唯一通道 = webview 内 modal 弹窗（面板居中，Kilo Code / DSH Web

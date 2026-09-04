@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.5.2] - 2026-09-04
+
+- Isolate sessions history list based on project to avoid restore session in non-relevent workspace
+- disable dsh_goal associated functions, long turn task without person is not complicate with ay-dsh work mode, it may lead to dead loop in AI think loop
+- chore: bump version to 0.5.2
+
 ## [0.5.1] - 2026-09-02
 
 - fix: session rotation summary/title & idle-check, stats reset, ripgrep exec, bump lock sync

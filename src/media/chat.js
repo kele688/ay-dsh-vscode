@@ -79,6 +79,7 @@
 
   const I18N = {
     zh: {
+      goalRoundChip: (n, m) => `↻ 目标自动续跑（第 ${n}/${m} 轮，系统指令）`,
       thinking: "思考过程",
       truncated: "\n…（已截断）",
       result: "── 结果 ──",
@@ -179,6 +180,7 @@
       closeLightbox: "关闭",
     },
     en: {
+      goalRoundChip: (n, m) => `↻ Goal auto-continuation (round ${n}/${m}, system directive)`,
       thinking: "Thinking",
       truncated: "\n… (truncated)",
       result: "── Result ──",
@@ -858,6 +860,18 @@
   function addUserMessage(text, images) {
     // 系统指令（宿主自动注入）：模型可见、界面不渲染
     if (isSystemDirective(text)) return;
+    // goal_round 系统轮次（DSH 内核 goal 自动续跑注入的指令；插件已默认排除该机制
+    // [G1]，但历史会话可能残留）：折叠为一行芯片，不渲染整段指令正文——
+    // 否则恢复含大量 goal round 的会话时界面被大段 <goal_round> 刷屏。
+    if (typeof text === "string" && text.startsWith("<goal_round>")) {
+      const gm = /\bRound:\s*(\d+)\s*\/\s*(\d+)/.exec(text);
+      const wrap = el("div", "msg goal-round");
+      wrap.appendChild(el("div", "goal-round-chip", t("goalRoundChip", gm ? gm[1] : "?", gm ? gm[2] : "?")));
+      messagesEl.appendChild(wrap);
+      updateEmptyState();
+      scrollToBottom();
+      return;
+    }
     // 轮转摘要去重：history 帧已显示的【上一会话摘要】，在用户首条消息的 events 批
     // 再次出现（inject 入队落地持久化）时跳过，避免重复显示
     if (state.seedShown !== null) {

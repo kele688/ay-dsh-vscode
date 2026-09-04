@@ -1,5 +1,11 @@
 # 更新日志
 
+## [0.5.2] - 2026-09-04
+
+- 基于项目隔离历史会话列表，防止在不同的工作区恢复不相干会话
+- 默认关闭dsh_goal相关功能，无人值守长程任务与ay-dsh应用模式冲突，可能造成模型死循环
+- chore: bump version to 0.5.2
+
 ## [0.5.1] - 2026-09-02
 
 - fix: session rotation summary/title & idle-check, stats reset, ripgrep exec, bump lock sync
