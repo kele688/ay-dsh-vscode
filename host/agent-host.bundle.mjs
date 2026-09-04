@@ -140003,7 +140003,7 @@ function installModelSelection(agentCtx, selection) {
 
 // host/agent-host.mjs
 var NAME2 = "dsh-vscode-host";
-var CORE_VERSION = "0.5.1";
+var CORE_VERSION = "0.5.2";
 var SESSION_PREFIX = "dsh-vscode-";
 var workMode = "single";
 var getWorkMode = () => workMode;
@@ -140040,7 +140040,7 @@ function composePatches(env2) {
     {
       id: "system-prompt",
       config: {
-        persona: `You are a coding agent powered by the {{model}} model, running inside the DeepSeek Harness VS Code extension. Your working directory is ${currentCwd} \u2014 the user's current workspace. Use this directory for all file operations and command workdirs. Help with coding tasks: read and edit files, run commands, search the web, and orchestrate subagents and workflows. File edits you make appear live in the editor. Plan before large changes; prefer the plan-mode workflow for ambiguous or big tasks. For long-running objectives, use the goal tools so progress persists across continuation rounds. Tool calls, approvals, and todos are shown to the user in real time; keep them informed and concise. Permissions: operations outside the workspace are denied by the sandbox by default. When a task genuinely needs wider access (e.g. reading or writing files outside the workspace, or system-level commands), you may request a one-time escalation by passing \`sandbox_permissions\` (the narrowest wider mode that suffices, e.g. "danger-full-access") together with a clear \`justification\` to the file/command tools \u2014 the user is then prompted to approve or deny in the UI. Do not request escalation casually; prefer working inside the workspace. Encoding: on Windows, command output (PowerShell 5.1 / Python) defaults to the system code page, which garbles non-ASCII text (any language) when captured. When running a command whose output may contain non-ASCII characters, force UTF-8 output: prefix PowerShell commands with \`[Console]::OutputEncoding = [Text.Encoding]::UTF8; $OutputEncoding = [Text.Encoding]::UTF8;\` or run \`chcp 65001 >nul\` first, and for Python set \`$env:PYTHONIOENCODING='utf-8'\` \u2014 otherwise the captured output will be garbled.`
+        persona: `You are a coding agent powered by the {{model}} model, running inside the DeepSeek Harness VS Code extension. Your working directory is ${currentCwd} \u2014 the user's current workspace. Use this directory for all file operations and command workdirs. Help with coding tasks: read and edit files, run commands, search the web, and orchestrate subagents and workflows. File edits you make appear live in the editor. Plan before large changes; prefer the plan-mode workflow for ambiguous or big tasks. Work is driven turn by turn by the user: a long-running task that cannot be finished within one turn must end with a clear summary of progress and next steps, waiting for the user's next instruction. Tool calls, approvals, and todos are shown to the user in real time; keep them informed and concise. Permissions: operations outside the workspace are denied by the sandbox by default. When a task genuinely needs wider access (e.g. reading or writing files outside the workspace, or system-level commands), you may request a one-time escalation by passing \`sandbox_permissions\` (the narrowest wider mode that suffices, e.g. "danger-full-access") together with a clear \`justification\` to the file/command tools \u2014 the user is then prompted to approve or deny in the UI. Do not request escalation casually; prefer working inside the workspace. Encoding: on Windows, command output (PowerShell 5.1 / Python) defaults to the system code page, which garbles non-ASCII text (any language) when captured. When running a command whose output may contain non-ASCII characters, force UTF-8 output: prefix PowerShell commands with \`[Console]::OutputEncoding = [Text.Encoding]::UTF8; $OutputEncoding = [Text.Encoding]::UTF8;\` or run \`chcp 65001 >nul\` first, and for Python set \`$env:PYTHONIOENCODING='utf-8'\` \u2014 otherwise the captured output will be garbled.`
       }
     },
     { id: "hmr", disabled: true },
@@ -140092,6 +140092,11 @@ function composePatches(env2) {
     { id: "session-telemetry-otel", disabled: true },
     { id: "typert-gateway", disabled: true }
   ];
+  if (env2.DSH_ENABLE_GOAL_ROUNDS !== "1") {
+    overlay.push({ id: "goal-round-driver", disabled: true });
+    overlay.push({ id: "tool-goal", disabled: true });
+    overlay.push({ id: "command-goal", disabled: true });
+  }
   return [...base, ...filteredHeadless, ...overlay];
 }
 async function currentSessionTitle(ctx, agent) {
@@ -140901,10 +140906,12 @@ async function listSessions(ctx) {
     return sessionsCache;
   }
   const entries = scanSessionDirs();
+  const currentProject = projectKey(process.cwd());
+  const scoped = entries.filter((e2) => e2.project === currentProject);
   const allMeta = loadSessionMeta();
   const patch = {};
   const result = [];
-  for (const e2 of entries) {
+  for (const e2 of scoped) {
     const meta3 = allMeta[e2.id] ?? {};
     let title = meta3.title;
     if (typeof title !== "string" || title.trim() === "") {
@@ -141010,6 +141017,97 @@ function resolveSessionStats(metaStats, events, sessionId) {
     log("warn", "session stats persist failed", error51 instanceof Error ? error51.message : String(error51));
   }
   return stats;
+}
+var SESSION_LOCK_NAME = ".host-lock.json";
+var hostToken = globalThis.crypto?.randomUUID?.() ?? `h-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+var currentSessionLock = null;
+function processAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+function sessionDirFor(sessionId) {
+  return join3(dshHomePath("sessions-ay-dsh"), projectKey(process.cwd()), encodeSegment(sessionId));
+}
+function clearOwnLock() {
+  if (currentSessionLock === null) return;
+  try {
+    rmSync(currentSessionLock.file, { force: true });
+  } catch {
+  }
+  currentSessionLock = null;
+}
+function acquireSessionLock(sessionId) {
+  clearOwnLock();
+  let dir = null;
+  try {
+    for (const entry of scanSessionDirs()) {
+      if (entry.id === sessionId) {
+        dir = dirname3(entry.logPath);
+        break;
+      }
+    }
+  } catch {
+  }
+  if (dir === null) dir = sessionDirFor(sessionId);
+  const file2 = join3(dir, SESSION_LOCK_NAME);
+  try {
+    mkdirSync2(dir, { recursive: true });
+  } catch {
+  }
+  const payload = JSON.stringify({
+    pid: process.pid,
+    hostToken,
+    project: projectKey(process.cwd()),
+    acquiredAt: Date.now()
+  });
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      writeFileSync2(file2, payload, { flag: "wx" });
+      currentSessionLock = { file: file2 };
+      return { ok: true };
+    } catch (err) {
+      if (err !== null && typeof err === "object" && err.code === "EEXIST") {
+        let holder = null;
+        try {
+          holder = JSON.parse(readFileSync2(file2, "utf8"));
+        } catch {
+        }
+        if (holder !== null && Number.isInteger(holder.pid) && processAlive(holder.pid)) {
+          return { ok: false, busy: true, holderPid: holder.pid };
+        }
+        try {
+          rmSync(file2, { force: true });
+        } catch {
+        }
+        continue;
+      }
+      log("warn", "session lock acquire degraded", err instanceof Error ? err.message : String(err));
+      return { ok: true, degraded: true };
+    }
+  }
+  return { ok: true, degraded: true };
+}
+async function pauseLegacyActiveGoal(ctx, agent) {
+  try {
+    const goals = ctx.get("goals");
+    if (goals === void 0 || typeof goals.get !== "function") return;
+    const goal = goals.get(agent);
+    if (goal === void 0 || goal.phase !== "active") return;
+    if (typeof goals.pause !== "function") return;
+    const result = goals.pause(agent, { id: goal.id, revision: goal.revision });
+    if (result !== void 0 && typeof result.then === "function") await result;
+    log("info", `paused legacy active goal (id=${goal.id} rev=${goal.revision}) after session resume`);
+    post({
+      t: "hint",
+      text: L("\u5DF2\u6682\u505C\u8BE5\u4F1A\u8BDD\u9057\u7559\u7684\u81EA\u52A8\u7EED\u8DD1\u76EE\u6807\uFF0C\u53EF\u5B89\u5168\u7EE7\u7EED\u5BF9\u8BDD\u3002", "Paused a legacy auto-continuation goal for this session; safe to continue.")
+    });
+  } catch (error51) {
+    log("warn", "pause legacy goal failed", error51 instanceof Error ? error51.message : String(error51));
+  }
 }
 function encodeSegment(raw) {
   let out = "";
@@ -141409,6 +141507,7 @@ ${summary}` }] }
     } catch (error51) {
       log("error", "shutdown error", error51 instanceof Error ? error51.message : String(error51));
     }
+    clearOwnLock();
     process.exit(code);
   }
   process.on("SIGTERM", () => void shutdown(0));
@@ -141453,6 +141552,7 @@ ${summary}` }] }
             agent = created.agent;
             selection = created.selection;
             resetStepBudget = created.resetStepBudget;
+            acquireSessionLock(agent.session.id);
             if (!getSessionMeta(agent.session.id).title) {
               updateSessionMeta(agent.session.id, { title: genTempTitle(text) });
             }
@@ -141539,6 +141639,7 @@ ${meta3.seedSummary}` }],
         }
         case "newSession": {
           pendingSessionId = null;
+          clearOwnLock();
           if (handle !== void 0) {
             await handle.dispose();
             handle = void 0;
@@ -141591,6 +141692,19 @@ ${meta3.seedSummary}` }],
             break;
           }
           try {
+            const lock = acquireSessionLock(msg.id);
+            if (!lock.ok && lock.busy) {
+              log("warn", `restorePreview denied: session busy by pid ${lock.holderPid}`);
+              post({
+                t: "hint",
+                text: L(
+                  `\u8BE5\u4F1A\u8BDD\u6B63\u88AB\u53E6\u4E00 VS Code \u5B9E\u4F8B\uFF08\u8FDB\u7A0B ${lock.holderPid}\uFF09\u4F7F\u7528\u4E2D\uFF0C\u672A\u81EA\u52A8\u6062\u590D\u3002`,
+                  `This session is in use by another VS Code instance (pid ${lock.holderPid}); not auto-resumed.`
+                )
+              });
+              post({ t: "sessionResumed", id: msg.id, ok: false, error: "session busy" });
+              break;
+            }
             const meta3 = getSessionMeta(msg.id);
             if (handle !== void 0) await handle.dispose();
             const resumed = await resumeAgent(
@@ -141612,6 +141726,7 @@ ${meta3.seedSummary}` }],
             agent = resumed.agent;
             selection = resumed.selection;
             resetStepBudget = resumed.resetStepBudget;
+            await pauseLegacyActiveGoal(ctx, agent);
             if (meta3.workMode === "multi" || meta3.workMode === "single") {
               workMode = meta3.workMode;
               post({ t: "workModeChanged", mode: workMode });
@@ -141645,6 +141760,20 @@ ${meta3.seedSummary}` }],
             post({ t: "sessionResumed", id: msg.id, ok: false, error: "invalid session id" });
             break;
           }
+          const lock = acquireSessionLock(msg.id);
+          if (!lock.ok && lock.busy) {
+            log("warn", `resumeSession denied: session busy by pid ${lock.holderPid}`);
+            post({
+              t: "sessionResumed",
+              id: msg.id,
+              ok: false,
+              error: L(
+                `\u8BE5\u4F1A\u8BDD\u6B63\u88AB\u53E6\u4E00 VS Code \u5B9E\u4F8B\uFF08\u8FDB\u7A0B ${lock.holderPid}\uFF09\u4F7F\u7528\u4E2D\uFF0C\u8BF7\u5148\u5173\u95ED\u90A3\u8FB9\u7684\u7A97\u53E3\u6216\u7A0D\u540E\u518D\u8BD5\u3002`,
+                `This session is in use by another VS Code instance (pid ${lock.holderPid}). Close that window or retry later.`
+              )
+            });
+            break;
+          }
           const meta3 = getSessionMeta(msg.id);
           if (handle !== void 0) await handle.dispose();
           const tResume0 = Date.now();
@@ -141664,6 +141793,7 @@ ${meta3.seedSummary}` }],
           agent = resumed.agent;
           selection = resumed.selection;
           resetStepBudget = resumed.resetStepBudget;
+          await pauseLegacyActiveGoal(ctx, agent);
           if (meta3.workMode === "multi" || meta3.workMode === "single") {
             workMode = meta3.workMode;
             post({ t: "workModeChanged", mode: workMode });
@@ -141807,6 +141937,7 @@ ${meta3.seedSummary}` }],
           const result = await deleteSession(ctx, msg.id);
           if (result.ok) invalidateSessionsCache();
           if (result.ok && agent !== void 0 && agent.session.id === msg.id) {
+            clearOwnLock();
             if (handle !== void 0) await handle.dispose();
             handle = void 0;
             agent = void 0;

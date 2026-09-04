@@ -406,6 +406,26 @@ body {
   white-space: pre-line;
 }
 
+/* 系统折叠行（goal_round 自动续跑轮次、会话恢复提示等宿主注入的系统信息）：
+   居中浅灰小字，不占对话气泡空间，可辨识但不打断阅读。 */
+.msg.goal-round {
+  display: flex;
+  justify-content: center;
+  margin: 2px 0;
+}
+.msg.goal-round .goal-round-chip {
+  font-size: 11px;
+  color: var(--fg-dim, #888);
+  background: color-mix(in srgb, var(--border) 22%, transparent);
+  padding: 1px 10px;
+  border-radius: 999px;
+  max-width: 90%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  user-select: none;
+}
+
 .msg {
   display: flex;
   flex-direction: column;

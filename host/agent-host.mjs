@@ -27,7 +27,7 @@ import { SessionId } from "@deepseek-ai/dsh-session";
 import { installModelSelection } from "@deepseek-ai/dsh-agent";
 
 const NAME = "dsh-vscode-host";
-const CORE_VERSION = "0.5.1";
+const CORE_VERSION = "0.5.2";
 /** 插件会话 id 前缀（也是会话隔离的标识）。 */
 const SESSION_PREFIX = "dsh-vscode-";
 
@@ -99,7 +99,7 @@ function composePatches(env) {
           `Your working directory is ${currentCwd} — the user's current workspace. Use this directory for all file operations and command workdirs. ` +
           "Help with coding tasks: read and edit files, run commands, search the web, and orchestrate subagents and workflows. " +
           "File edits you make appear live in the editor. Plan before large changes; prefer the plan-mode workflow for ambiguous or big tasks. " +
-          "For long-running objectives, use the goal tools so progress persists across continuation rounds. " +
+          "Work is driven turn by turn by the user: a long-running task that cannot be finished within one turn must end with a clear summary of progress and next steps, waiting for the user's next instruction. " +
           "Tool calls, approvals, and todos are shown to the user in real time; keep them informed and concise. " +
           "Permissions: operations outside the workspace are denied by the sandbox by default. " +
           "When a task genuinely needs wider access (e.g. reading or writing files outside the workspace, or system-level commands), " +
@@ -163,6 +163,25 @@ function composePatches(env) {
     { id: "session-telemetry-otel", disabled: true },
     { id: "typert-gateway", disabled: true },
   ];
+
+  // G1（2026-09 owner 定）：默认排除 DSH 内核的 goal 自动续跑机制。
+  // goal 是"无人值守长跑"设计（agent idle 即自动 followup <goal_round> 续跑），与
+  // 插件的"人工在环"模式（每轮由用户消息驱动 + 单轮步数预算、达限即总结等待用户）
+  // 冲突：goal round 不经 chat 帧、不触发宿主预算重置，曾导致达限后 0 步空转死循环
+  // （token 黑洞）。故默认禁用三件套，仅保留 goals 域服务供宿主恢复会话时 pause
+  // 存量遗留 goal（见 pauseLegacyActiveGoal）：
+  //   - goal-round-driver：自动续跑驱动（死循环源头）
+  //   - tool-goal：模型创建/管理 goal 的工具（无工具则不会产生新 goal）
+  //   - command-goal：/goal 斜杠命令入口
+  // G2 扩展点：若将来需要无人值守长跑（如授权后自主完成大任务），把
+  // env.DSH_ENABLE_GOAL_ROUNDS 置 "1"（或改为配置项）跳过下方禁用，并配套
+  // 改造"预算按 agent turn 重置"（goal round 每轮独立预算，避免 0 步空转）。
+  // 当前默认关闭——插件不需要无人值守模式，短期预计不启用。
+  if (env.DSH_ENABLE_GOAL_ROUNDS !== "1") {
+    overlay.push({ id: "goal-round-driver", disabled: true });
+    overlay.push({ id: "tool-goal", disabled: true });
+    overlay.push({ id: "command-goal", disabled: true });
+  }
 
   return [...base, ...filteredHeadless, ...overlay];
 }
@@ -372,8 +391,8 @@ function multiAgentSection(env) {
  *   - 关闭思考用 thinking.type=disabled（即本插件的 off 档）。
  *
  * 内核适配器（dsh-llm-deepseek）当前只实现 off/high/max 三档，
- * 对 low 会抛 UNSUPPORTED_REASONING_EFFORT（resolveCallConfig 实测拒绝，
- * 见 scripts/effort-probe.mjs）。因此在宿主层把 low 归一为 high：
+ * 对 low 会抛 UNSUPPORTED_REASONING_EFFORT（resolveCallConfig 实测拒绝）。
+ * 因此在宿主层把 low 归一为 high：
  *   官方 API 支持 low（真实低档），但内核未实现——这是"内核能力落后于
  *   官方 API"的兼容处理；待内核支持 low 后应移除该映射，让 low 真正生效。
  * 未知/空值返回 undefined → 走内核/提供商默认（DeepSeek 默认 high）。
@@ -1545,10 +1564,16 @@ async function listSessions(ctx) {
     return sessionsCache;
   }
   const entries = scanSessionDirs();
+  // 项目隔离（2026-09 owner 定）：历史列表**默认只显示当前工作区（项目）的会话**，
+  // 不加任何切换标识。会话库是机器级共享根（dshHomePath("sessions-ay-dsh")），
+  // 目录虽按 projectKey 分档，但若不在此过滤，其它项目/工作区的会话会全量可见、
+  // 可被误恢复（曾导致跨工作区恢复他人会话）。切掉即与"当前工作区"强绑定。
+  const currentProject = projectKey(process.cwd());
+  const scoped = entries.filter((e) => e.project === currentProject);
   const allMeta = loadSessionMeta();
   const patch = {};
   const result = [];
-  for (const e of entries) {
+  for (const e of scoped) {
     const meta = allMeta[e.id] ?? {};
     let title = meta.title;
     if (typeof title !== "string" || title.trim() === "") {
@@ -1677,6 +1702,138 @@ function resolveSessionStats(metaStats, events, sessionId) {
     log("warn", "session stats persist failed", error instanceof Error ? error.message : String(error));
   }
   return stats;
+}
+
+/* ------------------------------------------------------------------ */
+/* 会话占用锁（2026-09 owner 定：防两个 VS Code 实例并发读写同一会话日志） */
+/* ------------------------------------------------------------------ */
+/**
+ * 活性判定**只依赖系统进程状态**（process.kill(pid, 0)），不做心跳、不强抢：
+ *  - pid 存活 → 持有者仍在（哪怕正卡在长任务/等待外设），拒绝恢复并提示，等它自己
+ *    恢复继续使用——绝不抢占活进程的会话；
+ *  - pid 不存在（正常退出/崩溃/窗口强杀）→ stale，自动接管——永不永久锁死；
+ *  - 释放：正常退出走 shutdown 钩子 best-effort 删除；崩溃无需处理（pid 消失即解锁）。
+ * 局限（已知并接受）：pid 可能被系统复用；同机短时复用概率极低且需恰巧命中同一
+ * 会话目录才可能误伤。未来若需消除，可加"进程启动时间"二次校验（Linux /proc、
+ * Windows CIM），当前不引入。
+ * 锁文件放会话目录内（.host-lock.json）；内核只认固定 transcript 文件名，不冲突；
+ * 会话删除时目录连带删除。
+ */
+const SESSION_LOCK_NAME = ".host-lock.json";
+let hostToken = (globalThis.crypto?.randomUUID?.() ?? `h-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`);
+let currentSessionLock = null; // { file } 当前宿主持有的会话锁
+
+function processAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function sessionDirFor(sessionId) {
+  return join(dshHomePath("sessions-ay-dsh"), projectKey(process.cwd()), encodeSegment(sessionId));
+}
+
+/** 释放本宿主持有的锁（best-effort；崩溃时 pid 消失即由他方接管，无需此处兜底）。 */
+function clearOwnLock() {
+  if (currentSessionLock === null) return;
+  try {
+    rmSync(currentSessionLock.file, { force: true });
+  } catch {
+    /* best-effort */
+  }
+  currentSessionLock = null;
+}
+
+/**
+ * 接管会话：先释放旧锁，再原子独占抢占目标会话锁。
+ * @returns {ok:true} 或 {ok:false, busy:true, holderPid}（他实例进程活着）
+ *         或 {ok:true, degraded:true}（锁不可用但不阻断会话功能）。
+ */
+function acquireSessionLock(sessionId) {
+  clearOwnLock();
+  // 锁文件锚定会话**实际所在目录**（按日志目录反查），而不是检查方当前 cwd 的
+  // projectKey——否则不同工作区/项目的窗口（cwd 不同）会各自写不同路径的锁文件，
+  // 互斥失效（会话 id 全局唯一、目录按项目分档，锁必须落在真实目录）。restorePreview
+  // 的自动恢复不经列表过滤，正是必须按真实目录加锁的场景。新会话（日志尚未落盘）
+  // 回退到当前 cwd 分档——同工作区双开场景路径一致，仍然互斥。
+  let dir = null;
+  try {
+    for (const entry of scanSessionDirs()) {
+      if (entry.id === sessionId) {
+        dir = dirname(entry.logPath);
+        break;
+      }
+    }
+  } catch {
+    /* 扫描失败回退 */
+  }
+  if (dir === null) dir = sessionDirFor(sessionId);
+  const file = join(dir, SESSION_LOCK_NAME);
+  try {
+    mkdirSync(dir, { recursive: true });
+  } catch {
+    /* 尽力而为 */
+  }
+  const payload = JSON.stringify({
+    pid: process.pid,
+    hostToken,
+    project: projectKey(process.cwd()),
+    acquiredAt: Date.now(),
+  });
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      writeFileSync(file, payload, { flag: "wx" }); // 原子独占创建
+      currentSessionLock = { file };
+      return { ok: true };
+    } catch (err) {
+      if (err !== null && typeof err === "object" && err.code === "EEXIST") {
+        let holder = null;
+        try {
+          holder = JSON.parse(readFileSync(file, "utf8"));
+        } catch {
+          /* 坏锁内容按 stale 处理 */
+        }
+        if (holder !== null && Number.isInteger(holder.pid) && processAlive(holder.pid)) {
+          return { ok: false, busy: true, holderPid: holder.pid };
+        }
+        try {
+          rmSync(file, { force: true }); // stale：持有者已死，清锁重试一次
+        } catch {
+          /* 忽略 */
+        }
+        continue;
+      }
+      // 其它异常（目录只读等）：降级为无锁继续，不阻断会话功能
+      log("warn", "session lock acquire degraded", err instanceof Error ? err.message : String(err));
+      return { ok: true, degraded: true };
+    }
+  }
+  return { ok: true, degraded: true };
+}
+
+/** 恢复会话后的存量目标收尸（G1）：插件已禁用 goal 自动续跑与工具，若会话遗留
+ *  active goal（历史上模型创建的无人值守目标），宿主直接 pause，杜绝任何恢复后
+ *  复活续跑的可能（driver 禁用是主闸，此为二次保险）。失败不阻断恢复。 */
+async function pauseLegacyActiveGoal(ctx, agent) {
+  try {
+    const goals = ctx.get("goals");
+    if (goals === undefined || typeof goals.get !== "function") return;
+    const goal = goals.get(agent);
+    if (goal === undefined || goal.phase !== "active") return;
+    if (typeof goals.pause !== "function") return;
+    const result = goals.pause(agent, { id: goal.id, revision: goal.revision });
+    if (result !== undefined && typeof result.then === "function") await result;
+    log("info", `paused legacy active goal (id=${goal.id} rev=${goal.revision}) after session resume`);
+    post({
+      t: "hint",
+      text: L("已暂停该会话遗留的自动续跑目标，可安全继续对话。", "Paused a legacy auto-continuation goal for this session; safe to continue."),
+    });
+  } catch (error) {
+    log("warn", "pause legacy goal failed", error instanceof Error ? error.message : String(error));
+  }
 }
 
 /** 与 dsh-session-persistence-jsonl 相同的项目目录编码。 */
@@ -2161,6 +2318,7 @@ async function main() {
     } catch (error) {
       log("error", "shutdown error", error instanceof Error ? error.message : String(error));
     }
+    clearOwnLock(); // 释放会话锁（best-effort；崩溃时 pid 消失即自动失效）
     process.exit(code);
   }
 
@@ -2235,6 +2393,8 @@ async function main() {
               agent = created.agent;
               selection = created.selection;
               resetStepBudget = created.resetStepBudget;
+              // 新会话接管会话锁（统一写锁：其他实例试图恢复本会话时将被拒绝）。
+              acquireSessionLock(agent.session.id);
               // 会话已真实创建：立即生成**静态临时标题**写入 meta（标题是静态
               // 记录，此后仅由用户重命名覆盖）。列表直接读 meta，无需内核折叠
               // 会话日志推导标题——历史列表因此秒开，与会话内容大小无关。
@@ -2343,6 +2503,7 @@ async function main() {
           }
           case "newSession": {
             pendingSessionId = null; // 用户主动新建：作废轮转预建的下一会话 id
+            clearOwnLock(); // 释放旧会话锁（即将不再持有任何会话）
             if (handle !== undefined) {
               await handle.dispose();
               handle = undefined;
@@ -2411,6 +2572,20 @@ async function main() {
             }
             // ② 立即继续 resumeAgent（历史已秒显；复用 inspect 的 prepared 缓存）
             try {
+              // 会话占用锁：自动恢复同样受"他实例活着持有"保护（防并发双写）。
+              const lock = acquireSessionLock(msg.id);
+              if (!lock.ok && lock.busy) {
+                log("warn", `restorePreview denied: session busy by pid ${lock.holderPid}`);
+                post({
+                  t: "hint",
+                  text: L(
+                    `该会话正被另一 VS Code 实例（进程 ${lock.holderPid}）使用中，未自动恢复。`,
+                    `This session is in use by another VS Code instance (pid ${lock.holderPid}); not auto-resumed.`
+                  ),
+                });
+                post({ t: "sessionResumed", id: msg.id, ok: false, error: "session busy" });
+                break;
+              }
               const meta = getSessionMeta(msg.id);
               if (handle !== undefined) await handle.dispose();
               const resumed = await resumeAgent(
@@ -2432,6 +2607,8 @@ async function main() {
               agent = resumed.agent;
               selection = resumed.selection;
               resetStepBudget = resumed.resetStepBudget;
+              // 存量目标收尸（G1）：自动恢复同样 pause 遗留 active goal。
+              await pauseLegacyActiveGoal(ctx, agent);
               if (meta.workMode === "multi" || meta.workMode === "single") {
                 workMode = meta.workMode;
                 post({ t: "workModeChanged", mode: workMode });
@@ -2469,6 +2646,23 @@ async function main() {
               post({ t: "sessionResumed", id: msg.id, ok: false, error: "invalid session id" });
               break;
             }
+            // 会话占用锁（2026-09 owner 定）：恢复前先查他实例是否活着持有该会话。
+            // pid 存活 → 拒绝（防两实例并发写同一日志——曾写坏会话文件）；pid 已死
+            // → stale 自动接管。锁不可用时降级继续，不阻断。
+            const lock = acquireSessionLock(msg.id);
+            if (!lock.ok && lock.busy) {
+              log("warn", `resumeSession denied: session busy by pid ${lock.holderPid}`);
+              post({
+                t: "sessionResumed",
+                id: msg.id,
+                ok: false,
+                error: L(
+                  `该会话正被另一 VS Code 实例（进程 ${lock.holderPid}）使用中，请先关闭那边的窗口或稍后再试。`,
+                  `This session is in use by another VS Code instance (pid ${lock.holderPid}). Close that window or retry later.`
+                ),
+              });
+              break;
+            }
             // 恢复会话参数：模型/思考级别/workMode 优先取该会话记录的 meta
             const meta = getSessionMeta(msg.id);
             if (handle !== undefined) await handle.dispose();
@@ -2490,6 +2684,9 @@ async function main() {
             agent = resumed.agent;
             selection = resumed.selection;
             resetStepBudget = resumed.resetStepBudget;
+            // 存量目标收尸（G1）：该会话若遗留 active goal（历史自动续跑目标），
+            // 宿主直接 pause——插件已排除 goal 自动续跑，恢复即清零，杜绝复活续跑。
+            await pauseLegacyActiveGoal(ctx, agent);
             // 恢复工作模式（meta 记录；无则保持当前）
             if (meta.workMode === "multi" || meta.workMode === "single") {
               workMode = meta.workMode;
@@ -2668,6 +2865,7 @@ async function main() {
               // 删除的是当前会话：重置为"待开始"状态（惰性）——
               // 不立即创建新会话，等用户发出第一条消息才真正创建，
               // 避免产生无对话的空会话。
+              clearOwnLock(); // 锁文件随会话目录删除；此处清宿主持有指针
               if (handle !== undefined) await handle.dispose();
               handle = undefined;
               agent = undefined;

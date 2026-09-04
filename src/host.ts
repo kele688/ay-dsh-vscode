@@ -87,6 +87,7 @@ export type HostEvent =
   | { type: "ready"; sessionId: string; model: string; provider: string; cwd: string; sessionTitle?: string; sessionBytes?: number }
   | { type: "view"; event: ViewEvent }
   | { type: "status"; status: "idle" | "running" }
+  | { type: "hint"; text: string }
   | { type: "approval"; id: number; toolName: string; reason?: string; callId?: string; agentId?: string }
   | { type: "approvalGone"; id: number }
   | { type: "sessions"; list: SessionSummary[]; error?: string }
@@ -404,6 +405,11 @@ export class AgentHost {
       case "status": {
         this.running = frame.status === "running";
         this.emit({ type: "status", status: frame.status });
+        break;
+      }
+      case "hint": {
+        // 宿主提示帧（会话被占用 / 遗留自动目标已暂停等）：转发给扩展层显示。
+        this.emit({ type: "hint", text: typeof frame.text === "string" ? frame.text : "" });
         break;
       }
       case "events": {
