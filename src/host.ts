@@ -75,6 +75,8 @@ export interface AgentHostOptions {
   enableLearning?: boolean;
   /** 个性定制：是否自动学习（宿主提炼用户明确规则写入学习文件，默认 true）。 */
   enableAutoLearn?: boolean;
+  /** 每轮重申：每轮首条注入 [重申纪律]（引用定制品格/学习经验的规定标签）。 */
+  enableReiteration?: boolean;
   /** 插件专属的 DSH home 目录（会话/配置均存于此，与官方 dsh 完全隔离）。 */
   dshHome: string;
   /** 旧 DSH home（用于一次性迁移历史会话）。 */
@@ -306,6 +308,7 @@ export class AgentHost {
       DSH_ENABLE_CUSTOM: this.options.enableCustom ? "1" : "0",
       DSH_ENABLE_LEARNING: this.options.enableLearning ? "1" : "0",
       DSH_ENABLE_LEARN: this.options.enableAutoLearn ? "1" : "0",
+      DSH_ENABLE_REITERATION: this.options.enableReiteration ? "1" : "0",
       DSH_ROTATE_SUMMARY: (this.options.rotateSummary ?? true) ? "1" : "0",
       DSH_TELEMETRY_DISABLED: "1",
       // 统一子进程文本编码为 UTF-8：Windows PowerShell 5.1 / Python 默认按

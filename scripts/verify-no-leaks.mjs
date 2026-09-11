@@ -44,10 +44,12 @@ const CONTENT_PATTERNS = [
   { name: "VS Code install path", re: /C:\\Program Files\\Microsoft VS Code/ },
 ];
 
-/* Owner username is legitimate inside the public repo URL
-   (github.com/<owner>/ay-dsh-vscode) but nowhere else. */
+/* Owner username is legitimate inside the public repository identity — either the
+   full URL (github.com/<owner>/ay-dsh-vscode) or the `owner/repo` slug that the
+   GitHub API endpoints use (upgradeCenter) — but nowhere else. */
 const USER = W("kele", "688");
 const USER_IN_REPO_URL = new RegExp(W("github\\.com/", "kele", "688"), "g");
+const REPO_SLUG = new RegExp(W("kele", "688/ay-dsh-vscode"), "g");
 
 const OWNER_USERNAME_EXEMPT = new Set([
   "package.json",
@@ -81,9 +83,11 @@ for (const f of files) {
     continue; // binary or unreadable
   }
   if (content.includes("\0")) continue; // binary asset
-  const withoutRepoUrls = content.replace(USER_IN_REPO_URL, "");
+  // 去掉公开仓库标识的两种合法形态（完整 URL 与 owner/repo slug）后，
+  // 仍出现 owner 用户名才算泄露。
+  const withoutRepoUrls = content.replace(USER_IN_REPO_URL, "").replace(REPO_SLUG, "");
   if (!OWNER_USERNAME_EXEMPT.has(f) && withoutRepoUrls.includes(USER)) {
-    violations.push(`${f}: content contains owner username outside repo URLs`);
+    violations.push(`${f}: content contains owner username outside the repository identity`);
     continue;
   }
   for (const { name, re } of CONTENT_PATTERNS) {

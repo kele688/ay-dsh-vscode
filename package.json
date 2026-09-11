@@ -291,6 +291,11 @@
           "type": "boolean",
           "default": false,
           "markdownDescription": "启动学习：宿主在对话中自动提炼用户明确提出的规则/被肯定的经验，写入学习文件。"
+        },
+        "dshVscode.enableReiteration": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "每轮重申：宿主在每轮对话的首条系统消息中注入“[重申纪律]”指令，引用并重申“用户定制品格”与“自动学习经验”中规定（标签化引用，见 ay-dsh-reiteration.md，重启后生效）。"
         }
       }
     }

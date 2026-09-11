@@ -118,6 +118,8 @@
     enableLearningOff: zh ? "关闭：即使“自动学习经验”有内容也不会注入系统提示词。" : "Off: learned rules are not injected even if they exist.",
     enableAutoLearnOn: zh ? "开启：宿主会在对话中自动提炼你明确提出的规则、被肯定的经验，写入“自动学习经验”。" : "On: the host auto-extracts rules you explicitly state or confirm and writes them to the learned-rules file.",
     enableAutoLearnOff: zh ? "关闭：不会自动学习新经验（已有经验仍可按“启用经验”开关加载）。" : "Off: no auto-learning (existing rules can still be loaded via “Enable learned rules”).",
+    enableReiterationOn: zh ? "开启：宿主在每轮对话首条注入“重申纪律”，重申“用户定制品格/自动学习经验”中的规定标签（重启后生效）。" : "On: the host starts every round with a “reiterate discipline” message that re-states the labels from your custom persona / learned rules (effective on restart).",
+    enableReiterationOff: zh ? "关闭：每轮不注入重申指令。" : "Off: no per-round reiteration message.",
     permissionMatch: zh ? "工具名" : "Tool",
     permissionAction: zh ? "动作" : "Action",
     permissionActionAllow: zh ? "允许" : "Allow",
@@ -185,6 +187,7 @@
     enableCustom: $("cfgEnableCustom"),
     enableLearning: $("cfgEnableLearning"),
     enableAutoLearn: $("cfgEnableAutoLearn"),
+    enableReiteration: $("cfgEnableReiteration"),
   };
   // 自动压缩开关旁的"自动/手动"状态随勾选框实时切换
   const autoCompactionState = $("cfgAutoCompactionState");
@@ -207,6 +210,7 @@
     ["cfgEnableCustomHint", fields.enableCustom, "enableCustomOn", "enableCustomOff"],
     ["cfgEnableLearningHint", fields.enableLearning, "enableLearningOn", "enableLearningOff"],
     ["cfgEnableAutoLearnHint", fields.enableAutoLearn, "enableAutoLearnOn", "enableAutoLearnOff"],
+    ["cfgEnableReiterationHint", fields.enableReiteration, "enableReiterationOn", "enableReiterationOff"],
   ];
   const personalStateUpdaters = [];
   for (const [hintId, field, onKey, offKey] of personalSwitches) {
@@ -1083,6 +1087,7 @@
   // "个性定制"组"编辑"按钮：用 VS Code 编辑器打开文件（首次编辑自动创建）。
   $("btnEditCustom").addEventListener("click", () => vscode.postMessage({ t: "editCustomFile", kind: "custom" }));
   $("btnEditLearning").addEventListener("click", () => vscode.postMessage({ t: "editCustomFile", kind: "learning" }));
+  $("btnEditReiteration").addEventListener("click", () => vscode.postMessage({ t: "editCustomFile", kind: "reiteration" }));
 
   // ── 各组独立"保存"按钮（规则详见文件头部注释）──
   // 点击**只落盘本组字段、绝不重启宿主**；生效由功能组菜单"重启应用"统一触发。
@@ -1158,6 +1163,7 @@
         enableCustom: fields.enableCustom.checked,
         enableLearning: fields.enableLearning.checked,
         enableAutoLearn: fields.enableAutoLearn.checked,
+        enableReiteration: fields.enableReiteration.checked,
       },
     });
   });
@@ -1188,6 +1194,7 @@
     fields.enableCustom.checked = c.enableCustom === true;
     fields.enableLearning.checked = c.enableLearning === true;
     fields.enableAutoLearn.checked = c.enableAutoLearn === true;
+    fields.enableReiteration.checked = c.enableReiteration === true;
     personalStateUpdaters.forEach((fn) => fn());
     // 权限规则 = 系统默认（只读展示，宿主内置）+ 用户自定义（可增删改）：
     // 配置中与系统默认同名的条目被系统默认覆盖（宿主内置即生效，无需重复写盘）；
@@ -1230,11 +1237,13 @@
         }
         break;
       case "customFiles": {
-        // 个性定制：只读预览两个文件内容（markdown 渲染；编辑走 VS Code 编辑器）
+        // 个性定制：只读预览三个文件内容（markdown 渲染；编辑走 VS Code 编辑器）
         const c = $("cfgCustomPrompt");
         const l = $("cfgLearning");
+        const r = $("cfgReiteration");
         if (c) c.innerHTML = renderMarkdown(msg.custom?.text || "");
         if (l) l.innerHTML = renderMarkdown(msg.learning?.text || "");
+        if (r) r.innerHTML = renderMarkdown(msg.reiteration?.text || "");
         break;
       }
       case "saved":
