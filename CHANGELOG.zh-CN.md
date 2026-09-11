@@ -1,5 +1,10 @@
 # 更新日志
 
+## [0.5.3] - 2026-09-11
+
+- patch
+- feat: label system rules, add per-round reiteration directive; fix updater latest/next logic
+
 ## [0.5.2] - 2026-09-04
 
 - 基于项目隔离历史会话列表，防止在不同的工作区恢复不相干会话
