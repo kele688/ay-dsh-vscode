@@ -104,7 +104,7 @@ function composePatches(env) {
           "Permissions: operations outside the workspace are denied by the sandbox by default. " +
           "When a task genuinely needs wider access (e.g. reading or writing files outside the workspace, or system-level commands), " +
           "you may request a one-time escalation by passing `sandbox_permissions` (the narrowest wider mode that suffices, e.g. \"danger-full-access\") " +
-          "together with a clear `justification` to the file/command tools — the user is then prompted to approve or deny in the UI. " +
+          "together with a clear `justification` to the file/command tools and parameters in detail — the user is then prompted to approve or deny in the UI. " +
           "Do not request escalation casually; prefer working inside the workspace. " +
           "Encoding: on Windows, command output (PowerShell 5.1 / Python) defaults to the system code page, " +
           "which garbles non-ASCII text (any language) when captured. When running a command whose output " +
@@ -507,12 +507,12 @@ function languageDirectiveSection() {
   if (UI_LANG === "zh") {
     return {
       name: "language",
-      text: "请始终使用简体中文回复用户，思考过程（reasoning）同样使用简体中文。除非用户明确要求使用其他语言。",
+      text: "【语言规则】：请始终使用简体中文回复用户，思考过程（reasoning）同样使用简体中文。除非用户明确要求使用其他语言。",
     };
   }
   return {
     name: "language",
-    text: "Always reply in English, including your reasoning. Use English unless the user explicitly asks for another language.",
+    text: "[Language rule]: Always reply in English, including your reasoning. Use English unless the user explicitly asks for another language.",
   };
 }
 
@@ -556,8 +556,8 @@ function toolBoundarySection() {
     return {
       name: "tool-boundary",
       text:
-        "工具调用边界：工具调用仅用于**模型推理所必需**的信息收集与分析" +
-        "（读文件、搜索、执行能直接产生推理依据的命令）。" +
+        "【工具调用边界规则】：工具调用仅用于**模型推理所必需**的信息收集与分析" +
+        "（读文件、搜索、执行能直接产生推理依据的命令），且优先调用沙箱内工具。" +
         "**替用户完成的工作不要调用工具**——例如编译、打包、部署、每轮结尾的全面安全检查等" +
         "重复性验证动作，除非用户明确要求，否则不主动执行：改为在最终答复中给出清晰的操作步骤/命令清单，" +
         "由用户自行执行；也不要发起不必要的权限授权请求。",
@@ -566,8 +566,8 @@ function toolBoundarySection() {
   return {
     name: "tool-boundary",
     text:
-      "Tool-use boundary: use tools ONLY for information gathering and analysis your reasoning requires " +
-      "(reading files, searching, running commands that directly produce reasoning evidence). " +
+      "[Tool-use boundary rule]: use tools ONLY for information gathering and analysis your reasoning requires " +
+      "(reading files, searching, running commands that directly produce reasoning evidence), and prefer in-sandbox tools." +
       "Do NOT call tools to do the user's work for them — e.g. compiling, packaging, deploying, or full " +
       "security sweeps at the end of every turn. Unless the user explicitly asks, don't perform these yourself: " +
       "instead give a clear step-by-step command list in your final answer for the user to run. " +
@@ -593,25 +593,25 @@ function stepBudgetSection(limit) {
     return {
       name: "step-budget",
       text:
-        `每轮对话（一条用户消息）的思考步数预算为 ${limit} 步，请在此预算内规划工作节奏。` +
+        `【每轮对话思考预算规则】: 每轮对话（一条用户消息）的思考步数预算为 ${limit} 步，请在此预算内规划工作节奏。` +
         "请全力发挥能力，以**最少的步数**实现最好的解决效果，提高效率、节省 tokens。" +
-        "效率要点：动手前先简述你的计划与预估步数（写在回复文本中，不消耗工具步），按计划执行减少绕路；" +
+        "效率要点：动手前先简述你的计划与预估步数（写在回复文本中，不消耗工具步数），按计划执行减少绕路；" +
         "需要收集多项信息时，在同一答复中**一次发起多个工具调用**（并行批量收集），" +
         "一次性拿回所有需要的信息后再分析；仅当调用之间**存在依赖**时才逐个进行。" +
-        "预算用尽后工具调用将被禁用，你必须立即收尾总结（说明已完成/未完成/下一步命令），预算耗尽后请勿继续工作。" +
+        "预算用尽后工具调用将被禁用，你必须立即收尾总结（说明已完成/未完成/下一步命令），发出应答并停止工作。" +
         "本轮实时进度由系统每步通过 [本步指引] 提供（专用字段 STEPS_USED/STEPS_REMAIN/TOOLS_USED/ELAPSED_SEC），请引用其数值。",
     };
   }
   return {
     name: "step-budget",
     text:
-      `Each turn (one user message) has a thinking-step budget of ${limit} steps. Plan your work to finish within it. ` +
+      `[Per-turn thinking budget rule]: Each turn (one user message) has a thinking-step budget of ${limit} steps. Plan your work to finish within it. ` +
       "Do your best to achieve the best outcome in the FEWEST steps — be efficient and save tokens. " +
       "Efficiency guidance: before acting, briefly state your plan and estimated steps in your reply text (costs no tool steps) and follow it to avoid detours; " +
       "when you need several pieces of information, issue MULTIPLE tool calls in a single reply " +
       "(parallel batch collection), then analyze once all results are back; go step-by-step only when calls DEPEND on each other. " +
       "When the budget is exhausted, tool calls are disabled and you must wrap up immediately: deliver a concise final answer " +
-      "(accomplished / unfinished / next command). Do not continue beyond the budget. " +
+      "(accomplished / unfinished / next command), and then stop working immediately. " +
       "Real-time progress is provided each step via [Step guide] (named fields STEPS_USED/STEPS_REMAIN/TOOLS_USED/ELAPSED_SEC); quote those values.",
   };
 }
@@ -621,7 +621,7 @@ function wrapUpReportSection() {
     return {
       name: "wrap-up-report",
       text:
-        "收尾报告（**强制，非可选项**）：每轮对话（对应用户的一次输入）的最终答复的**第一行**必须以如下格式开头：" +
+        "【收尾报告规则】（**强制，非可选项**）：每轮对话（对应用户的一次输入）的最终答复的**第一行**必须以如下格式开头：" +
         "`⏱ 本轮统计：STEPS_USED 步思考 / TOOLS_USED 次工具调用 / 耗时 ELAPSED_SEC 秒`" +
         "——**STEPS_USED / TOOLS_USED / ELAPSED_SEC 取本步 [本步指引] 中同名专用字段的值**；" +
         "如果你本步还进行了工具调用，则 TOOLS_USED 还必须加上你本步调用工具的次数，" +
@@ -631,7 +631,7 @@ function wrapUpReportSection() {
   return {
     name: "wrap-up-report",
     text:
-      "Wrap-up report (MANDATORY, not optional): Per turn (one user input) your final answer's FIRST LINE must open with " +
+      "[Wrap-up report rule] (MANDATORY, not optional): Per turn (one user input) your final answer's FIRST LINE must open with " +
       "`⏱ Stats this turn: STEPS_USED steps / TOOLS_USED tool calls / ELAPSED_SECs elapsed`" +
       " — STEPS_USED / TOOLS_USED / ELAPSED_SEC are the values of the SAME NAMED FIELDS in THIS step's " +
       "[Step guide]; if you issue additional tool calls in this step, ADD them to TOOLS_USED and ADD this " +
@@ -647,9 +647,12 @@ function wrapUpReportSection() {
  */
 function roundGuideText(perfNoteText) {
   if (UI_LANG === "zh") {
-    return `[本轮指引] ${perfNoteText || "本轮请以最少步数高效完成任务。"}`;
+    return `[本轮指引] 必须严格遵守【语言规则】、【工具调用边界规则】、【每轮对话思考预算规则】和【收尾报告规则】。` +
+      ` ${ perfNoteText || "本轮请以最少步数高效完成任务。" }`;
   }
-  return `[Round guide] ${perfNoteText || "Complete this round efficiently in as few steps as possible."}`;
+  return `[Round guide] Must strictly comply with the [Language rule], [Tool-use boundary rule], ` +
+    `[Per-turn thinking budget rule], and [Wrap-up report rule]. ` +
+    `${ perfNoteText || "Complete this round efficiently in as few steps as possible." }`;
 }
 
 /**
@@ -686,13 +689,12 @@ function stepLimitWrapUpMessage(limit, steps, tools, elapsedSec) {
   if (UI_LANG === "zh") {
     return (
       `[达限警示] 本轮思考步数已达上限（${steps}/${limit}），已发起 ${tools} 次工具调用，本轮耗时 ${elapsedSec} 秒，` +
-      "所有工具调用已被禁用。" +
-      "单轮步数上限用于控制单次请求规模、防止工具循环失控，因此本轮工作到此为止。" +
+      "所有工具调用已被禁用。单轮步数上限用于控制单次请求规模、防止工具循环失控，因此本轮工作到此为止。" +
       "请立即停止进一步推理，在本回复中给出最终答复，**第一行**必须以如下格式开头：" +
       "`⏱ 本轮统计：STEPS_USED 步思考 / TOOLS_USED 次工具调用 / 耗时 ELAPSED_SEC 秒`" +
       `（其中 STEPS_USED=${steps}、TOOLS_USED=${tools}、ELAPSED_SEC=${elapsedSec}，若本答复中还有新的工具调用和耗时请一并计入），` +
       "随后写总结正文（已完成/未完成/下一步命令）。" +
-      "预算耗尽后请勿继续工作，请务必严格遵守此规则！"
+      "请务必严格遵守此规则！预算已耗尽，完成收尾总结后务必立即停止工作！"
     );
   }
   return (
@@ -702,8 +704,8 @@ function stepLimitWrapUpMessage(limit, steps, tools, elapsedSec) {
     "Stop further reasoning and deliver your final answer in this reply, opening with a first line in this exact format: " +
     "`⏱ Stats this turn: STEPS_USED steps / TOOLS_USED tool calls / ELAPSED_SECs elapsed`" +
     ` (STEPS_USED=${steps}, TOOLS_USED=${tools}, ELAPSED_SEC=${elapsedSec}; count any NEW tool calls and time used in this reply too), ` +
-    "then the summary body (accomplished / unfinished / next command). Do not continue working after this reply. " +
-    "Please strictly comply with this rule!"
+    "then the summary body (accomplished / unfinished / next command). " +
+    "Please strictly comply with this rule! Stop working immediately after deliver this response!"
   );
 }
 
@@ -912,9 +914,14 @@ function attachAgent(ctx, handle, pump) {
       add(stepLimitWrapUpMessage(stepLimit, stepCount, toolCallCount, elapsedSec()));
       return { ...decision, messages };
     }
-    // 每轮首步：注入 [本轮指引]（预算 + 效率 + 绩效）
+    // 每轮首步：先注入 [重申纪律]（引用并重申定制品格/学习经验的规定标签，
+    // 位置在 [本轮指引] 之前——前呼后应的"后应"层，拉回模型对系统提示规则的
+    // 注意力），再注入 [本轮指引]（预算 + 效率 + 绩效）。
     if (!roundGuideInjected) {
       roundGuideInjected = true;
+      if (reiterationText) {
+        add(`${UI_LANG === "zh" ? "[重申纪律]" : "[Reiterate rules]"}\n${reiterationText}`);
+      }
       add(roundGuideText(perfNote()));
     }
     // 每步：注入 [本步指引]（动态剩余，尽快完成）
@@ -1074,8 +1081,15 @@ function attachAgent(ctx, handle, pump) {
   // 关闭时即使文件有内容也不加载。
   const enableCustom = String(process.env.DSH_ENABLE_CUSTOM ?? "0") !== "0";
   const enableLearning = String(process.env.DSH_ENABLE_LEARNING ?? "0") !== "0";
+  const enableReiteration = String(process.env.DSH_ENABLE_REITERATION ?? "0") !== "0";
   const customPrompt = enableCustom ? readTextFile(CUSTOM_PROMPT_FILE) : "";
   const learningText = enableLearning ? readTextFile(LEARNING_FILE) : "";
+  // [重申纪律]（"每轮重申指令"，2026-09 owner 定）：每轮首条系统消息（位于
+  // [本轮指引] 之前）引用并重申"用户定制品格 / 自动学习经验"中的规定标签——
+  // 前呼后应的"后应"强调层，把模型注意力拉回系统提示中的规则全文，强化长会话
+  // 中的规则遵循权重。agent 启动快照一次保持稳定（内容/开关变化在宿主重启或
+  // 新建会话后生效）；文件为空时不注入；开关 DSH_ENABLE_REITERATION=0 关闭。
+  const reiterationText = enableReiteration ? readTextFile(REITERATION_FILE) : "";
   agent.ctx.on("system-prompt/assemble", async (_assembly, _context, next) => {
     const assembled = await next();
     const sections = [...(assembled.sections ?? [])];
@@ -1428,6 +1442,7 @@ async function summarizeUserMessages(ctx, agent, texts, signal) {
  *  文件不存在/为空即不注入，不影响默认提示词。 */
 const CUSTOM_PROMPT_FILE = join(resolveDshHome(), "ay-dsh-custom.md");
 const LEARNING_FILE = join(resolveDshHome(), "ay-dsh-learning.md");
+const REITERATION_FILE = join(resolveDshHome(), "ay-dsh-reiteration.md");
 
 /** 读文件文本（不存在/空/异常返回空串）。 */
 function readTextFile(p) {

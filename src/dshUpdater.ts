@@ -33,8 +33,9 @@ export interface DshUpdaterDeps {
   isChatActive: () => boolean;
   /** 日志输出（走扩展输出通道）。 */
   log: (msg: string) => void;
-  /** 发现更新的 DSH 版本时回调（由运行时管理器评估并触发采纳 UI）。 */
-  onCandidate?: (latest: string) => void;
+  /** 发现可升级的 DSH 候选版本时回调（可能来自 latest 或 next 标签，见检测处通道
+   *  规则；由运行时管理器评估黑名单/忽略并触发采纳 UI）。 */
+  onCandidate?: (candidate: string) => void;
 }
 
 /** 解析 VSIX 内置（插件发布时锁定）的 DSH 版本；缺失返回 undefined。 */
@@ -113,12 +114,35 @@ export function startDshUpdateChecker(deps: DshUpdaterDeps): vscode.Disposable {
       const latest = tags.latest;
       const next = tags.next;
       const bundled = bundledDshVersion(deps.extensionPath);
-      if (latest && bundled && semverGt(latest, bundled)) {
-        deps.log(`[dsh-updater] new DSH ${latest} available (latest=${latest}, next=${next ?? "—"}, bundled=${bundled})`);
+      // npm dist-tag 语义（2026-09 实测 DSH 官方发布习惯）：
+      //   latest 标签可能长期停在旧版（曾见 latest=0.1.0-rc.6），新 rc/预发布都发在
+      //   next 标签（next=0.1.2-rc.1）——"latest 标签"≠"远端最高版本"。旧逻辑只比较
+      //   latest 会漏报更新，且日志 "up to date" 有误导（next 明明更高却不提示）。
+      // 通道规则：
+      //   - 插件内置版本为预发布（含 -rc/beta 等）→ 用户处于 next/rc 通道：
+      //     候选 = max(latest, next)（语义更高者），两个标签都纳入；
+      //   - 插件内置为正式版 → 只跟随 stable 通道（latest）：next 的预发布不自动
+      //     推送给正式版用户（避免未经预览的 rc 打扰），next 仅留日志参考。
+      const bundledPre = typeof bundled === "string" && /-/.test(bundled);
+      let candidate: string | undefined;
+      let chosenTag: string | undefined;
+      const consider = (tag: string | undefined, tagName: string): void => {
+        if (!tag) return;
+        if (!bundledPre && tagName === "next") return; // 正式版用户不自动跟 next
+        if (candidate === undefined || semverGt(tag, candidate)) {
+          candidate = tag;
+          chosenTag = tagName;
+        }
+      };
+      consider(latest, "latest");
+      consider(next, "next");
+      if (candidate && bundled && semverGt(candidate, bundled)) {
+        deps.log(`[dsh-updater] new DSH ${candidate} available (tag=${chosenTag}, latest=${latest ?? "—"}, next=${next ?? "—"}, bundled=${bundled})`);
         // 候选移交运行时管理器（黑名单/忽略过滤 + 采纳 UI 由调用方决定）
-        if (deps.onCandidate) deps.onCandidate(latest);
+        if (deps.onCandidate) deps.onCandidate(candidate);
       } else {
-        deps.log(`[dsh-updater] DSH up to date (latest=${latest ?? "unknown"}, next=${next ?? "—"}, bundled=${bundled ?? "unknown"})`);
+        // 未命中更新：日志同时给出两个 tag 的真实值，供人工判断发布通道状态
+        deps.log(`[dsh-updater] DSH up to date (latest=${latest ?? "—"}, next=${next ?? "—"}, bundled=${bundled ?? "unknown"})`);
       }
       // 成功检测（无论有无更新）→ 记录时间，24h 后再检
       await deps.workspaceState.update(LAST_CHECK_KEY, Date.now());

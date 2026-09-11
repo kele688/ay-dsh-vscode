@@ -835,9 +835,11 @@
     "[本轮指引]",
     "[本步指引]",
     "[达限警示]",
+    "[重申纪律]",
     "[Round guide]",
     "[Step guide]",
     "[Limit warning]",
+    "[Reiterate rules]",
   ];
   function isSystemDirective(text) {
     const t = String(text ?? "");

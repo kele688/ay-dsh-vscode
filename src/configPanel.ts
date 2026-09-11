@@ -91,6 +91,7 @@ export interface ConfigPanelDeps {
     enableCustom: boolean;
     enableLearning: boolean;
     enableAutoLearn: boolean;
+    enableReiteration: boolean;
     autoApproveRules: { match: string; action: string }[];
   };
   /** 当前 Agent 工作目录（展示用）。 */
@@ -153,8 +154,10 @@ export function openConfigPanel(context: vscode.ExtensionContext, deps: ConfigPa
   // 个性定制文件（DSH home 固定路径固定文件名，跨项目共享）
   const customPromptFile = join(deps.dshHomePath, "ay-dsh-custom.md");
   const learningFile = join(deps.dshHomePath, "ay-dsh-learning.md");
+  const reiterationFile = join(deps.dshHomePath, "ay-dsh-reiteration.md");
   let customMtime = 0;
   let learningMtime = 0;
+  let reiterationMtime = 0;
   const readCustomFile = (p: string): string => {
     try {
       return existsSync(p) ? readFileSync(p, "utf8") : "";
@@ -175,6 +178,7 @@ export function openConfigPanel(context: vscode.ExtensionContext, deps: ConfigPa
       t: "customFiles",
       custom: { text: readCustomFile(customPromptFile), mtime: customMtime },
       learning: { text: readCustomFile(learningFile), mtime: learningMtime },
+      reiteration: { text: readCustomFile(reiterationFile), mtime: reiterationMtime },
     });
   };
   // 从编辑器切回配置面板时刷新个性定制预览（用户编辑保存后可见新内容）
@@ -362,14 +366,22 @@ export function openConfigPanel(context: vscode.ExtensionContext, deps: ConfigPa
         // 个性定制文件（DSH home 固定名）：记录 mtime 基准（"保存"比对用）
         customMtime = mtimeOf(customPromptFile);
         learningMtime = mtimeOf(learningFile);
+        reiterationMtime = mtimeOf(reiterationFile);
         refreshCustomFiles();
         break;
       }
       case "editCustomFile": {
         // 打开 VS Code 编辑器编辑个性文件（首次编辑时创建）
-        const file = msg.kind === "learning" ? learningFile : customPromptFile;
+        const isLearning = msg.kind === "learning";
+        const isReiteration = msg.kind === "reiteration";
+        const file = isLearning ? learningFile : isReiteration ? reiterationFile : customPromptFile;
         if (!existsSync(file)) {
-          writeFileSync(file, msg.kind === "learning" ? "# 自动学习的工作经验\n\n" : "# 用户定制提示词\n\n", "utf8");
+          const seed = isLearning
+            ? "# 自动学习的工作经验\n\n"
+            : isReiteration
+              ? "# 每轮重申纪律\n\n在 ay-dsh-custom.md / ay-dsh-learning.md 中用标签化的方式描述规定（如 `[精炼输出]`、`[先计划后动手]`），然后在下面逐条引用标签即可——每轮开头宿主会原样注入本文件内容，形成\"重申\"效果。\n\n"
+              : "# 用户定制提示词\n\n";
+          writeFileSync(file, seed, "utf8");
         }
         await vscode.window.showTextDocument(await vscode.workspace.openTextDocument(file));
         break;
@@ -382,7 +394,7 @@ export function openConfigPanel(context: vscode.ExtensionContext, deps: ConfigPa
         deps.onConfigSaveStart();
         try {
           for (const doc of vscode.workspace.textDocuments) {
-            if (doc.isDirty && (doc.uri.fsPath === customPromptFile || doc.uri.fsPath === learningFile)) {
+            if (doc.isDirty && (doc.uri.fsPath === customPromptFile || doc.uri.fsPath === learningFile || doc.uri.fsPath === reiterationFile)) {
               await doc.save();
             }
           }
@@ -396,8 +408,12 @@ export function openConfigPanel(context: vscode.ExtensionContext, deps: ConfigPa
           if (typeof sv.enableAutoLearn === "boolean") {
             await cfg.update("enableAutoLearn", sv.enableAutoLearn, vscode.ConfigurationTarget.Global);
           }
+          if (typeof sv.enableReiteration === "boolean") {
+            await cfg.update("enableReiteration", sv.enableReiteration, vscode.ConfigurationTarget.Global);
+          }
           customMtime = mtimeOf(customPromptFile);
           learningMtime = mtimeOf(learningFile);
+          reiterationMtime = mtimeOf(reiterationFile);
           deps.onSaved(false);
           vscode.window.setStatusBarMessage(
             zh ? "✅ 配置保存成功，重启宿主后生效" : "✅ Settings saved; effective after host restart",
@@ -738,14 +754,17 @@ function renderHtml(webview: vscode.Webview, scriptUri: vscode.Uri, styleUri: vs
     groupPersonal: zh ? "个性定制" : "Personalization",
     customPromptTitle: zh ? "用户定制品格" : "Custom persona",
     learningTitle: zh ? "自动学习经验" : "Learned rules",
+    reiterationTitle: zh ? "每轮重申指令" : "Per-round reiteration",
     editBtn: zh ? "编辑" : "Edit",
     enableCustom: zh ? "启用定制" : "Enable customization",
     enableLearning: zh ? "启用经验" : "Enable learned rules",
+    enableReiteration: zh ? "启用重申" : "Enable reiteration",
     enableAutoLearn: zh ? "启动学习" : "Auto-learn",
     on: zh ? "开" : "On",
     off: zh ? "关" : "Off",
     customPromptHint: zh ? "点击“编辑”在VSCode编辑器修改（首次编辑自动创建文件）；点击“保存”落盘，重启宿主后生效。" : "Click Edit to modify your custom persona in the VS Code editor (auto-created on first edit); then click Save, and restart the host via the “Restart & Apply” group on the left.",
     learningHint: zh ? "点击“编辑”用VSCode编辑器修改（首次编辑自动创建文件）；点击“保存”落盘，重启宿主后生效。" : "Click Edit to modify your learned rules in the VS Code editor (auto-created on first edit); then click Save, and restart the host via the “Restart & Apply” group on the left.",
+    reiterationHint: zh ? "每轮开头宿主会注入本文件内容，重申“用户定制品格/自动学习经验”的规定。建议在那两个文件中把规则写成醒目标签（如 【先计划后动手】），此处逐条引用标签即可；保存后重启宿主生效。" : "Injected at the start of every round to re-state the rules in your custom persona / learned rules. Tip: write rules as recognizable tags in those files (e.g. [PLAN_FIRST]) and reference the tags here; save and restart the host to apply.",
     saveCustom: zh ? "保存" : "Save",
     rotateBytes: zh ? "会话轮转阈值（MB）" : "Session rotation threshold (MB)",
     rotateBytesHint: zh ? "会话日志超过该大小（MB）时自动轮转，创建新会话继续（默认 10）" : "Rotate when the session log exceeds this size (MB); a new session continues (default 10)",
@@ -1024,6 +1043,19 @@ function renderHtml(webview: vscode.Webview, scriptUri: vscode.Uri, styleUri: vs
           </div>
           <div id="cfgLearning" class="readonly-box markdown-box"></div>
           <span class="hint">${L.learningHint}</span>
+        </div>
+        <div class="field">
+          <div class="checkbox-row">
+            <input type="checkbox" id="cfgEnableReiteration" checked>
+            <label for="cfgEnableReiteration">${L.enableReiteration}</label>
+          </div>
+          <span class="hint" id="cfgEnableReiterationHint">…</span>
+          <div class="field-label-row">
+            <label for="cfgReiteration">${L.reiterationTitle}</label>
+            <button type="button" id="btnEditReiteration" class="icon-btn small">${L.editBtn}</button>
+          </div>
+          <div id="cfgReiteration" class="readonly-box markdown-box"></div>
+          <span class="hint">${L.reiterationHint}</span>
         </div>
         <div class="cfg-group-actions">
           <button type="button" class="primary" id="cfgSavePersonal">${L.save}</button>
