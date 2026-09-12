@@ -140003,7 +140003,7 @@ function installModelSelection(agentCtx, selection) {
 
 // host/agent-host.mjs
 var NAME2 = "dsh-vscode-host";
-var CORE_VERSION = "0.5.2";
+var CORE_VERSION = "0.5.4";
 var SESSION_PREFIX = "dsh-vscode-";
 var workMode = "single";
 var getWorkMode = () => workMode;
@@ -140018,6 +140018,33 @@ function log(level, message, extra2) {
 function bundlePatchFile(specifier) {
   return fileURLToPath2(import.meta.resolve(specifier));
 }
+function detectPersonaPrefixField() {
+  for (const spec of [
+    "@deepseek-ai/dsh-system-prompt/lib/index.js",
+    "@deepseek-ai/dsh-system-prompt/package.json"
+  ]) {
+    let resolved;
+    try {
+      resolved = fileURLToPath2(import.meta.resolve(spec));
+    } catch {
+      continue;
+    }
+    try {
+      if (spec.endsWith("package.json")) {
+        const dir = dirname3(resolved);
+        for (const rel of ["lib/index.js", "dist/index.js", "lib/types/index.js"]) {
+          const f3 = join3(dir, rel);
+          if (existsSync2(f3) && readFileSync2(f3, "utf8").includes("personaPrefix")) return true;
+        }
+        continue;
+      }
+      if (readFileSync2(resolved, "utf8").includes("personaPrefix")) return true;
+    } catch {
+    }
+  }
+  return false;
+}
+var DSH_PERSONA_PREFIX_SUPPORTED = detectPersonaPrefixField();
 function composePatches(env2) {
   const base = loadOverlayPatches(NAME2, bundlePatchFile("@deepseek-ai/dsh-base/cordis.patch.yml"));
   const headless = loadOverlayPatches(NAME2, bundlePatchFile("@deepseek-ai/dsh-headless/cordis.patch.yml"));
@@ -140036,12 +140063,13 @@ function composePatches(env2) {
     }
   }
   const currentCwd = process.cwd();
+  const personaText = `You are a coding agent powered by the {{model}} model, running inside the DeepSeek Harness VS Code extension. Your working directory is ${currentCwd} \u2014 the user's current workspace. Use this directory for all file operations and command workdirs. Help with coding tasks: read and edit files, run commands, search the web, and orchestrate subagents and workflows. File edits you make appear live in the editor. Plan before large changes; prefer the plan-mode workflow for ambiguous or big tasks. Work is driven turn by turn by the user: a long-running task that cannot be finished within one turn must end with a clear summary of progress and next steps, waiting for the user's next instruction. Tool calls, approvals, and todos are shown to the user in real time; keep them informed and concise. Permissions: operations outside the workspace are denied by the sandbox by default. When a task genuinely needs wider access (e.g. reading or writing files outside the workspace, or system-level commands), you may request a one-time escalation by passing \`sandbox_permissions\` (the narrowest wider mode that suffices, e.g. "danger-full-access") together with a clear \`justification\` to the file/command tools and parameters in detail \u2014 the user is then prompted to approve or deny in the UI. Do not request escalation casually; prefer working inside the workspace. Encoding: on Windows, command output (PowerShell 5.1 / Python) defaults to the system code page, which garbles non-ASCII text (any language) when captured. When running a command whose output may contain non-ASCII characters, force UTF-8 output: prefix PowerShell commands with \`[Console]::OutputEncoding = [Text.Encoding]::UTF8; $OutputEncoding = [Text.Encoding]::UTF8;\` or run \`chcp 65001 >nul\` first, and for Python set \`$env:PYTHONIOENCODING='utf-8'\` \u2014 otherwise the captured output will be garbled.`;
   const overlay = [
     {
       id: "system-prompt",
-      config: {
-        persona: `You are a coding agent powered by the {{model}} model, running inside the DeepSeek Harness VS Code extension. Your working directory is ${currentCwd} \u2014 the user's current workspace. Use this directory for all file operations and command workdirs. Help with coding tasks: read and edit files, run commands, search the web, and orchestrate subagents and workflows. File edits you make appear live in the editor. Plan before large changes; prefer the plan-mode workflow for ambiguous or big tasks. Work is driven turn by turn by the user: a long-running task that cannot be finished within one turn must end with a clear summary of progress and next steps, waiting for the user's next instruction. Tool calls, approvals, and todos are shown to the user in real time; keep them informed and concise. Permissions: operations outside the workspace are denied by the sandbox by default. When a task genuinely needs wider access (e.g. reading or writing files outside the workspace, or system-level commands), you may request a one-time escalation by passing \`sandbox_permissions\` (the narrowest wider mode that suffices, e.g. "danger-full-access") together with a clear \`justification\` to the file/command tools and parameters in detail \u2014 the user is then prompted to approve or deny in the UI. Do not request escalation casually; prefer working inside the workspace. Encoding: on Windows, command output (PowerShell 5.1 / Python) defaults to the system code page, which garbles non-ASCII text (any language) when captured. When running a command whose output may contain non-ASCII characters, force UTF-8 output: prefix PowerShell commands with \`[Console]::OutputEncoding = [Text.Encoding]::UTF8; $OutputEncoding = [Text.Encoding]::UTF8;\` or run \`chcp 65001 >nul\` first, and for Python set \`$env:PYTHONIOENCODING='utf-8'\` \u2014 otherwise the captured output will be garbled.`
-      }
+      // 内核字段名适配（patch 为整行替换 config 语义：只提供内核实际支持的键，
+      // 误用旧键会被新版 schema 丢弃 → 人设静默失效）。
+      config: DSH_PERSONA_PREFIX_SUPPORTED ? { personaPrefix: personaText } : { persona: personaText }
     },
     { id: "hmr", disabled: true },
     {
@@ -140293,7 +140321,7 @@ function toolBoundarySection() {
   }
   return {
     name: "tool-boundary",
-    text: "[Tool-use boundary rule]: use tools ONLY for information gathering and analysis your reasoning requires (reading files, searching, running commands that directly produce reasoning evidence), and prefer to use built-in tools.Do NOT call tools to do the user's work for them \u2014 e.g. compiling, packaging, deploying, or full security sweeps at the end of every turn. Unless the user explicitly asks, don't perform these yourself: instead give a clear step-by-step command list in your final answer for the user to run. Don't raise unnecessary approval requests either."
+    text: "[Tool-use boundary rule]: use tools ONLY for information gathering and analysis your reasoning requires (reading files, searching, running commands that directly produce reasoning evidence), and prefer in-sandbox tools.Do NOT call tools to do the user's work for them \u2014 e.g. compiling, packaging, deploying, or full security sweeps at the end of every turn. Unless the user explicitly asks, don't perform these yourself: instead give a clear step-by-step command list in your final answer for the user to run. Don't raise unnecessary approval requests either."
   };
 }
 function stepBudgetSection(limit2) {
@@ -140322,9 +140350,9 @@ function wrapUpReportSection() {
 }
 function roundGuideText(perfNoteText) {
   if (UI_LANG === "zh") {
-    return `[\u672C\u8F6E\u6307\u5F15] \u5FC5\u987B\u4E25\u683C\u9075\u5B88\u3010\u8BED\u8A00\u89C4\u5219\u3011\u3001\u3010\u5DE5\u5177\u8C03\u7528\u8FB9\u754C\u89C4\u5219\u3011\u3001\u3010\u6BCF\u8F6E\u5BF9\u8BDD\u601D\u8003\u9884\u7B97\u89C4\u5219\u3011\u548C\u3010\u6536\u5C3E\u62A5\u544A\u89C4\u5219\u3011\uFF0C ${perfNoteText || "\u672C\u8F6E\u8BF7\u4EE5\u6700\u5C11\u6B65\u6570\u9AD8\u6548\u5B8C\u6210\u4EFB\u52A1\u3002"}`;
+    return `[\u672C\u8F6E\u6307\u5F15] \u5FC5\u987B\u4E25\u683C\u9075\u5B88\u3010\u8BED\u8A00\u89C4\u5219\u3011\u3001\u3010\u5DE5\u5177\u8C03\u7528\u8FB9\u754C\u89C4\u5219\u3011\u3001\u3010\u6BCF\u8F6E\u5BF9\u8BDD\u601D\u8003\u9884\u7B97\u89C4\u5219\u3011\u548C\u3010\u6536\u5C3E\u62A5\u544A\u89C4\u5219\u3011\u3002 ${perfNoteText || "\u672C\u8F6E\u8BF7\u4EE5\u6700\u5C11\u6B65\u6570\u9AD8\u6548\u5B8C\u6210\u4EFB\u52A1\u3002"}`;
   }
-  return `[Round guide] Must strictly comply with the  [Language rule], [Tool-use boundary rule], [Per-turn thinking budget rule], and [Wrap-up report rule].${perfNoteText || "Complete this round efficiently in as few steps as possible."}`;
+  return `[Round guide] Must strictly comply with the [Language rule], [Tool-use boundary rule], [Per-turn thinking budget rule], and [Wrap-up report rule]. ${perfNoteText || "Complete this round efficiently in as few steps as possible."}`;
 }
 function stepGuideText(limit2, steps, tools, elapsed) {
   const remaining = Math.max(0, limit2 - steps);
@@ -140406,15 +140434,42 @@ function attachAgent(ctx, handle, pump2) {
     }
     pump2.push(event);
   });
+  let streamTurn;
+  let streamStep;
+  agent.ctx.on("agent/assistant-stream", (payload) => {
+    try {
+      const subject = payload?.agent;
+      if (subject !== void 0 && subject !== agent) return;
+      const frame = payload?.frame;
+      if (frame === void 0 || frame === null) return;
+      if (frame.type === "start") {
+        streamTurn = frame.turn;
+        streamStep = frame.step;
+        return;
+      }
+      if (frame.type !== "chunk") return;
+      if (streamTurn === void 0) return;
+      pump2.push({
+        type: "assistant/chunk",
+        seq: frame.index ?? 0,
+        time: frame.time ?? Date.now(),
+        data: { turn: streamTurn, step: streamStep, chunk: frame.chunk }
+      });
+    } catch (error51) {
+      log("warn", "assistant stream bridge failed", error51 instanceof Error ? error51.message : String(error51));
+    }
+  });
   agent.ctx.on("session/flush", () => {
     try {
       const sid = agent.session.id;
-      const events = agent.session.events.filter(
-        (e2) => e2.type !== "assistant/chunk" && e2.type !== "session/end-seed"
-      );
       const meta3 = loadSessionMeta();
       const prev = meta3[sid]?.stats;
-      const stats = computeSessionStats(events, prev && Number.isFinite(prev.lastSeq) ? prev : void 0);
+      const base = prev && Number.isFinite(prev.lastSeq) ? prev : void 0;
+      const delta = sessionEventsSince(agent.session, base === void 0 ? 0 : base.lastSeq + 1).filter(
+        (e2) => e2.type !== "assistant/chunk" && e2.type !== "session/end-seed"
+      );
+      if (delta.length === 0) return;
+      const stats = computeSessionStats(delta, base);
       meta3[sid] = { ...meta3[sid] ?? {}, stats: { ...stats } };
       saveSessionMeta(meta3);
     } catch (error51) {
@@ -140734,7 +140789,90 @@ function removeSessionMeta(sessionId) {
     saveSessionMeta(meta3);
   }
 }
-var SESSION_LOG_NAMES = ["session.jsonl", "session.jsonl.zstd"];
+var sessionEventsCache = /* @__PURE__ */ new WeakMap();
+function sessionEventsOf(session) {
+  if (session === void 0 || session === null) return [];
+  if (Array.isArray(session.events)) return session.events;
+  if (typeof session.snapshotEvents !== "function") {
+    return typeof session.ownEvents === "function" ? session.ownEvents() : [];
+  }
+  const hit = sessionEventsCache.get(session);
+  const now = Date.now();
+  if (hit !== void 0 && now - hit.at < 250) return hit.list;
+  const list = session.snapshotEvents();
+  sessionEventsCache.set(session, { at: now, list });
+  return list;
+}
+async function inspectStoredSession(ctx, sessionId) {
+  const id = SessionId(sessionId);
+  const persistence = ctx.get("sessionPersistence");
+  if (persistence !== void 0 && typeof persistence.inspect === "function") {
+    const inspected = await persistence.inspect(id);
+    return { meta: inspected.meta, events: inspected.events ?? [] };
+  }
+  if (persistence !== void 0 && typeof persistence.open === "function") {
+    const handle = await persistence.open(id, "read");
+    try {
+      const result = await handle.read(0);
+      return { meta: handle.header, events: result?.events ?? [] };
+    } finally {
+      try {
+        await handle.close();
+      } catch {
+      }
+    }
+  }
+  const query = ctx.get("sessionQuery");
+  if (query !== void 0 && typeof query.readSession === "function") {
+    const snapshot = await query.readSession(id);
+    return { meta: snapshot.session, events: snapshot.events ?? [] };
+  }
+  throw new Error("dsh-vscode-host: no session read API available (sessionPersistence.inspect/open, sessionQuery.readSession)");
+}
+var SESSION_LOG_RE = /^session(?:\.v(\d+))?\.jsonl(?:\.zstd?)?$/;
+function sessionEventsSince(session, fromSeq) {
+  const from2 = Number.isFinite(fromSeq) && fromSeq > 0 ? Math.floor(fromSeq) : 0;
+  if (session === void 0 || session === null) return [];
+  if (Array.isArray(session.events)) {
+    return from2 === 0 ? session.events : session.events.slice(from2);
+  }
+  if (typeof session.snapshotEvents === "function") {
+    return from2 === 0 ? session.snapshotEvents() : session.snapshotEvents(from2);
+  }
+  if (typeof session.ownEvents === "function") return session.ownEvents();
+  return [];
+}
+function sessionLogGeneration(name) {
+  const m2 = SESSION_LOG_RE.exec(name);
+  if (m2 === null) return -1;
+  return m2[1] === void 0 ? 0 : Number(m2[1]);
+}
+function pickSessionLog(dir) {
+  let best = null;
+  let bestMtime = -1;
+  let bestGen = -1;
+  try {
+    for (const name of readdirSync(dir)) {
+      const gen = sessionLogGeneration(name);
+      if (gen < 0) continue;
+      let st;
+      try {
+        st = statSync2(join3(dir, name));
+      } catch {
+        continue;
+      }
+      if (!st.isFile()) continue;
+      const mtime = st.mtimeMs;
+      if (mtime > bestMtime || mtime === bestMtime && gen > bestGen) {
+        bestMtime = mtime;
+        bestGen = gen;
+        best = join3(dir, name);
+      }
+    }
+  } catch {
+  }
+  return best;
+}
 var sessionSizeCache = /* @__PURE__ */ new Map();
 var SESSION_SIZE_CACHE_TTL = 1e3;
 function sessionFileSize(sessionId) {
@@ -140746,13 +140884,8 @@ function sessionFileSize(sessionId) {
     const root = dshHomePath("sessions-ay-dsh");
     const dir = join3(root, projectKey(process.cwd()), encodeSegment(key));
     let size;
-    for (const n of SESSION_LOG_NAMES) {
-      const p = join3(dir, n);
-      if (existsSync2(p)) {
-        size = statSync2(p).size;
-        break;
-      }
-    }
+    const logPath = pickSessionLog(dir);
+    if (logPath !== null) size = statSync2(logPath).size;
     sessionSizeCache.set(key, { at: now, size });
     return size;
   } catch {
@@ -140893,8 +141026,8 @@ function scanSessionDirs() {
     }
     for (const s2 of sessions) {
       if (!s2.isDirectory()) continue;
-      const logPath = SESSION_LOG_NAMES.map((n) => join3(root, p.name, s2.name, n)).find((p2) => existsSync2(p2));
-      if (!logPath) continue;
+      const logPath = pickSessionLog(join3(root, p.name, s2.name));
+      if (logPath === null) continue;
       out.push({ id: s2.name, logPath, project: p.name });
     }
   }
@@ -140914,7 +141047,8 @@ async function listSessions(ctx) {
   }
   const entries = scanSessionDirs();
   const currentProject = projectKey(process.cwd());
-  const scoped = entries.filter((e2) => e2.project === currentProject);
+  const sameProject = process.platform === "win32" ? (a, b) => a.toLowerCase() === b.toLowerCase() : (a, b) => a === b;
+  const scoped = entries.filter((e2) => sameProject(e2.project, currentProject));
   const allMeta = loadSessionMeta();
   const patch = {};
   const result = [];
@@ -141158,9 +141292,7 @@ async function deleteSession(ctx, sessionId) {
       const cwd = query !== void 0 ? (await query.readSession(SessionId(sessionId))).session.cwd ?? process.cwd() : process.cwd();
       dir = join3(dshHomePath("sessions-ay-dsh"), projectKey(cwd), encodeSegment(sessionId));
     }
-    const artifacts = ["session.jsonl", "session.jsonl.zstd", "session.jsonl.zst"];
-    const hasArtifact = artifacts.some((name) => existsSync2(join3(dir, name)));
-    if (!hasArtifact) {
+    if (pickSessionLog(dir) === null) {
       return { ok: false, error: `\u4F1A\u8BDD\u6587\u4EF6\u4E0D\u5B58\u5728: ${dir}` };
     }
     rmSync(dir, { recursive: true, force: true });
@@ -141372,7 +141504,7 @@ async function main() {
         }
         rotating = true;
         post({ t: "rotateWorking" });
-        const tailText = tailConversationText(agent.session.events, 60);
+        const tailText = tailConversationText(sessionEventsOf(agent.session), 60);
         let summary = "";
         if (ROTATE_SUMMARY_ENABLED && tailText !== "") {
           try {
@@ -141383,7 +141515,7 @@ async function main() {
           }
         }
         if (summary === "") {
-          summary = tailConversationText(agent.session.events, ROTATE_FALLBACK_MSGS);
+          summary = tailConversationText(sessionEventsOf(agent.session), ROTATE_FALLBACK_MSGS);
         }
         const newId = `dsh-vscode-${randomUUID()}`;
         const seq2 = nextSessionSeq(oldTitle);
@@ -141680,19 +141812,16 @@ ${meta3.seedSummary}` }],
         case "restorePreview": {
           if (typeof msg.id !== "string" || msg.id.trim() === "") break;
           try {
-            const persistence = ctx.get("sessionPersistence");
-            if (persistence !== void 0 && typeof persistence.inspect === "function") {
-              const inspected = await persistence.inspect(SessionId(msg.id));
-              const events = (inspected.events ?? []).filter(
-                (e2) => e2.type !== "assistant/chunk" && e2.type !== "session/end-seed"
-              );
-              const limit2 = Number.isInteger(msg.limit) && msg.limit > 0 ? msg.limit : 200;
-              const tail = events.slice(-limit2);
-              const hasMore = events.length > tail.length;
-              const nextSeq = hasMore ? tail[0].seq : void 0;
-              const stats = resolveSessionStats(getSessionMeta(msg.id).stats, events, msg.id);
-              post({ t: "history", sessionId: msg.id, events: tail, hasMore, nextSeq, stats, sessionBytes: sessionFileSize(msg.id) });
-            }
+            const inspected = await inspectStoredSession(ctx, msg.id);
+            const events = (inspected.events ?? []).filter(
+              (e2) => e2.type !== "assistant/chunk" && e2.type !== "session/end-seed"
+            );
+            const limit2 = Number.isInteger(msg.limit) && msg.limit > 0 ? msg.limit : 200;
+            const tail = events.slice(-limit2);
+            const hasMore = events.length > tail.length;
+            const nextSeq = hasMore ? tail[0].seq : void 0;
+            const stats = resolveSessionStats(getSessionMeta(msg.id).stats, events, msg.id);
+            post({ t: "history", sessionId: msg.id, events: tail, hasMore, nextSeq, stats, sessionBytes: sessionFileSize(msg.id) });
           } catch (error51) {
             log("warn", "restorePreview preview failed", error51 instanceof Error ? error51.message : String(error51));
             post({ t: "viewSessionFailed", id: msg.id, error: error51 instanceof Error ? error51.message : String(error51) });
@@ -141813,7 +141942,7 @@ ${meta3.seedSummary}` }],
               });
             }
           }
-          const allEvents = agent.session.events.filter(
+          const allEvents = sessionEventsOf(agent.session).filter(
             (e2) => e2.type !== "assistant/chunk" && e2.type !== "session/end-seed"
           );
           const limit2 = Number.isInteger(msg.limit) && msg.limit > 0 ? msg.limit : 200;
@@ -141844,12 +141973,7 @@ ${meta3.seedSummary}` }],
             break;
           }
           try {
-            const persistence = ctx.get("sessionPersistence");
-            if (persistence === void 0 || typeof persistence.inspect !== "function") {
-              post({ t: "viewSessionFailed", id: msg.id, error: "sessionPersistence unavailable" });
-              break;
-            }
-            const inspected = await persistence.inspect(SessionId(msg.id));
+            const inspected = await inspectStoredSession(ctx, msg.id);
             const events = (inspected.events ?? []).filter(
               (e2) => e2.type !== "assistant/chunk" && e2.type !== "session/end-seed"
             );
@@ -141873,7 +141997,7 @@ ${meta3.seedSummary}` }],
           }
           const limit2 = Number.isInteger(msg.limit) && msg.limit > 0 ? msg.limit : 200;
           if (agent !== void 0) {
-            const allEvents = agent.session.events.filter(
+            const allEvents = sessionEventsOf(agent.session).filter(
               (e2) => e2.type !== "assistant/chunk" && e2.type !== "session/end-seed"
             );
             const older = allEvents.filter((e2) => e2.seq < msg.beforeSeq).slice(-limit2);
@@ -141887,24 +142011,19 @@ ${meta3.seedSummary}` }],
             });
           } else if (typeof msg.sessionId === "string" && msg.sessionId !== "") {
             try {
-              const persistence = ctx.get("sessionPersistence");
-              if (persistence !== void 0 && typeof persistence.inspect === "function") {
-                const inspected = await persistence.inspect(SessionId(msg.sessionId));
-                const allEvents = (inspected.events ?? []).filter(
-                  (e2) => e2.type !== "assistant/chunk" && e2.type !== "session/end-seed"
-                );
-                const older = allEvents.filter((e2) => e2.seq < msg.beforeSeq).slice(-limit2);
-                const hasMore = allEvents.some((e2) => e2.seq < (older[0]?.seq ?? msg.beforeSeq));
-                post({
-                  t: "historyMore",
-                  sessionId: msg.sessionId,
-                  events: older,
-                  hasMore,
-                  nextSeq: hasMore && older.length > 0 ? older[0].seq : void 0
-                });
-              } else {
-                post({ t: "historyMore", sessionId: msg.sessionId, events: [], hasMore: false });
-              }
+              const inspected = await inspectStoredSession(ctx, msg.sessionId);
+              const allEvents = (inspected.events ?? []).filter(
+                (e2) => e2.type !== "assistant/chunk" && e2.type !== "session/end-seed"
+              );
+              const older = allEvents.filter((e2) => e2.seq < msg.beforeSeq).slice(-limit2);
+              const hasMore = allEvents.some((e2) => e2.seq < (older[0]?.seq ?? msg.beforeSeq));
+              post({
+                t: "historyMore",
+                sessionId: msg.sessionId,
+                events: older,
+                hasMore,
+                nextSeq: hasMore && older.length > 0 ? older[0].seq : void 0
+              });
             } catch (error51) {
               log("warn", "view loadMoreHistory failed", error51 instanceof Error ? error51.message : String(error51));
               post({ t: "historyMore", sessionId: msg.sessionId, events: [], hasMore: false });

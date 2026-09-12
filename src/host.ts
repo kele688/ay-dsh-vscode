@@ -39,6 +39,14 @@ interface TurnState {
   tools: Map<string, ToolCallState>;
   chunkSeq: number;
   ts: number;
+  /**
+   * 本轮是否收到过流式增量（`assistant/chunk`）。
+   *  ≤0.1.1：内核把每个 token 增量作为会话事件下发 → true，正文已由 delta 渲染；
+   *  ≥0.1.5：内核改为进程内 `agent/assistant-stream` 临时帧（宿主桥接成
+   *  assistant/chunk），若桥接不可用则始终为 false —— 此时每条 assistant/message
+   *  都必须整段下发（见 translateEvent），否则一轮里第一条之后的正文会被静默丢弃。
+   */
+  chunked: boolean;
 }
 
 export interface AgentHostOptions {
@@ -340,6 +348,20 @@ export class AgentHost {
 
     child.stderr.on("data", (d) => {
       this.output.appendLine(String(d).replace(/\n$/, ""));
+      // 【诊断落盘】宿主 stderr 同步写入 <DSH home>/dsh-host.log：内核启动期问题
+      // （会话加载被拒 / 格式版本拒绝 / 写锁冲突 / 迁移失败）只能从宿主日志定位，
+      // 而 VS Code 输出通道无法离线读取。超过 5MB 自动重建，避免无限增长。
+      try {
+        const logPath = path.join(this.options.dshHome, "dsh-host.log");
+        try {
+          if (fs.statSync(logPath).size > 5 * 1024 * 1024) fs.rmSync(logPath, { force: true });
+        } catch {
+          /* 文件不存在即跳过 */
+        }
+        fs.appendFileSync(logPath, String(d));
+      } catch {
+        /* 落盘失败不影响主流程 */
+      }
       this.emit({ type: "log", level: "stderr", message: String(d) });
     });
     child.on("error", (err) => {
@@ -695,7 +717,7 @@ export class AgentHost {
       case "turn/start": {
         const turn = d.turn as number;
         if (opts?.history) return null; // 历史重放不需要 turn 状态机
-        this.turns.set(turn, { turn, text: "", reasoning: "", tools: new Map(), chunkSeq: 0, ts: event.time });
+        this.turns.set(turn, { turn, text: "", reasoning: "", tools: new Map(), chunkSeq: 0, ts: event.time, chunked: false });
         return { kind: "turn", status: "start", ts: event.time };
       }
       case "turn/end": {
@@ -719,14 +741,27 @@ export class AgentHost {
         if (!state) return null;
         const chunk = d.chunk as { type: string; text?: string; argumentsDelta?: string; index?: number };
         if (chunk.type === "text-delta" && chunk.text) {
+          state.chunked = true;
           state.text += chunk.text;
           return { kind: "assistant-delta", text: chunk.text, reasoning: "", ts: event.time };
         }
         if (chunk.type === "reasoning-delta" && chunk.text) {
+          state.chunked = true;
           state.reasoning += chunk.text;
           return { kind: "assistant-delta", text: "", reasoning: chunk.text, ts: event.time };
         }
         return null;
+      }
+      case "assistant/attempt": {
+        // 【0.1.5】"模型尝试未提交任何可见消息"的终态事件（失败/重试/取消/纯思考：
+        // 内核只在确实提交了 surface 消息时才写 assistant/message，否则写
+        // assistant/attempt）。实时流已由 assistant/chunk 桥接渲染，这里只做**收尾**：
+        // finalizeAssistant 在气泡已有内容时保留（显示已流出的部分），全空则移除，
+        // 避免流式气泡悬空、下一轮 turn/start 直接丢弃未定稿内容。
+        // 注意：**不删除 turn 状态**——同一步可能重试多次，后续 attempt 的 chunk
+        // 仍需归属同一 turn。历史重放不需要该事件（不产生气泡）。
+        if (opts?.history) return null;
+        return { kind: "assistant", text: "", reasoning: "", ts: event.time };
       }
       case "assistant/message": {
         const turn = d.turn as number;
@@ -748,9 +783,18 @@ export class AgentHost {
         }
         const state = this.turns.get(turn);
         if (state) {
-          // 流式模式下 UI 已按 delta 渲染；仅当全程没有 chunk 时补发完整文本
-          const needFull = !state.text && text !== "";
-          if (needFull) state.text = text;
+          // 流式模式下 UI 已按 delta 渲染；仅当本步全程没有 chunk 时补发完整文本。
+          //  【0.1.5】内核不再产生 assistant/chunk 会话事件（改由宿主桥接
+          //  agent/assistant-stream），一旦桥接缺失/失败，`state.chunked` 恒为 false，
+          //  此时必须**每一步都整段下发**：原实现用 `!state.text` 判断，第一条
+          //  assistant/message 会把 text 记入 state.text，于是同一轮里后续每一步
+          //  （含最后的总结报告）都被判定为"已渲染"而返回空文本 —— 表现为
+          //  "只显示第一步、最后的正文输出不见了、回答不完整"。
+          //  每次下发后清空累积，保证下一条消息重新整段下发。
+          const needFull = !state.chunked && text !== "";
+          state.text = "";
+          state.reasoning = "";
+          state.chunked = false;
           return { kind: "assistant", text: needFull ? text : "", reasoning, usage, ts: event.time };
         }
         return { kind: "assistant", text, reasoning, usage, ts: event.time };

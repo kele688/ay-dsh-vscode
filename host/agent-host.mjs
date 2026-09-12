@@ -27,7 +27,7 @@ import { SessionId } from "@deepseek-ai/dsh-session";
 import { installModelSelection } from "@deepseek-ai/dsh-agent";
 
 const NAME = "dsh-vscode-host";
-const CORE_VERSION = "0.5.3";
+const CORE_VERSION = "0.5.4";
 /** 插件会话 id 前缀（也是会话隔离的标识）。 */
 const SESSION_PREFIX = "dsh-vscode-";
 
@@ -60,6 +60,50 @@ function bundlePatchFile(specifier) {
 }
 
 /**
+ * 探测**当前实际加载的**内核 `dsh-system-prompt` 是否使用 `personaPrefix` 字段。
+ *
+ * 背景（0.1.5 升级适配，2026-09）：dsh-system-prompt 在 0.1.5-rc.2 把部署人设字段由
+ * `persona` 改名为 `personaPrefix`（并新增 `personaSuffix`）；而本插件对 system-prompt
+ * 行是"整行替换 config"（Cordis patch 语义），若仍写 `persona`，新版 schema 会丢弃该
+ * 未知键并取 `personaPrefix` 默认空串 → 插件人设（工作目录/编码注意事项等）静默失效。
+ * 因此按**特征探测**而非版本号猜测：直接读已安装包源码，命中 `personaPrefix` 即用新键；
+ * 探测不到（旧版/读取失败）→ 保持 `persona`（内置 0.1.1-rc.2 行为不变）。
+ * 运行时升级场景下 import.meta.resolve 指向 DSH_RUNTIME_NODE_MODULES 隔离目录中的包，
+ * 探测结果即实际加载版本，无需人工同步。
+ */
+function detectPersonaPrefixField() {
+  for (const spec of [
+    "@deepseek-ai/dsh-system-prompt/lib/index.js",
+    "@deepseek-ai/dsh-system-prompt/package.json",
+  ]) {
+    let resolved;
+    try {
+      resolved = fileURLToPath(import.meta.resolve(spec));
+    } catch {
+      continue; // exports 不允许该子路径 → 尝试下一个候选
+    }
+    try {
+      if (spec.endsWith("package.json")) {
+        // 从包根推导入口（兼容 lib / dist 布局）
+        const dir = dirname(resolved);
+        for (const rel of ["lib/index.js", "dist/index.js", "lib/types/index.js"]) {
+          const f = join(dir, rel);
+          if (existsSync(f) && readFileSync(f, "utf8").includes("personaPrefix")) return true;
+        }
+        continue;
+      }
+      if (readFileSync(resolved, "utf8").includes("personaPrefix")) return true;
+    } catch {
+      /* 读取失败 → 继续尝试下一个候选 */
+    }
+  }
+  return false;
+}
+
+/** 进程内一次性探测结果（运行时升级后宿主重启会重新探测）。 */
+const DSH_PERSONA_PREFIX_SUPPORTED = detectPersonaPrefixField();
+
+/**
  * 组装 Cordis patch 层：
  * 1. dsh-base 的共享核心（agent、工具、沙箱、审批、goal/subagent/workflow…）；
  * 2. dsh-headless 的补丁，剔除一次性 runner/startup，保留 code-runtime 与 tools 行；
@@ -90,29 +134,33 @@ function composePatches(env) {
   // 导致 Agent 把旧目录当作工作目录。显式注入保证任何会话都指向当前真实目录。
   const currentCwd = process.cwd();
 
+  // 人设文本（与 system-prompt 行的字段名解耦：0.1.5 起内核把 persona 改名为
+  // personaPrefix，旧版仍用 persona——见 detectPersonaPrefixField 特征探测）。
+  const personaText =
+    "You are a coding agent powered by the {{model}} model, running inside the DeepSeek Harness VS Code extension. " +
+    `Your working directory is ${currentCwd} — the user's current workspace. Use this directory for all file operations and command workdirs. ` +
+    "Help with coding tasks: read and edit files, run commands, search the web, and orchestrate subagents and workflows. " +
+    "File edits you make appear live in the editor. Plan before large changes; prefer the plan-mode workflow for ambiguous or big tasks. " +
+    "Work is driven turn by turn by the user: a long-running task that cannot be finished within one turn must end with a clear summary of progress and next steps, waiting for the user's next instruction. " +
+    "Tool calls, approvals, and todos are shown to the user in real time; keep them informed and concise. " +
+    "Permissions: operations outside the workspace are denied by the sandbox by default. " +
+    "When a task genuinely needs wider access (e.g. reading or writing files outside the workspace, or system-level commands), " +
+    "you may request a one-time escalation by passing `sandbox_permissions` (the narrowest wider mode that suffices, e.g. \"danger-full-access\") " +
+    "together with a clear `justification` to the file/command tools and parameters in detail — the user is then prompted to approve or deny in the UI. " +
+    "Do not request escalation casually; prefer working inside the workspace. " +
+    "Encoding: on Windows, command output (PowerShell 5.1 / Python) defaults to the system code page, " +
+    "which garbles non-ASCII text (any language) when captured. When running a command whose output " +
+    "may contain non-ASCII characters, force UTF-8 output: prefix PowerShell commands with " +
+    "`[Console]::OutputEncoding = [Text.Encoding]::UTF8; $OutputEncoding = [Text.Encoding]::UTF8;` " +
+    "or run `chcp 65001 >nul` first, and for Python set `$env:PYTHONIOENCODING='utf-8'` — " +
+    "otherwise the captured output will be garbled.";
+
   const overlay = [
     {
       id: "system-prompt",
-      config: {
-        persona:
-          "You are a coding agent powered by the {{model}} model, running inside the DeepSeek Harness VS Code extension. " +
-          `Your working directory is ${currentCwd} — the user's current workspace. Use this directory for all file operations and command workdirs. ` +
-          "Help with coding tasks: read and edit files, run commands, search the web, and orchestrate subagents and workflows. " +
-          "File edits you make appear live in the editor. Plan before large changes; prefer the plan-mode workflow for ambiguous or big tasks. " +
-          "Work is driven turn by turn by the user: a long-running task that cannot be finished within one turn must end with a clear summary of progress and next steps, waiting for the user's next instruction. " +
-          "Tool calls, approvals, and todos are shown to the user in real time; keep them informed and concise. " +
-          "Permissions: operations outside the workspace are denied by the sandbox by default. " +
-          "When a task genuinely needs wider access (e.g. reading or writing files outside the workspace, or system-level commands), " +
-          "you may request a one-time escalation by passing `sandbox_permissions` (the narrowest wider mode that suffices, e.g. \"danger-full-access\") " +
-          "together with a clear `justification` to the file/command tools and parameters in detail — the user is then prompted to approve or deny in the UI. " +
-          "Do not request escalation casually; prefer working inside the workspace. " +
-          "Encoding: on Windows, command output (PowerShell 5.1 / Python) defaults to the system code page, " +
-          "which garbles non-ASCII text (any language) when captured. When running a command whose output " +
-          "may contain non-ASCII characters, force UTF-8 output: prefix PowerShell commands with " +
-          "`[Console]::OutputEncoding = [Text.Encoding]::UTF8; $OutputEncoding = [Text.Encoding]::UTF8;` " +
-          "or run `chcp 65001 >nul` first, and for Python set `$env:PYTHONIOENCODING='utf-8'` — " +
-          "otherwise the captured output will be garbled.",
-      },
+      // 内核字段名适配（patch 为整行替换 config 语义：只提供内核实际支持的键，
+      // 误用旧键会被新版 schema 丢弃 → 人设静默失效）。
+      config: DSH_PERSONA_PREFIX_SUPPORTED ? { personaPrefix: personaText } : { persona: personaText },
     },
     { id: "hmr", disabled: true },
     {
@@ -727,6 +775,10 @@ function stepLimitWrapUpMessage(limit, steps, tools, elapsedSec) {
 function attachAgent(ctx, handle, pump) {
   const agent = handle.agent;
 
+  // 【0.1.5 兼容｜2026-09】会话事件访问统一走模块级 sessionEventsOf()（见会话工具
+  // 函数区）——新版 Session 不再公开 events 属性、且实例可能不可扩展，defineProperty
+  // 注入不可靠；统计落盘 / 历史重放 / 预览 / 轮转摘要等读取点均已改为显式调用。
+
   // 会话日志大小：绑定到本 agent 的局部闭包。main 作用域闭包在 flush 时
   // 可能读到 undefined（曾导致 events 帧从不携带 sessionBytes，标题栏大小
   // 标签常态不显示）；此处 agent 是本函数局部变量，闭包求值必然可靠。
@@ -843,6 +895,51 @@ function attachAgent(ctx, handle, pump) {
     pump.push(event);
   });
 
+  /**
+   * 【0.1.5 兼容｜实时流桥接】把新版"临时流帧"重新包装成旧版 `assistant/chunk`
+   * 会话事件推给扩展，从而**不改动**扩展/前端的流式渲染链路（translateEvent 的
+   * assistant/chunk → assistant-delta → 节流 markdown 渲染）。
+   *
+   * 背景：≤0.1.1 内核把每个 token 增量作为会话事件 `assistant/chunk` 落日志（体积
+   * 巨大，v0 日志因此膨胀到 4.9MB/31 万事件）；0.1.5 改为**进程内临时帧**
+   * `agent/assistant-stream`（见 dsh-agent-loop 的 AssistantStreamAttempt），
+   * 只把压缩后的 stream 存进 `assistant/message`，不再产生 chunk 会话事件。
+   *
+   * 若不桥接：面板在整个模型输出期间**完全没有增量**（表现为"反应明显变慢、
+   * 输出迟迟不出现"），且每条 assistant/message 会被当成"已流式渲染过"处理，
+   * 导致一轮里第一条之后的正文（含最后的总结报告）被丢弃。
+   *
+   * 帧形状（0.1.5）：start{attemptId,revision,turn,step} / chunk{...,index,time,chunk}
+   * / end{...,outcome}。这里只转发 chunk，并补回 start 携带的 turn/step（chunk 帧
+   * 本身不含），包装成 {type:"assistant/chunk", data:{turn, step, chunk}}。
+   * 旧内核对 `agent/assistant-stream` 从不 emit → 本监听器天然不触发，无副作用。
+   */
+  let streamTurn;
+  let streamStep;
+  agent.ctx.on("agent/assistant-stream", (payload) => {
+    try {
+      const subject = payload?.agent;
+      if (subject !== undefined && subject !== agent) return; // 仅本 agent 的流
+      const frame = payload?.frame;
+      if (frame === undefined || frame === null) return;
+      if (frame.type === "start") {
+        streamTurn = frame.turn;
+        streamStep = frame.step;
+        return;
+      }
+      if (frame.type !== "chunk") return; // end（含 abandoned）不渲染
+      if (streamTurn === undefined) return; // 未收到 start：无可归属轮次，丢弃
+      pump.push({
+        type: "assistant/chunk",
+        seq: frame.index ?? 0,
+        time: frame.time ?? Date.now(),
+        data: { turn: streamTurn, step: streamStep, chunk: frame.chunk },
+      });
+    } catch (error) {
+      log("warn", "assistant stream bridge failed", error instanceof Error ? error.message : String(error));
+    }
+  });
+
   // **统计与日志强同步落盘**（owner 反复强调：日志落盘时统计同步落盘，保证
   // 一致性）。内核 `session/flush` 是持久化检查点（日志落盘边界）——在此把
   // 统计写 meta.stats：以 meta 中上次落盘的 stats 为基准，对日志**增量补算**
@@ -852,12 +949,18 @@ function attachAgent(ctx, handle, pump) {
   agent.ctx.on("session/flush", () => {
     try {
       const sid = agent.session.id;
-      const events = agent.session.events.filter(
-        (e) => e.type !== "assistant/chunk" && e.type !== "session/end-seed"
-      );
       const meta = loadSessionMeta();
       const prev = meta[sid]?.stats;
-      const stats = computeSessionStats(events, prev && Number.isFinite(prev.lastSeq) ? prev : undefined);
+      const base = prev && Number.isFinite(prev.lastSeq) ? prev : undefined;
+      // 【性能】只取 base.lastSeq 之后的新增段（seq 从 1 连续）——原实现对 30 万
+      // 事件级长会话每次 flush 都要全量拷贝 + filter + 逐条跳过，是 O(n) 拷贝与
+      // 扫描；flush 是内核高频持久化检查点，长会话下会明显拖慢每次交互。
+      // 同时必须保留 chunk/end-seed 过滤（chunk 不参与统计且体积最大）。
+      const delta = sessionEventsSince(agent.session, base === undefined ? 0 : base.lastSeq + 1).filter(
+        (e) => e.type !== "assistant/chunk" && e.type !== "session/end-seed"
+      );
+      if (delta.length === 0) return; // 无新增（纯 chunk/心跳 flush）→ 无需落盘
+      const stats = computeSessionStats(delta, base);
       meta[sid] = { ...(meta[sid] ?? {}), stats: { ...stats } };
       saveSessionMeta(meta);
     } catch (error) {
@@ -1333,8 +1436,141 @@ async function sessionDisplayTitle(ctx, sessionId, kernelTitle) {
   return kernelTitle;
 }
 
-/** 会话日志文件名（与 dsh-session-persistence-jsonl 的 logSuffix 一致）。 */
-const SESSION_LOG_NAMES = ["session.jsonl", "session.jsonl.zstd"];
+/** 会话日志文件名（与 dsh-session-persistence-jsonl 的 logSuffix 一致）。
+ *  【0.1.5 兼容】内核引入"多代不可变日志"：同一会话目录可能同时存在
+ *  session.jsonl.zstd（v0）与 session.v1/v2/v3.jsonl[.zstd]（v1/v2/v3），
+ *  打开时以**最高代**为准。必须识别全部代际并优先取最高代，否则大小/列表
+ *  显示的是升级前冻结的旧代文件（曾出现"面板显示 4.2M、实际写入的是 v3 1.5M"）。 */
+/** 【0.1.5 兼容】统一的会话事件访问器：
+ *  旧内核（≤0.1.1）`session.events` 是数组属性；新内核（≥0.1.5）改为
+ *  `snapshotEvents()` / `ownEvents()` 方法（不再公开 events 属性）。
+ *  本函数供统计落盘、历史重放、预览、轮转摘要等**全部**读取点使用，
+ *  不依赖 Object.defineProperty 注入（Session 实例可能不可扩展）。
+ *  250ms TTL 缓存避免长会话被 flush/统计高频读取时反复全量拷贝。 */
+const sessionEventsCache = new WeakMap();
+function sessionEventsOf(session) {
+  if (session === undefined || session === null) return [];
+  if (Array.isArray(session.events)) return session.events; // ≤0.1.1
+  if (typeof session.snapshotEvents !== "function") {
+    return typeof session.ownEvents === "function" ? session.ownEvents() : [];
+  }
+  const hit = sessionEventsCache.get(session);
+  const now = Date.now();
+  if (hit !== undefined && now - hit.at < 250) return hit.list;
+  const list = session.snapshotEvents();
+  sessionEventsCache.set(session, { at: now, list });
+  return list;
+}
+
+/** 【0.1.5 兼容】只读读取一个已持久化会话（元数据 + 全量事件）的统一入口。
+ *
+ *  背景：0.1.1 的 `sessionPersistence` 提供 `inspect(id)`（只读、不取写所有权），
+ *  插件的历史预览 / 只读浏览 / 分页都直接调用它。0.1.5 **移除了 `inspect`/`load`**，
+ *  改为基于句柄的 `open(id, access)`：只读浏览必须用 `open(id, "read")` 拿
+ *  `SessionHandle`，再 `handle.read(0)` 取事件、`handle.close()` 释放。
+ *  旧代码用 `typeof persistence.inspect === "function"` 守卫，0.1.5 下守卫静默失败
+ *  → **一个 history 帧都不发**：面板标题（bootstrap 携带）与日志大小标签（文件 stat）
+ *  仍在，而消息列表被清空、统计归零——即"重启宿主后会话历史恢复不了"的不一致状态。
+ *
+ *  取值优先级（按代价从低到高，且均可与活跃写句柄并存）：
+ *   1. `persistence.inspect`   —— ≤0.1.1，与 resume 共享 prepared 缓存；
+ *   2. `persistence.open(id,"read")` + `handle.read(0)` —— ≥0.1.5，不取写所有权；
+ *   3. `sessionQuery.readSession` —— 两版本都有，最后兜底。
+ *
+ *  @returns {Promise<{meta: object, events: Array}>}
+ */
+async function inspectStoredSession(ctx, sessionId) {
+  const id = SessionId(sessionId);
+  const persistence = ctx.get("sessionPersistence");
+  if (persistence !== undefined && typeof persistence.inspect === "function") {
+    const inspected = await persistence.inspect(id);
+    return { meta: inspected.meta, events: inspected.events ?? [] };
+  }
+  if (persistence !== undefined && typeof persistence.open === "function") {
+    // 0.1.5：read 句柄只观察、永不取所有权——可与另一实例/本进程的写句柄并存
+    const handle = await persistence.open(id, "read");
+    try {
+      const result = await handle.read(0);
+      return { meta: handle.header, events: result?.events ?? [] };
+    } finally {
+      try {
+        await handle.close();
+      } catch {
+        /* 释放失败不影响已读到的数据 */
+      }
+    }
+  }
+  const query = ctx.get("sessionQuery");
+  if (query !== undefined && typeof query.readSession === "function") {
+    const snapshot = await query.readSession(id);
+    return { meta: snapshot.session, events: snapshot.events ?? [] };
+  }
+  throw new Error("dsh-vscode-host: no session read API available (sessionPersistence.inspect/open, sessionQuery.readSession)");
+}
+
+const SESSION_LOG_RE = /^session(?:\.v(\d+))?\.jsonl(?:\.zstd?)?$/;
+
+/** 【0.1.5 兼容】按 seq 增量取会话事件（seq ≥ fromSeq）。
+ *
+ *  统计落盘（session/flush）原本每次都要 `sessionEventsOf()` 全量拷贝 + filter
+ *  一遍整条日志，再用 base.lastSeq 逐条跳过——对 30 万事件级别的长会话是 O(n)
+ *  拷贝 + O(n) 扫描，且 flush 是内核的持久化检查点（高频），实测会显著拖慢每次
+ *  交互。这里直接按 seq 切片，只取新增段：seq 与日志下标在 0.1.1/0.1.5 都是
+ *  连续且相等（"seq 恒等于日志长度"契约），故下标 == seq。
+ */
+function sessionEventsSince(session, fromSeq) {
+  const from = Number.isFinite(fromSeq) && fromSeq > 0 ? Math.floor(fromSeq) : 0;
+  if (session === undefined || session === null) return [];
+  if (Array.isArray(session.events)) {
+    return from === 0 ? session.events : session.events.slice(from); // ≤0.1.1
+  }
+  if (typeof session.snapshotEvents === "function") {
+    return from === 0 ? session.snapshotEvents() : session.snapshotEvents(from);
+  }
+  if (typeof session.ownEvents === "function") return session.ownEvents();
+  return [];
+}
+
+/** 文件名 → 代数（无法识别返回 -1）。 */
+function sessionLogGeneration(name) {
+  const m = SESSION_LOG_RE.exec(name);
+  if (m === null) return -1;
+  return m[1] === undefined ? 0 : Number(m[1]);
+}
+
+/** 在会话目录中挑选**当前活跃**的日志文件（无匹配返回 null）。
+ *  0.1.5 起会话日志按"格式代际"分文件（v0 保留旧名 session.jsonl[.zstd]，
+ *  之后为 session.v<N>.jsonl[.zstd]，旧代际不可变保留、不双写）。因此
+ *  **不能只按代际取最高**：若用户从 0.1.5 重置回旧内核（0.1.1），旧代文件
+ *  才是正在被写入的活跃日志——按代际取高会选到已停止增长的 v3，导致列表
+ *  更新时间/日志大小错乱。规则：优先最近写入（mtime），同 mtime 再取更高代。 */
+function pickSessionLog(dir) {
+  let best = null;
+  let bestMtime = -1;
+  let bestGen = -1;
+  try {
+    for (const name of readdirSync(dir)) {
+      const gen = sessionLogGeneration(name);
+      if (gen < 0) continue;
+      let st;
+      try {
+        st = statSync(join(dir, name));
+      } catch {
+        continue; // 读不到 → 跳过
+      }
+      if (!st.isFile()) continue;
+      const mtime = st.mtimeMs;
+      if (mtime > bestMtime || (mtime === bestMtime && gen > bestGen)) {
+        bestMtime = mtime;
+        bestGen = gen;
+        best = join(dir, name);
+      }
+    }
+  } catch {
+    /* 目录不可读 → 视为无日志 */
+  }
+  return best;
+}
 
 /** 会话日志大小缓存：sessionId -> { at, size }（TTL 内复用，避免高频事件批反复 statSync）。 */
 const sessionSizeCache = new Map();
@@ -1350,10 +1586,9 @@ function sessionFileSize(sessionId) {
     const root = dshHomePath("sessions-ay-dsh");
     const dir = join(root, projectKey(process.cwd()), encodeSegment(key));
     let size;
-    for (const n of SESSION_LOG_NAMES) {
-      const p = join(dir, n);
-      if (existsSync(p)) { size = statSync(p).size; break; }
-    }
+    // 多代日志（0.1.5）：pickSessionLog 取当前活跃（最近写入）日志文件大小；无日志则 undefined
+    const logPath = pickSessionLog(dir);
+    if (logPath !== null) size = statSync(logPath).size;
     sessionSizeCache.set(key, { at: now, size });
     return size;
   } catch { /* ignore */ }
@@ -1547,8 +1782,9 @@ function scanSessionDirs() {
     }
     for (const s of sessions) {
       if (!s.isDirectory()) continue;
-      const logPath = SESSION_LOG_NAMES.map((n) => join(root, p.name, s.name, n)).find((p2) => existsSync(p2));
-      if (!logPath) continue; // 无日志文件 → 非会话目录（跳过）
+      // 多代日志（0.1.5）：取该会话目录中最高代的日志文件
+      const logPath = pickSessionLog(join(root, p.name, s.name));
+      if (logPath === null) continue; // 无日志文件 → 非会话目录（跳过）
       out.push({ id: s.name, logPath, project: p.name });
     }
   }
@@ -1584,7 +1820,15 @@ async function listSessions(ctx) {
   // 目录虽按 projectKey 分档，但若不在此过滤，其它项目/工作区的会话会全量可见、
   // 可被误恢复（曾导致跨工作区恢复他人会话）。切掉即与"当前工作区"强绑定。
   const currentProject = projectKey(process.cwd());
-  const scoped = entries.filter((e) => e.project === currentProject);
+  // Windows 路径大小写不敏感：会话目录名来自会话**创建时**的 cwd（旧 home 迁移的
+  // 会话还会原样保留旧键名），与当前进程 cwd 的盘符大小写可能不同
+  // （d:\... vs D:\...）。严格相等会让历史列表**静默变空**——恰恰造成
+  // "不知道是新会话还是继承的旧会话"的困惑（本次 0.1.5 升级排查即命中）。
+  const sameProject =
+    process.platform === "win32"
+      ? (a, b) => a.toLowerCase() === b.toLowerCase()
+      : (a, b) => a === b;
+  const scoped = entries.filter((e) => sameProject(e.project, currentProject));
   const allMeta = loadSessionMeta();
   const patch = {};
   const result = [];
@@ -1900,9 +2144,9 @@ async function deleteSession(ctx, sessionId) {
       const cwd = query !== undefined ? (await query.readSession(SessionId(sessionId))).session.cwd ?? process.cwd() : process.cwd();
       dir = join(dshHomePath("sessions-ay-dsh"), projectKey(cwd), encodeSegment(sessionId));
     }
-    const artifacts = ["session.jsonl", "session.jsonl.zstd", "session.jsonl.zst"];
-    const hasArtifact = artifacts.some((name) => existsSync(join(dir, name)));
-    if (!hasArtifact) {
+    // 多代日志（0.1.5）：目录内存在**任一世代**日志（v0 旧名或 session.v<N>.jsonl[.zstd]）
+    // 即视为有效会话；删除时整目录递归移除（覆盖全部世代文件与 .host-lock.json）。
+    if (pickSessionLog(dir) === null) {
       return { ok: false, error: `会话文件不存在: ${dir}` };
     }
     rmSync(dir, { recursive: true, force: true });
@@ -2160,7 +2404,7 @@ async function main() {
         //    那是同会话上下文压缩，摘要复用系统提示词，不适合跨会话迁移）
         // 覆盖最近 60 条用户消息起的对话（配合 summarizeUserMessages 内 150K 上限，
         // 避免大会会话只摘要到最近一两轮）
-        const tailText = tailConversationText(agent.session.events, 60);
+        const tailText = tailConversationText(sessionEventsOf(agent.session), 60);
         let summary = "";
         if (ROTATE_SUMMARY_ENABLED && tailText !== "") {
           try {
@@ -2173,7 +2417,7 @@ async function main() {
         if (summary === "") {
           // fallback：LLM 摘要不可用/关闭 → 取倒数第 N 条用户输入起的所有
           // user/assistant 消息原文（默认 N=5），不丢失记忆
-          summary = tailConversationText(agent.session.events, ROTATE_FALLBACK_MSGS);
+          summary = tailConversationText(sessionEventsOf(agent.session), ROTATE_FALLBACK_MSGS);
         }
         // 2) 创建新会话：**立即创建 agent 并注入摘要**（轮转经用户确认，新会话应
         //    直接可用并继承前会话摘要——不等首条消息，摘要即显示在对话面板）
@@ -2565,20 +2809,22 @@ async function main() {
             //    前端模型下拉恢复为该会话模型（不再显示全局默认）。
             if (typeof msg.id !== "string" || msg.id.trim() === "") break;
             try {
-              const persistence = ctx.get("sessionPersistence");
-              if (persistence !== undefined && typeof persistence.inspect === "function") {
-                const inspected = await persistence.inspect(SessionId(msg.id));
-                const events = (inspected.events ?? []).filter(
-                  (e) => e.type !== "assistant/chunk" && e.type !== "session/end-seed"
-                );
-                const limit = Number.isInteger(msg.limit) && msg.limit > 0 ? msg.limit : 200;
-                const tail = events.slice(-limit);
-                const hasMore = events.length > tail.length;
-                const nextSeq = hasMore ? tail[0].seq : undefined;
-                // 统计：meta.stats 直读（合理则用，零遍历）；无/异常则全量算并落盘
-                const stats = resolveSessionStats(getSessionMeta(msg.id).stats, events, msg.id);
-                post({ t: "history", sessionId: msg.id, events: tail, hasMore, nextSeq, stats, sessionBytes: sessionFileSize(msg.id) });
-              }
+              // 【0.1.5 兼容】不得再用 persistence.inspect（0.1.5 已移除）：用
+              // inspectStoredSession 跨版本只读读取，否则 0.1.5 下这里静默跳过 →
+              // 不发 history 帧 → 面板消息列表清空 / 统计归零（标题与文件大小仍在）。
+              const inspected = await inspectStoredSession(ctx, msg.id);
+              const events = (inspected.events ?? []).filter(
+                (e) => e.type !== "assistant/chunk" && e.type !== "session/end-seed"
+              );
+              const limit = Number.isInteger(msg.limit) && msg.limit > 0 ? msg.limit : 200;
+              const tail = events.slice(-limit);
+              const hasMore = events.length > tail.length;
+              const nextSeq = hasMore ? tail[0].seq : undefined;
+              // 统计：meta.stats 直读（合理则用，零遍历）；无/异常则全量算并落盘
+              const stats = resolveSessionStats(getSessionMeta(msg.id).stats, events, msg.id);
+              // sessionBytes：宿主已知道内核实际使用的日志（pickSessionLog 取最近写入），
+              // 前端标题栏据此显示 KB。
+              post({ t: "history", sessionId: msg.id, events: tail, hasMore, nextSeq, stats, sessionBytes: sessionFileSize(msg.id) });
             } catch (error) {
               log("warn", "restorePreview preview failed", error instanceof Error ? error.message : String(error));
               // 预览失败帧：前端据此解锁（否则卡"正在恢复"直到 15s 兜底）
@@ -2728,7 +2974,7 @@ async function main() {
             // 统计直读 meta.stats（旧会话无统计则全量算一次并落盘）。
             // 注意：**单次加载**（只用 resume，不做 readSession 预读）——两阶段
             // 双份全量加载会拖慢 2 倍（Node 单线程下并行无效），已回滚（docs 2.23）。
-            const allEvents = agent.session.events.filter(
+            const allEvents = sessionEventsOf(agent.session).filter(
               (e) => e.type !== "assistant/chunk" && e.type !== "session/end-seed"
             );
             const limit = Number.isInteger(msg.limit) && msg.limit > 0 ? msg.limit : 200;
@@ -2763,15 +3009,10 @@ async function main() {
               break;
             }
             try {
-              // **用 persistence.inspect（与 resume 同源）**——prepared 缓存共享：
-              // 重复查看同一会话秒回（复用已解压结果）；readSession 独立加载
-              // 每次全量解压（docs 2.24 同因）。
-              const persistence = ctx.get("sessionPersistence");
-              if (persistence === undefined || typeof persistence.inspect !== "function") {
-                post({ t: "viewSessionFailed", id: msg.id, error: "sessionPersistence unavailable" });
-                break;
-              }
-              const inspected = await persistence.inspect(SessionId(msg.id));
+              // **跨版本只读读取（inspectStoredSession）**——≤0.1.1 走 inspect
+              // （prepared 缓存共享，重复查看同一会话秒回）；≥0.1.5 走
+              // open(id,"read")+read(0)（inspect 已移除，见 inspectStoredSession）。
+              const inspected = await inspectStoredSession(ctx, msg.id);
               const events = (inspected.events ?? []).filter(
                 (e) => e.type !== "assistant/chunk" && e.type !== "session/end-seed"
               );
@@ -2798,7 +3039,7 @@ async function main() {
             }
             const limit = Number.isInteger(msg.limit) && msg.limit > 0 ? msg.limit : 200;
             if (agent !== undefined) {
-              const allEvents = agent.session.events.filter(
+              const allEvents = sessionEventsOf(agent.session).filter(
                 (e) => e.type !== "assistant/chunk" && e.type !== "session/end-seed"
               );
               const older = allEvents.filter((e) => e.seq < msg.beforeSeq).slice(-limit);
@@ -2812,26 +3053,22 @@ async function main() {
               });
             } else if (typeof msg.sessionId === "string" && msg.sessionId !== "") {
               try {
-                // 用 persistence.inspect（与 viewSession 同源、prepared 缓存共享），
-                // 避免每次滚动都独立全量解压（readSession 无缓存复用）。
-                const persistence = ctx.get("sessionPersistence");
-                if (persistence !== undefined && typeof persistence.inspect === "function") {
-                  const inspected = await persistence.inspect(SessionId(msg.sessionId));
-                  const allEvents = (inspected.events ?? []).filter(
-                    (e) => e.type !== "assistant/chunk" && e.type !== "session/end-seed"
-                  );
-                  const older = allEvents.filter((e) => e.seq < msg.beforeSeq).slice(-limit);
-                  const hasMore = allEvents.some((e) => e.seq < (older[0]?.seq ?? msg.beforeSeq));
-                  post({
-                    t: "historyMore",
-                    sessionId: msg.sessionId,
-                    events: older,
-                    hasMore,
-                    nextSeq: hasMore && older.length > 0 ? older[0].seq : undefined,
-                  });
-                } else {
-                  post({ t: "historyMore", sessionId: msg.sessionId, events: [], hasMore: false });
-                }
+                // 跨版本只读读取（inspectStoredSession）：≤0.1.1 复用 inspect 的
+                // prepared 缓存；≥0.1.5 走 open(id,"read")+read(0)。避免每次滚动
+                // 都独立全量解压（readSession 无缓存复用）。
+                const inspected = await inspectStoredSession(ctx, msg.sessionId);
+                const allEvents = (inspected.events ?? []).filter(
+                  (e) => e.type !== "assistant/chunk" && e.type !== "session/end-seed"
+                );
+                const older = allEvents.filter((e) => e.seq < msg.beforeSeq).slice(-limit);
+                const hasMore = allEvents.some((e) => e.seq < (older[0]?.seq ?? msg.beforeSeq));
+                post({
+                  t: "historyMore",
+                  sessionId: msg.sessionId,
+                  events: older,
+                  hasMore,
+                  nextSeq: hasMore && older.length > 0 ? older[0].seq : undefined,
+                });
               } catch (error) {
                 log("warn", "view loadMoreHistory failed", error instanceof Error ? error.message : String(error));
                 post({ t: "historyMore", sessionId: msg.sessionId, events: [], hasMore: false });
