@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.5.4] - 2026-09-12
+
+DSH core 0.1.5-rc.2 adaptation — fixes "session history not restored / final answer text lost / feels slow" after the core upgrade:
+
+- Fix session history not restored after a host restart: 0.1.5 removed `sessionPersistence.inspect`, so the preview path's `typeof === "function"` guard failed silently and **no `history` frame was ever sent** (title and log size stayed, message list was cleared, stats reset to zero). Replaced with a cross-version read-only helper (`inspect` → `open(id,"read")` → `sessionQuery.readSession`) used by preview, read-only browsing and pagination.
+- Fix only the first step's text being shown while the final summary report disappeared: once 0.1.5 stopped emitting `assistant/chunk` session events, `translateEvent` wrongly assumed "already streamed" and dropped the text of every later `assistant/message` in the turn. Now decided by whether the step really had streaming deltas.
+- Restore live streaming output: bridge 0.1.5's process-local `agent/assistant-stream` frames back into `assistant/chunk`, leaving the whole front-end streaming pipeline unchanged.
+- Handle 0.1.5's new `assistant/attempt` terminal event (attempt that committed no visible message).
+- Multi-generation immutable session logs: stats `lastSeq` is recomputed when a generation renumbers `seq`; log size / listing / deletion recognize every generation (`session.jsonl.zstd` = v0, `session.v3.jsonl.zstd` = v3).
+- Performance: session stats persistence now slices by `seq` instead of copying and rescanning the whole log on every flush (measured 8.7 ms → ~0 ms per flush on a 310k-event session).
+- Diagnostics: host stderr is mirrored to `<DSH home>/dsh-host.log` (recreated above 5 MB) so kernel boot problems (session load refusal, format refusal, migration failure) can be inspected offline.
+- Session-list project filter is now case-insensitive on Windows: directory keys come from the session's creation-time cwd (and legacy-migrated sessions keep their old key), so a drive-letter case difference used to silently empty the list.
+
 ## [0.5.3] - 2026-09-11
 
 - patch
