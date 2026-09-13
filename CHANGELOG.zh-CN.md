@@ -1,5 +1,10 @@
 # 更新日志
 
+## [0.5.5] - 2026-09-13
+
+- 安全与正确性加固
+- fix: harden security, correctness and remove redundant code
+
 ## [0.5.4] - 2026-09-12
 
 适配 DSH 内核 0.1.5-rc.2（修复升级后"会话历史恢复不了 / 最后的正文输出丢失 / 反应变慢"）：

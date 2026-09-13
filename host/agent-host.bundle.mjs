@@ -85902,7 +85902,7 @@ function envFlag(name) {
   return String(process.env[name] ?? "0") !== "0";
 }
 var NAME2 = "dsh-vscode-host";
-var CORE_VERSION = "0.5.4";
+var CORE_VERSION = "0.5.5";
 var SESSION_PREFIX = "dsh-vscode-";
 var workMode = "single";
 var dshProviders = [];

@@ -41,7 +41,7 @@ function envFlag(name) {
 }
 
 const NAME = "dsh-vscode-host";
-const CORE_VERSION = "0.5.4";
+const CORE_VERSION = "0.5.5";
 /** 插件会话 id 前缀（也是会话隔离的标识）。 */
 const SESSION_PREFIX = "dsh-vscode-";
 

@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.5.5] - 2026-09-13
+
+- Security and correctness hardening
+- fix: harden security, correctness and remove redundant code
+
 ## [0.5.4] - 2026-09-12
 
 DSH core 0.1.5-rc.2 adaptation — fixes "session history not restored / final answer text lost / feels slow" after the core upgrade:
