@@ -74,6 +74,7 @@ export type HostFrame =
   | { t: "compactDone"; id: number; ok: boolean; text?: string; error?: string }
   | { t: "llmProviders"; id: number; providers: { id: string; name: string; baseUrl?: string }[] }
   | { t: "discoveredModels"; id: number; models: { id: string; name?: string; contextWindow?: number; maxTokens?: number }[]; error?: string }
+  | { t: "toolCatalog"; id: number; tools: { name: string; description?: string; fields?: string[] }[]; error?: string }
   | { t: "providersApplied"; id: number; ok: boolean; error?: string }
   | { t: "stepLimit"; maxSteps: number; steps: number }
   | { t: "modelAdapted"; provider: string; model: string; from: string; to: string }
@@ -104,7 +105,8 @@ export type ExtensionFrame =
   | { t: "setWorkMode"; mode: "single" | "multi" }
   | { t: "compact"; id: number }
   | { t: "llmProviders"; id: number }
-  | { t: "discoverModels"; id: number; provider?: string; baseURL?: string; api?: string; apiKey?: string }
+  | { t: "discoverModels"; id: number; provider?: string; baseURL?: string; api?: string; apiKey?: string; model?: string }
+  | { t: "toolCatalog"; id: number }
   | {
       t: "providersApply";
       id: number;

@@ -172,15 +172,17 @@
         },
         "dshVscode.model": {
           "type": "string",
-          "default": "deepseek-v4-flash",
-          "markdownDescription": "默认模型 id（DeepSeek 官方路由）。可填 `deepseek-v4-pro` 等。"
+          "default": "deepseek-flash",
+          "markdownDescription": "默认模型 id（DeepSeek 官方路由）。默认 `deepseek-flash`（V41 Flash）：内核声明 `systemPromptUpdate: in-history`，每轮变化的提示词会追加到已缓存历史之后，而不是改写开头的 system 消息，长会话的 KV cache 前缀因此得以复用。也可填 `deepseek-v4-flash`、`deepseek-v4-pro`、`deepseek-v4-flash-vision-exp`（支持图片）。"
         },
         "dshVscode.baseUrl": {
           "type": "string",
+          "scope": "machine",
           "markdownDescription": "可选：自定义 OpenAI 兼容 Base URL（等价于环境变量 `DEEPSEEK_BASE_URL`）。留空使用官方 API。"
         },
         "dshVscode.permissionMode": {
           "type": "string",
+          "scope": "machine",
           "enum": [
             "workspace-write",
             "read-only",
@@ -191,6 +193,7 @@
         },
         "dshVscode.nodePath": {
           "type": "string",
+          "scope": "machine",
           "markdownDescription": "可选：agent 宿主进程使用的 Node 可执行文件路径。留空时使用 VS Code 内置 Node（`ELECTRON_RUN_AS_NODE`）。",
           "default": ""
         },
@@ -239,14 +242,23 @@
         },
         "dshVscode.autoApproveRules": {
           "type": "array",
+          "scope": "machine",
           "default": [],
           "items": {
             "type": "object",
             "properties": {
               "match": {
                 "type": "string",
-                "markdownDescription": "工具名（如 glob / grep / read）。DSH 内核暂未提供具体命令参数，仅支持工具级匹配，不支持带参数命令。",
+                "markdownDescription": "工具名（支持 `*` 通配，如 `pwsh`、`bash`、`write`、`edit`、`mcp_*`）。注意：内核对 read / glob / grep 从不发起审批。",
                 "default": ""
+              },
+              "commands": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "default": [],
+                "markdownDescription": "可选：命令白名单/黑名单（**前缀匹配**，每行一条），仅对命令类工具（bash / pwsh）有意义。可写 `npm run *`（末尾 `*` 只是记号，等价于 `npm run`）；不允许中间或开头的 `*`。留空 = 工具级规则。"
               },
               "action": {
                 "type": "string",
@@ -256,11 +268,11 @@
                   "deny"
                 ],
                 "default": "allow",
-                "markdownDescription": "allow=自动允许，ask=询问，deny=拒绝。"
+                "markdownDescription": "allow=命中即自动放行（白名单，越界升级不再弹框）；ask=继续弹框（默认）；deny=直接拒绝（黑名单）。命令含 `&&` `;` `|` `>` `<` 反引号 `$(` 时白名单不生效（防复合命令绕过），黑名单不受限。"
               }
             }
           },
-          "markdownDescription": "自动授权规则（工具级）：命中的工具调用按动作处理（allow 自动允许 / ask 询问 / deny 拒绝），不弹审批框。"
+          "markdownDescription": "自动授权规则（白名单 / 黑名单；工具级或命令级前缀）。默认空 = 一切走内核默认：write/edit 与 pwsh/bash 的越界升级会弹框询问。"
         },
         "dshVscode.rotateBytes": {
           "type": "number",

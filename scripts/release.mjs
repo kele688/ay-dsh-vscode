@@ -7,7 +7,7 @@
  *
  * 用法：
  *   node scripts/release.mjs                  # 默认 patch 递增
- *   node scripts/release.mjs --bump minor --message "新增 X；修复 Y"
+ *   node scripts/release.mjs --bump minor --message-en "Summary" --message-zh "摘要"
  *   node scripts/release.mjs --no-bump        # 不递增版本，仅构建打包
  *
  * 说明：
@@ -23,14 +23,22 @@ import { fileURLToPath } from "node:url";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const args = process.argv.slice(2);
-const bumpLevel = args[args.indexOf("--bump") + 1] ?? "patch";
-const messageEn = args[args.indexOf("--message-en") + 1];
-const messageZh = args[args.indexOf("--message-zh") + 1];
+/** 取 flag 后的参数值；flag 缺失时返回 undefined（避免 indexOf(-1)+1 越界误取 args[0]）。 */
+const argValue = (flag) => {
+  const i = args.indexOf(flag);
+  return i >= 0 && i + 1 < args.length ? args[i + 1] : undefined;
+};
+const bumpArg = argValue("--bump");
+const bumpLevel = bumpArg && ["patch", "minor", "major"].includes(bumpArg) ? bumpArg : "patch";
+const messageEn = argValue("--message-en");
+const messageZh = argValue("--message-zh");
 const noBump = args.includes("--no-bump");
 
 function run(step, cmd, cmdArgs) {
   console.log(`\n=== ${step} ===`);
-  const res = spawnSync(cmd, cmdArgs, { cwd: root, stdio: "inherit", shell: process.platform === "win32" });
+  // 全部子进程都是 node（process.execPath）直执行，无需 shell；去掉 shell:true 防 Windows
+  // 下参数被 cmd.exe 拼接执行（--message 含 & | > 等元字符会命令注入）。
+  const res = spawnSync(cmd, cmdArgs, { cwd: root, stdio: "inherit" });
   if (res.status !== 0) {
     console.error(`✗ ${step} 失败（exit ${res.status}）`);
     process.exit(res.status ?? 1);

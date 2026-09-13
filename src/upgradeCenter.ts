@@ -138,9 +138,12 @@ export class UpgradeCenter {
         .map((r) => {
           const raw = r as { tag_name?: unknown; body?: unknown; draft?: unknown };
           const tag = String(raw.tag_name ?? "");
-          let version = tag;
-          if (tagPrefix && tag.startsWith(tagPrefix)) version = tag.slice(tagPrefix.length);
-          else version = tag.replace(/^v/i, "");
+          // 只接受带指定前缀的 tag（如 dsh-v / v）；其它 tag（如同仓库里 harness 自身的
+          // v0.x.y 发布）返回空版本交由 filter 丢弃，避免误列成内核/插件版本。
+          if (tagPrefix && !tag.startsWith(tagPrefix)) {
+            return { version: "", notes: typeof raw.body === "string" ? raw.body : undefined, draft: raw.draft === true };
+          }
+          const version = tagPrefix ? tag.slice(tagPrefix.length) : tag;
           return { version, notes: typeof raw.body === "string" ? raw.body : undefined, draft: raw.draft === true };
         })
         .filter((r) => !r.draft && r.version && filter(r.version))
@@ -187,7 +190,7 @@ export class UpgradeCenter {
   /** 重置 DSH 核心回插件包原始版本（复用 runtime.reset + 清候选/检测周期 + 重启宿主）。 */
   async resetDsh(): Promise<void> {
     this.deps.log("[upgrade-center] resetting DSH core to bundled");
-    this.deps.runtime.reset();
+    await this.deps.runtime.reset();
     await this.deps.globalState.update(CACHE_KEY_DSH, undefined);
     await this.deps.onDshReset();
   }
@@ -227,16 +230,27 @@ export class UpgradeCenter {
       if (!asset?.browser_download_url) throw new Error(zh ? "该版本没有 VSIX 安装包资产" : "no VSIX asset for this release");
 
       // 2) 下载 VSIX 到系统临时目录（安装后即删，不落地缓存）
-      const dl = await fetch(asset.browser_download_url, {
-        headers: { "User-Agent": "ay-dsh-vscode" },
-      });
+      const dlCtrl = new AbortController();
+      const dlTimer = setTimeout(() => dlCtrl.abort(), FETCH_TIMEOUT_MS);
+      let dl: Response;
+      try {
+        dl = await fetch(asset.browser_download_url, {
+          headers: { "User-Agent": "ay-dsh-vscode" },
+          signal: dlCtrl.signal,
+        });
+      } finally {
+        clearTimeout(dlTimer);
+      }
       if (!dl.ok) throw new Error(`download HTTP ${dl.status}`);
       const tmp = path.join(os.tmpdir(), `ay-dsh-vscode-${version}.vsix`);
       fs.writeFileSync(tmp, Buffer.from(await dl.arrayBuffer()));
 
-      // 3) 覆盖安装（同 publisher 同 id → VS Code 升级该扩展）
-      await vscode.commands.executeCommand("workbench.extensions.installExtension", vscode.Uri.file(tmp));
-      fs.rmSync(tmp, { force: true });
+      // 3) 覆盖安装（同 publisher 同 id → VS Code 升级该扩展）；临时文件始终清理
+      try {
+        await vscode.commands.executeCommand("workbench.extensions.installExtension", vscode.Uri.file(tmp));
+      } finally {
+        fs.rmSync(tmp, { force: true });
+      }
       this.deps.statusBar(
         zh ? `✅ 插件已升级到 ${version}，请重新加载窗口生效` : `✅ Extension upgraded to ${version} — reload the window to apply`
       );

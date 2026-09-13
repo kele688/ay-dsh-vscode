@@ -6,6 +6,7 @@
  * ensureHost 回调，保证"打开面板即可用"，绝不静默丢弃用户输入。
  */
 import * as vscode from "vscode";
+import * as path from "node:path";
 import type { AgentHost, HostEvent } from "./host";
 import type { ExtensionToWebview, WebviewMessage } from "./protocol";
 
@@ -217,11 +218,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         case "stop":
           this.host?.stop();
           break;
-        case "approval:resolve":
+        case "approval:resolve": {
+          // 不信任 webview：approve 必须为布尔、id 必须是当前确实待审批的编号，
+          // 否则忽略（防伪造授权绕过工具审批）。
+          if (typeof msg.approve !== "boolean") break;
+          if (!Number.isInteger(msg.id) || !this.pendingApprovals.has(msg.id)) break;
           this.host?.approve(msg.id, msg.approve);
           this.pendingApprovals.delete(msg.id);
           this.refreshApprovalStatusBar();
           break;
+        }
         case "newSession":
           // 用户显式开新会话：清空持久化会话（Reload/重启不再恢复），宿主切到空会话
           this.persistSessionId(undefined);
@@ -269,7 +275,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         case "historyClose":
           break;
         case "loadMoreHistory":
-          this.host?.loadMoreHistory(msg.beforeSeq);
+          this.host?.loadMoreHistory(msg.beforeSeq, msg.sessionId);
           break;
         case "deleteSession":
           this.host?.deleteSession(msg.id);
@@ -347,7 +353,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           break;
         }
         case "openFile": {
-          const uri = vscode.Uri.file(msg.path);
+          // 不信任 webview：path 必须是非空字符串，normalize 后拒绝空值/含 NUL 的非法路径，
+          // 只允许绝对路径（相对路径无意义且可能被拼到任意 cwd 下）。
+          if (typeof msg.path !== "string" || msg.path.trim() === "") break;
+          const normalized = path.normalize(msg.path);
+          if (normalized === "." || normalized.includes("\0") || !path.isAbsolute(normalized)) break;
+          const uri = vscode.Uri.file(normalized);
           void vscode.window.showTextDocument(uri, { preview: true });
           break;
         }

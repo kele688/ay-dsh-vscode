@@ -61,7 +61,6 @@
     stats: null, // 最近一次会话统计
     rotating: false, // 轮转执行中（摘要生成/新会话创建）：锁定发送
     seedShown: null, // 轮转摘要去重标记：history 已显示的【上一会话摘要】文本
-    modelInfo: null, // （历史遗留字段，无读取方；保留以兼容旧帧结构）
     providerModels: {}, // 按提供商分组的模型（provider -> model id 列表），模型下拉过滤用
     suppressSelectorEvents: false, // 填充下拉时抑制 change 事件
     historyMore: null, // {hasMore, nextSeq} 分页状态
@@ -74,6 +73,7 @@
   let codeSeq = 0;
   /** 会话恢复兜底定时器（history 帧 15 秒未到达则自动解除发送锁定）。 */
   let resumeTimer = null;
+  let rotateTimer = null;
 
   /* ---------------- 国际化（跟随 VS Code 语言） ---------------- */
 
@@ -573,8 +573,8 @@
 
   /** 填充模型/提供者下拉并同步当前选择（来自 host 的 modelInfo 帧）。 */
   function renderModelInfo(info) {
-    state.providerModels = info.providerModels || {};
     if (!info) return;
+    state.providerModels = info.providerModels || {};
     state.suppressSelectorEvents = true;
     // provider 下拉
     selProvider.innerHTML = "";
@@ -678,6 +678,8 @@
       const lang = codeLang || "text";
       const codeId = `code-${codeSeq++}`;
       codeTexts.set(codeId, codeBuf.join("\n"));
+      // 上限兜底：长期会话/反复清屏下无界增长 → 超限丢弃最旧条目（M9）
+      if (codeTexts.size > 500) codeTexts.delete(codeTexts.keys().next().value);
       out.push(
         `<div class="codeblock">` +
           `<div class="codeblock-head"><span class="codeblock-lang">${escapeHtml(lang)}</span>` +
@@ -1757,6 +1759,14 @@
         state.rotating = true;
         updateButtons();
         setHint(t("rotateWorkingHint"));
+        // 兜底：宿主异常（bootstrap 迟迟不到）时 30 秒后自动解锁，防止发送被永久锁定
+        clearTimeout(rotateTimer);
+        rotateTimer = setTimeout(() => {
+          if (state.rotating) {
+            state.rotating = false;
+            updateButtons();
+          }
+        }, 30000);
         break;
       }
       case "sessionRotated": {
@@ -1872,6 +1882,8 @@
     // resuming：会话历史恢复中，消息区即将被 history 帧重建，此时发送会
     // 造成"用户消息被清空/应答在前"的错乱——锁定直到历史渲染完成。
     if (state.resuming) return;
+    // 轮转进行中 / 只读浏览子代理会话：与按钮锁定一致，Enter 键不能绕过（M14）
+    if (state.rotating || state.viewSessionId !== null) return;
     inputEl.value = "";
     autoResize();
     // 用户消息**先**同步渲染进消息列表（append），再通知扩展转发给宿主；
@@ -1941,12 +1953,6 @@
       item.append(thumb, rm);
       rail.appendChild(item);
     });
-  }
-
-  /** 点击单张缩略图放大显示（兼容历史图片等单张场景）。 */
-  function showImageLightbox(img) {
-    if (!img || !img.data) return;
-    showImageGallery([img], 0);
   }
 
   /** 多图 lightbox（借鉴 dsh web）：居中大图 + 文件名/序号 + 上一下一张切换；
