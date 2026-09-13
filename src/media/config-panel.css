@@ -522,52 +522,90 @@ input.invalid {
 .suffix-row input {
   flex: none;
 }
-/* 权限审批：自动授权规则列表（工具级，Kilo Code 风格） */
+/* 权限审批：自动授权规则表格（表头与内容同属一张 table；固定列宽 → 表头与内容必然对齐） */
 .permission-rules {
-  display: flex;
-  flex-direction: column;
-  margin-top: 6px;
+  margin-top: 6px; /* 满宽：表格、表头、行分割线、内容四者同宽（不再留白造成"线差一截"） */
 }
-.permission-rule-row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 6px 2px;
-  border-bottom: 1px solid var(--vscode-widget-border, rgba(128, 128, 128, 0.35)); /* 每行下边框分割线 */
+.permission-table {
+  table-layout: fixed;
+  border-collapse: collapse;
 }
-.permission-rule-row:last-child {
-  border-bottom: none;
+.permission-table th,
+.permission-table td {
+  padding: 4px 6px 4px 0;
+  text-align: left;
+  vertical-align: middle;
+  border: none; /* 分割线只画在"行"上，不画在单元格上 */
 }
-/* 系统默认规则标注（只读展示）：弱化样式 + 左侧分隔 */
-.permission-system-badge {
+/* 分割线 = 行的下边沿（表头行与内容行同一规则 → 必然横跨整表宽度） */
+.permission-table tr {
+  border-bottom: 1px solid var(--vscode-widget-border, rgba(128, 128, 128, 0.35));
+}
+.permission-table th {
   font-size: 11px;
+  font-weight: 400;
   color: var(--vscode-descriptionForeground);
-  opacity: 0.8;
+}
+.permission-table th:nth-child(1),
+.permission-table td:nth-child(1) {
+  width: 24%;
+}
+.permission-table th:nth-child(2),
+.permission-table td:nth-child(2) {
+  width: 38%;
+}
+.permission-table th:nth-child(3),
+.permission-table td:nth-child(3) {
+  width: 14%;
+}
+.permission-table th:nth-child(4),
+.permission-table td:nth-child(4) {
+  width: 24%; /* 固定列宽：表格总宽恒定，不随"确认/取消/删除"的显示个数变化 */
   white-space: nowrap;
-  padding-left: 8px;
-  border-left: 1px solid var(--vscode-widget-border, rgba(128, 128, 128, 0.35));
 }
-.permission-rule-row input[type="text"]:read-only,
-.permission-rule-row select:disabled {
+/* 操作按钮：紧凑——内边距刚好包住文字，三个按钮并排也不溢出 */
+.permission-table td:nth-child(4) button {
+  margin-left: 4px;
+  padding: 1px 6px;
+  font-size: 11px;
+  line-height: 15px;
+  min-width: 0;
+  white-space: nowrap;
+}
+.permission-table td:nth-child(4) button:first-child {
+  margin-left: 0;
+}
+
+/* 工具列与策略列：**同一个 select 控件、同一套样式**（原生下拉箭头，不做任何自绘） */
+.permission-table select {
+  width: 100%;
+  box-sizing: border-box;
+  border: none;
+  border-radius: 2px;
+  padding: 2px 4px;
+  background-color: var(--vscode-input-background, rgba(128, 128, 128, 0.12));
+  color: var(--vscode-input-foreground, inherit);
+  font-family: inherit;
+  font-size: inherit;
+}
+/* 命令列：编辑框（不是下拉）——淡边框示意；底色/圆角/内边距与两个下拉一致 */
+.permission-table td:nth-child(2) input[type="text"] {
+  width: 100%;
+  box-sizing: border-box;
+  border: 1px solid var(--vscode-input-border, rgba(128, 128, 128, 0.4));
+  border-radius: 2px;
+  padding: 2px 4px;
+  background-color: var(--vscode-input-background, rgba(128, 128, 128, 0.12));
+  color: var(--vscode-input-foreground, inherit);
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 12px;
+}
+/* 只读 / 禁用：只改光标，**不改文字色**——工具、命令、策略、操作整行文字保持高亮一致 */
+.permission-table input[type="text"]:read-only,
+.permission-table select:disabled {
   cursor: default;
-  color: var(--vscode-descriptionForeground);
-}
-.permission-rule-row input[type="text"],
-.permission-rule-row select {
-  border: none; /* 字段无边框，靠行分割线分隔 */
-  background: transparent;
-  box-shadow: none;
-  max-width: none;
-}
-.permission-rule-row input[type="text"] {
-  flex: 1;
-  max-width: 220px;
-}
-.permission-rule-row select {
-  max-width: 120px;
-  /* 下拉用 VS Code 主题背景/前景，避免透明背景导致白底白字 */
-  background: var(--vscode-dropdown-background, #3c3c3c);
-  color: var(--vscode-dropdown-foreground, #cccccc);
+  color: var(--vscode-input-foreground, inherit);
+  opacity: 1;
 }
 /* 添加规则按钮下方的限制说明：字号更小一级 */
 .permission-note {

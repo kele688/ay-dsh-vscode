@@ -49,6 +49,7 @@ let closed = false;
 const timeout = setTimeout(() => {
   console.error("✗ smoke test TIMEOUT — host did not emit `ready` within 90 s");
   child.kill();
+  rmSync(smokeHome, { recursive: true, force: true }); // 超时路径也要清理临时 home
   process.exit(1);
 }, 90000);
 

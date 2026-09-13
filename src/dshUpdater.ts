@@ -12,11 +12,8 @@
  * - 检测为闲时低优先级任务，绝不阻塞启动、不打扰用户。
  */
 import * as vscode from "vscode";
-import * as path from "node:path";
-import * as fs from "node:fs";
+import { DSH_PACKAGE_METADATA_URL, bundledDshVersion, semverGt } from "./dshVersion";
 
-const DSH_PKG = "@deepseek-ai/dsh-app-boot";
-const REGISTRY_URL = `https://registry.npmjs.org/${DSH_PKG}`;
 /** 距上次成功检测 ≥ 24h 才安排检测。 */
 const CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
 /** 忙碌退避：有活动对话时每 1 分钟重试。 */
@@ -38,52 +35,9 @@ export interface DshUpdaterDeps {
   onCandidate?: (candidate: string) => void;
 }
 
-/** 解析 VSIX 内置（插件发布时锁定）的 DSH 版本；缺失返回 undefined。 */
-export function bundledDshVersion(extensionPath: string): string | undefined {
-  try {
-    const p = path.join(extensionPath, "node_modules", DSH_PKG, "package.json");
-    const pkg = JSON.parse(fs.readFileSync(p, "utf8")) as { version?: string };
-    return pkg.version || undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-/** 按 semver 规则比较预发布标识符（"rc.7" > "rc.6"；正式版 > 预发布）。 */
-function comparePre(a: string | undefined, b: string | undefined): number {
-  if (a === undefined && b === undefined) return 0;
-  if (a === undefined) return 1; // 正式版 > 预发布
-  if (b === undefined) return -1;
-  const tok = (s: string): Array<number | string> =>
-    s.split(".").map((t) => {
-      const n = Number(t);
-      return Number.isNaN(n) ? t : n;
-    });
-  const A = tok(a);
-  const B = tok(b);
-  const n = Math.max(A.length, B.length);
-  for (let i = 0; i < n; i++) {
-    const x = A[i] ?? -1;
-    const y = B[i] ?? -1;
-    if (x === y) continue;
-    if (typeof x === "number" && typeof y === "string") return -1; // 数字段 < 字符串段
-    if (typeof x === "string" && typeof y === "number") return 1;
-    return x < y ? -1 : 1;
-  }
-  return 0;
-}
-
-/** 宽松 semver 比较（正确处理 0.1.0-rc.6 / 0.1.0-rc.7 预发布号）。 */
-export function semverGt(a: string, b: string): boolean {
-  const m = /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$/.exec(a.trim());
-  const n = /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$/.exec(b.trim());
-  if (!m || !n) return false;
-  const core = [Number(m[1]) - Number(n[1]), Number(m[2]) - Number(n[2]), Number(m[3]) - Number(n[3])];
-  for (const d of core) {
-    if (d !== 0) return d > 0;
-  }
-  return comparePre(m[4], n[4]) > 0;
-}
+// 版本比较与内置版本解析已收敛到 ./dshVersion（唯一真源）；此处 re-export 供兼容
+// （extension.ts 等仍按旧路径导入）。
+export { bundledDshVersion, semverGt };
 
 /**
  * 启动 DSH 更新检测调度器。返回 Disposable（deactivate 时清理）。
@@ -104,7 +58,14 @@ export function startDshUpdateChecker(deps: DshUpdaterDeps): vscode.Disposable {
     if (deps.isChatActive()) return;
     checking = true;
     try {
-      const res = await fetch(REGISTRY_URL, { headers: { "User-Agent": "ay-dsh-vscode" } });
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 15_000);
+      let res: Response;
+      try {
+        res = await fetch(DSH_PACKAGE_METADATA_URL, { headers: { "User-Agent": "ay-dsh-vscode" }, signal: ctrl.signal });
+      } finally {
+        clearTimeout(timer);
+      }
       if (!res.ok) {
         deps.log(`[dsh-updater] registry check failed (HTTP ${res.status}) — will retry next cycle`);
         return;

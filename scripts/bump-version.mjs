@@ -35,8 +35,13 @@ const changelogZhPath = join(root, "CHANGELOG.zh-CN.md");
 const args = process.argv.slice(2);
 const level = (args.find((a) => ["patch", "minor", "major"].includes(a)) ?? "patch");
 const dryRun = args.includes("--dry-run");
-const enArg = args[args.indexOf("--message-en") + 1];
-const zhArg = args[args.indexOf("--message-zh") + 1];
+/** 取 flag 后的参数值；flag 缺失时返回 undefined（避免 indexOf(-1)+1 越界误取 args[0]）。 */
+const argValue = (flag) => {
+  const i = args.indexOf(flag);
+  return i >= 0 && i + 1 < args.length ? args[i + 1] : undefined;
+};
+const enArg = argValue("--message-en");
+const zhArg = argValue("--message-zh");
 
 function bumpSemver(v, lvl) {
   const m = /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$/.exec(String(v).trim());
@@ -138,18 +143,31 @@ if (dryRun) {
   process.exit(0);
 }
 
-// ---- 写入 ----
-pkg.version = newVersion;
-writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + "\n", "utf8");
-syncLockVersion();
-writeFileSync(hostPath, hostNext, "utf8");
-writeChangelog(changelogPath, "# Changelog", "Maintained by scripts/bump-version.mjs.", entryEn);
-writeChangelog(
-  changelogZhPath,
-  "# 更新日志",
-  "本文件由 scripts/bump-version.mjs 维护；按用户本地语言（zh-CN）引用展示。",
-  entryZh
-);
+// ---- 写入（先备份五文件，任一步失败回滚，避免版本号/CHANGELOG 半途不一致）----
+const WRITE_TARGETS = [pkgPath, lockPath, hostPath, changelogPath, changelogZhPath];
+const backups = {};
+for (const p of WRITE_TARGETS) {
+  try { backups[p] = readFileSync(p, "utf8"); } catch { backups[p] = null; }
+}
+try {
+  pkg.version = newVersion;
+  writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + "\n", "utf8");
+  syncLockVersion();
+  writeFileSync(hostPath, hostNext, "utf8");
+  writeChangelog(changelogPath, "# Changelog", "Maintained by scripts/bump-version.mjs.", entryEn);
+  writeChangelog(
+    changelogZhPath,
+    "# 更新日志",
+    "本文件由 scripts/bump-version.mjs 维护；按用户本地语言（zh-CN）引用展示。",
+    entryZh
+  );
+} catch (e) {
+  for (const p of WRITE_TARGETS) {
+    if (backups[p] !== null) { try { writeFileSync(p, backups[p], "utf8"); } catch { /* 回滚尽力而为 */ } }
+  }
+  console.error(`✗ 版本递增失败，已回滚：${e instanceof Error ? e.message : String(e)}`);
+  process.exit(1);
+}
 
 console.log(`✅ 版本 ${oldVersion} -> ${newVersion}（${level}）`);
 console.log(`   已同步：package.json / package-lock.json / host/agent-host.mjs (CORE_VERSION) / CHANGELOG.md (EN) / CHANGELOG.zh-CN.md (ZH)`);

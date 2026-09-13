@@ -76,7 +76,11 @@ foreach ($stale in $staleExtensions) {
     if ($installed -contains $stale) {
         Step "卸载旧版扩展（$stale）"
         & code --uninstall-extension $stale 2>&1 | Out-Null
-        Ok "已卸载 $stale"
+        if ($LASTEXITCODE -ne 0) {
+            Write-Warning "卸载 $stale 失败（退出码 $LASTEXITCODE），请手动卸载以免新旧扩展并存"
+        } else {
+            Ok "已卸载 $stale"
+        }
     }
 }
 

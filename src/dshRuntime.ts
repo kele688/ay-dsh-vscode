@@ -4,7 +4,7 @@
  * 设计依据见插件设计决策文档（AY-DSH 插件改进方案选取依据）§1。
  * 状态机（持久化于 workspaceState）：
  *   currentVersion     当前生效版本（顶栏显示；初始 = VSIX 内置）
- *   knownGoodVersion   上一个可正常工作版本（只升不降；初始 = VSIX 内置）
+ *   previousVersion    稳定基线（初始 = VSIX 内置；稳定运行后只升不降，紧急回退时例外降级）
  *   failedVersions[]   失败版本黑名单（不再推荐，须有更新的适配版本才重新推荐）
  *   ignoredVersions[]  用户点"忽略"的版本（同样不再推荐，直到更新的版本出现）
  * 用户可见提示仅两条：状态栏「升级成功」/「升级失败」；过程性事件只写日志。
@@ -13,11 +13,9 @@ import * as vscode from "vscode";
 import * as path from "node:path";
 import * as fs from "node:fs";
 import { execFileSync } from "node:child_process";
+import { DSH_PKG, DSH_REGISTRY, bundledDshVersion, semverGt, isValidDshVersion } from "./dshVersion";
 
-const DSH_PKG = "@deepseek-ai/dsh-app-boot";
-const REGISTRY_URL = `https://registry.npmjs.org/${DSH_PKG}`;
 const KEY_CURRENT = "dshRuntimeCurrentVersion";
-const KEY_KNOWN_GOOD = "dshRuntimeKnownGoodVersion";
 const KEY_PREVIOUS = "dshRuntimePreviousVersion";
 const KEY_FAILED = "dshRuntimeFailedVersions";
 const KEY_IGNORED = "dshRuntimeIgnoredVersions";
@@ -75,8 +73,8 @@ export class DshRuntimeManager {
     return this.deps.workspaceState.get<string[]>(KEY_IGNORED) ?? [];
   }
 
-  private setState(key: string, value: unknown): void {
-    void this.deps.workspaceState.update(key, value);
+  private setState(key: string, value: unknown): Thenable<void> {
+    return this.deps.workspaceState.update(key, value);
   }
 
   /** 当前生效的闭包 node_modules 目录；未升级（用 VSIX 内置）返回 undefined。 */
@@ -116,10 +114,18 @@ export class DshRuntimeManager {
   /**
    * 采纳候选版本：隔离目录 npm install 插件最小依赖集 → 校验版本 → 宿主自检 →
    * 成功则切换（状态栏「升级成功」）。
-   * 失败分级：安装/网络/环境失败（阶段 A）**不进黑名单**（可重试）；
-   * 版本不符/自检失败（阶段 B/C，版本本身问题）**进黑名单**。
+   * 失败分级：安装/网络/环境失败（阶段 A）**不进黑名单**（可重试，含"安装后版本
+   * 校验不符"——可能只是 registry 传播延迟）；仅宿主自检失败（阶段 B，版本本身问题）
+   * **进黑名单**。
    */
   async upgrade(latest: string): Promise<boolean> {
+    // 入口白名单：版本字符串必须是严格 semver，否则直接失败——防止把网络来源的版本
+    // 拼进 shell:true 的 npm 参数造成命令注入，且杜绝目录穿越（runtimeRoot 拼接版本）。
+    if (!isValidDshVersion(latest)) {
+      this.deps.log(`[dsh-runtime] upgrade rejected: invalid version ${JSON.stringify(latest)}`);
+      this.deps.statusBar(vscode.env.language.startsWith("zh") ? "✗ DSH 升级失败" : "✗ DSH upgrade failed");
+      return false;
+    }
     this.deps.log(`[dsh-runtime] upgrading DSH to ${latest} …`);
     const root = this.runtimeRoot(latest);
     const failStatus = () =>
@@ -127,11 +133,19 @@ export class DshRuntimeManager {
     // 阶段 A：安装 + 版本校验（环境/网络失败不拉黑）
     let installed: string | undefined;
     try {
+      // 隔离目录防符号链接劫持：root 已存在且是符号链接则先移除（防安装/加载落点被劫持）
+      try {
+        if (fs.lstatSync(root).isSymbolicLink()) fs.unlinkSync(root);
+      } catch {
+        /* 不存在/非链接 → 由 mkdir 创建或复用 */
+      }
       fs.mkdirSync(root, { recursive: true });
       const specs = this.minimalDependencySpecs(latest);
       // Windows 下 npm.cmd 必须走 shell（CreateProcess 直执行 .cmd 会 EINVAL）
       const npm = process.platform === "win32" ? "npm.cmd" : "npm";
-      execFileSync(npm, ["install", "--prefix", root, "--no-audit", "--no-fund", "--no-package-lock", ...specs], {
+      // 供应链加固：固定官方 registry（探测与安装同源）、--ignore-scripts 阻断下载包的
+      // install/postinstall 脚本在自检前以用户身份执行。
+      execFileSync(npm, ["install", "--prefix", root, "--registry", DSH_REGISTRY, "--ignore-scripts", "--no-audit", "--no-fund", "--no-package-lock", ...specs], {
         cwd: root,
         stdio: "pipe",
         timeout: 5 * 60 * 1000,
@@ -170,7 +184,7 @@ export class DshRuntimeManager {
     }
     // 阶段 C：启用。previousVersion（稳定基线）保持不变——升级版本须稳定运行
     // （>1h + >10 次对话，见 tryPromotePrevious）才提升为基线；self-test 通过只证明"能启动"。
-    this.setState(KEY_CURRENT, installed);
+    await this.setState(KEY_CURRENT, installed);
     this.deps.statusBar(vscode.env.language.startsWith("zh") ? "✅ DSH 已升级" : "✅ DSH upgraded");
     this.deps.log(`[dsh-runtime] DSH upgraded to ${installed} (self-test passed)`);
     return true;
@@ -178,7 +192,9 @@ export class DshRuntimeManager {
 
   /** 运行异常回滚（降级链）：current → previous（稳定基线）→ VSIX 内置。
    *  前 3 次崩溃后调用：试用版本回退到稳定基线；基线即当前版本（已回退过）时降级到
-   *  VSIX 内置；已是最低（内置）则无可退——此后由调用方转入无限指数退避。 */
+   *  VSIX 内置；已是最低（内置）则无可退——此后由调用方转入无限指数退避。
+   *  例外：基线即当前且非内置时，把 previous 降级为 bundled——previous 的"只升不降"
+   *  不变量在紧急回退这里被有意打破（保证后续再崩溃能降到最底线）。 */
   markRuntimeFailed(version: string): void {
     const failed = new Set(this.failedVersions);
     failed.add(version);
@@ -216,8 +232,12 @@ export class DshRuntimeManager {
   noteHostCrash(version: string): "restart" | "rollback" {
     const now = Date.now();
     const prev = this.crashCounts.get(version);
-    const count = prev && now - prev.firstAt < CRASH_WINDOW_MS ? prev.count + 1 : 1;
-    this.crashCounts.set(version, { count, firstAt: now });
+    // 固定时间窗：窗口内累积计数，窗口过期（距首次崩溃 > 阈值）才重置窗口起点
+    // （此前每次崩溃都重置 firstAt，语义退化为"间隔阈值"，比文档更激进）
+    const within = prev !== undefined && now - prev.firstAt <= CRASH_WINDOW_MS;
+    const count = within ? prev.count + 1 : 1;
+    const firstAt = within ? prev.firstAt : now;
+    this.crashCounts.set(version, { count, firstAt });
     if (count >= CRASH_THRESHOLD) {
       this.deps.log(`[dsh-runtime] runtime ${version} crashed ${count}x within window — rolling back`);
       this.markRuntimeFailed(version);
@@ -280,13 +300,12 @@ export class DshRuntimeManager {
   }
 
   /** 重置运行时状态（回退 VSIX 内置 + 清空候选/黑名单；供测试与紧急恢复）。 */
-  reset(): void {
-    this.setState(KEY_CURRENT, undefined);
-    this.setState(KEY_KNOWN_GOOD, undefined);
-    this.setState(KEY_PREVIOUS, undefined);
-    this.setState(KEY_FAILED, undefined);
-    this.setState(KEY_IGNORED, undefined);
-    this.setState(KEY_STABILITY, undefined);
+  async reset(): Promise<void> {
+    await this.setState(KEY_CURRENT, undefined);
+    await this.setState(KEY_PREVIOUS, undefined);
+    await this.setState(KEY_FAILED, undefined);
+    await this.setState(KEY_IGNORED, undefined);
+    await this.setState(KEY_STABILITY, undefined);
     this.crashCounts.clear();
     this.deps.statusBar(vscode.env.language.startsWith("zh") ? "DSH 运行时已重置为内置版" : "DSH runtime reset to bundled");
     this.deps.log("[dsh-runtime] runtime state reset to bundled");
@@ -318,10 +337,12 @@ export class DshRuntimeManager {
     const useElectronNode = nodeExe === process.execPath;
     const hostScript = this.deps.hostScript();
     const loader = this.deps.loaderArgs();
+    // 一次性 nonce：宿主必须回显该值且干净退出才判通过（防伪造静态哨兵提前通过）
+    const nonce = `selftest-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
     const env: NodeJS.ProcessEnv = {
       ...process.env,
       DSH_RUNTIME_NODE_MODULES: path.join(runtimeRoot, "node_modules"),
-      DSH_SELF_TEST: "1",
+      DSH_SELF_TEST: nonce,
       DSH_HOME: path.join(runtimeRoot, "selftest-home"),
     };
     if (useElectronNode) env.ELECTRON_RUN_AS_NODE = "1";
@@ -337,11 +358,6 @@ export class DshRuntimeManager {
       }, SELF_TEST_TIMEOUT_MS);
       child.stdout.on("data", (d: Buffer) => {
         out += d.toString("utf8");
-        if (out.includes("DSH_SELF_TEST_OK")) {
-          clearTimeout(timer);
-          try { child.kill(); } catch { /* ignore */ }
-          resolvePromise(true);
-        }
       });
       child.on("error", () => {
         clearTimeout(timer);
@@ -349,7 +365,8 @@ export class DshRuntimeManager {
       });
       child.on("exit", (code) => {
         clearTimeout(timer);
-        resolvePromise(code === 0 && out.includes("DSH_SELF_TEST_OK"));
+        // 必须干净退出且回显 nonce 才判通过（不提前在 stdout 命中即通过）
+        resolvePromise(code === 0 && out.includes(nonce));
       });
     });
   }
@@ -357,49 +374,6 @@ export class DshRuntimeManager {
 
 /* ---------------- 工具 ---------------- */
 
-/** 解析 VSIX 内置（或任意目录下）的 dsh-app-boot 版本。 */
-export function bundledDshVersion(extensionPathOrModules: string): string | undefined {
-  try {
-    const p = path.join(extensionPathOrModules, "node_modules", DSH_PKG, "package.json");
-    const pkg = JSON.parse(fs.readFileSync(p, "utf8")) as { version?: string };
-    return pkg.version || undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-/** 按 semver 规则比较预发布标识符（"rc.7" > "rc.6"；正式版 > 预发布）。 */
-function comparePre(a: string | undefined, b: string | undefined): number {
-  if (a === undefined && b === undefined) return 0;
-  if (a === undefined) return 1; // 正式版 > 预发布
-  if (b === undefined) return -1;
-  const tok = (s: string): Array<number | string> =>
-    s.split(".").map((t) => {
-      const n = Number(t);
-      return Number.isNaN(n) ? t : n;
-    });
-  const A = tok(a);
-  const B = tok(b);
-  const n = Math.max(A.length, B.length);
-  for (let i = 0; i < n; i++) {
-    const x = A[i] ?? -1;
-    const y = B[i] ?? -1;
-    if (x === y) continue;
-    if (typeof x === "number" && typeof y === "string") return -1; // 数字段 < 字符串段
-    if (typeof x === "string" && typeof y === "number") return 1;
-    return x < y ? -1 : 1;
-  }
-  return 0;
-}
-
-/** 宽松 semver 比较（正确处理 0.1.0-rc.6 / 0.1.0-rc.7 预发布号）。 */
-export function semverGt(a: string, b: string): boolean {
-  const m = /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$/.exec(a.trim());
-  const n = /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$/.exec(b.trim());
-  if (!m || !n) return false;
-  const core = [Number(m[1]) - Number(n[1]), Number(m[2]) - Number(n[2]), Number(m[3]) - Number(n[3])];
-  for (const d of core) {
-    if (d !== 0) return d > 0;
-  }
-  return comparePre(m[4], n[4]) > 0;
-}
+// 版本比较与内置版本解析已收敛到 ./dshVersion（唯一真源）；此处仅 re-export 供兼容
+// （upgradeCenter 等仍按旧路径导入）。dshRuntime 内部直接用上方 import 的绑定。
+export { bundledDshVersion, semverGt };

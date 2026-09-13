@@ -33,6 +33,10 @@ let hostReadyAt: number | undefined;
 let hostReadyVersion: string | undefined;
 /** 指数退避计数（仅回退后的稳定基线/内置版本崩溃时递增；宿主 ready 时重置）。 */
 let backoffAttempt = 0;
+/** 上次已下发给宿主的"官方路由 API Key"：只有它**实际变化**才需要重启宿主（密钥走进程环境变量）。 */
+let lastOfficialKey: string | undefined;
+/** 已重同步过提供商配置的宿主实例：每个宿主实例只同步一次，避免反复清空宿主内缓存。 */
+let syncedProviderHost: AgentHost | undefined;
 
 /** 设置/清除 DSH 升级候选（持久化 + 推送顶栏横幅）。 */
 function setDshCandidate(context: vscode.ExtensionContext, latest: string | undefined): void {
@@ -71,7 +75,7 @@ async function doDshUpgrade(context: vscode.ExtensionContext): Promise<void> {
 
 /** 重置 DSH 运行时为 VSIX 内置（清空候选/黑名单/已采纳版本/检测周期；测试与紧急恢复用）。 */
 async function resetDshRuntimeFlow(context: vscode.ExtensionContext): Promise<void> {
-  runtimeManager?.reset();
+  await runtimeManager?.reset();
   setDshCandidate(context, undefined);
   // 清除检测周期：重置后 1 分钟内即可重新检测（测试升级流程的关键）
   void context.workspaceState.update(LAST_CHECK_KEY, undefined);
@@ -207,7 +211,7 @@ function readConfig(): {
   enableLearning: boolean;
   enableAutoLearn: boolean;
   enableReiteration: boolean;
-  autoApproveRules: { match: string; action: string }[];
+  autoApproveRules: { match: string; action: string; commands?: string[] }[];
 } {
   const cfg = vscode.workspace.getConfiguration(CONFIG_NS);
   const apiKeySetting = cfg.get<string>("apiKey");
@@ -216,7 +220,12 @@ function readConfig(): {
     process.env.DEEPSEEK_API_KEY;
   const baseUrl = cfg.get<string>("baseUrl") || undefined;
   const model = cfg.get<string>("model") || DEFAULT_MODEL;
-  const permissionMode = cfg.get<string>("permissionMode") || "workspace-write";
+  // 安全敏感项：仅接受白名单枚举，非法值一律回退默认（配置已 scope:"machine"、
+  // 工作区不可覆盖；此处兜底防用户手改 settings.json 引入非法/未知值）。
+  const permissionModeRaw = cfg.get<string>("permissionMode");
+  const permissionMode = ["workspace-write", "read-only", "danger-full-access"].includes(permissionModeRaw ?? "")
+    ? (permissionModeRaw as string)
+    : "workspace-write";
   const nodePath = cfg.get<string>("nodePath") || "";
   // 借鉴 dsh web：思考轮次上限（0 = 不限制）、子代理递归深度、并行子代理数
   const maxSteps = Math.max(0, Number(cfg.get<number>("maxSteps") ?? 100) || 0);
@@ -236,14 +245,40 @@ function readConfig(): {
   const enableLearning = cfg.get<boolean>("enableLearning") ?? false;
   const enableAutoLearn = cfg.get<boolean>("enableAutoLearn") ?? false;
   const enableReiteration = cfg.get<boolean>("enableReiteration") ?? false;
-  // 自动授权规则（工具级，Kilo Code 风格）：glob/grep/read 等只读工具可自动放行
-  const rawRules = cfg.get<{ match?: string; action?: string }[]>("autoApproveRules");
-  const autoApproveRules: { match: string; action: string }[] = Array.isArray(rawRules)
+  // 自动授权规则（白名单 / 黑名单）：{ match, action, commands? }。
+  // 命令级规则（commands 非空）走**前缀匹配**，宿主按需记录这些工具的调用参数并用 callId 关联；
+  // 非法条目（中间/开头的 `*`、空串）由 UI 保存时拒绝，宿主侧另有兜底丢弃。
+  const rawRules = cfg.get<{ match?: string; action?: string; commands?: unknown }[]>("autoApproveRules");
+  const autoApproveRules: { match: string; action: string; commands?: string[] }[] = Array.isArray(rawRules)
     ? rawRules
-        .map((r) => ({ match: String(r?.match ?? "").trim(), action: ["allow", "ask", "deny"].includes(String(r?.action)) ? String(r.action) : "ask" }))
-        .filter((r) => r.match)
+        .map((r) => {
+          const rule: { match: string; action: string; commands?: string[] } = {
+            match: String(r?.match ?? "").trim(),
+            action: ["allow", "ask", "deny"].includes(String(r?.action)) ? String(r.action) : "ask",
+          };
+          if (Array.isArray(r?.commands) && r.commands.length > 0) {
+            const cmds = r.commands.map((c) => String(c ?? "").trim()).filter((c) => c !== "");
+            // 声明了命令但全部为空 → 丢弃整条规则（不降级成"允许/拒绝该工具全部命令"）
+            if (cmds.length === 0) return undefined;
+            rule.commands = cmds;
+          }
+          return rule;
+        })
+        .filter((r): r is { match: string; action: string; commands?: string[] } => Boolean(r && r.match))
     : [];
   return { apiKey, baseUrl, model, permissionMode, nodePath, maxSteps, subagentMaxDepth, maxParallelSubagents, autoCompaction, compactionThresholdRatio, compactionMaxTokens, rotateBytes, rotateSummary, rotateFallbackMsgs, enableCustom, enableLearning, enableAutoLearn, enableReiteration, autoApproveRules };
+}
+
+/** deepseek-official 专属密钥库键（与 configPanel.ts 的 providerSecretKey("deepseek-official") 一致）。 */
+const OFFICIAL_PROVIDER_KEY = "dshVscode.provider.deepseek-official.apiKey";
+
+/** 解析"实际生效"的 DeepSeek API Key。优先级（高→低）：设置/环境（readConfig.apiKey）→
+ *  deepseek-official 专属密钥库 → 旧全局密钥库（dshVscode.apiKey）。
+ *  唯一真源：createHost 与 getConfigSummary 共用，避免两处优先级漂移（M4）。 */
+async function resolveApiKey(context: vscode.ExtensionContext, cfg: { apiKey?: string }): Promise<string | undefined> {
+  const officialKey = await context.secrets.get(OFFICIAL_PROVIDER_KEY);
+  const legacyKey = await context.secrets.get(SECRET_KEY);
+  return cfg.apiKey ?? officialKey ?? legacyKey ?? undefined;
 }
 
 /** 配置摘要（推送给 UI 展示）。SecretStorage 密钥库是 API Key 的主存储，必须纳入判断。 */
@@ -255,8 +290,7 @@ async function getConfigSummary(context: vscode.ExtensionContext): Promise<{
   cwd: string;
 }> {
   const c = readConfig();
-  const secretKey = await context.secrets.get(SECRET_KEY);
-  const keyConfigured = Boolean(c.apiKey ?? secretKey);
+  const keyConfigured = Boolean(await resolveApiKey(context, c));
   return {
     keyConfigured,
     model: c.model,
@@ -281,12 +315,19 @@ async function setConfigValue<T>(key: string, value: T): Promise<void> {
   await vscode.workspace.getConfiguration(CONFIG_NS).update(key, value, vscode.ConfigurationTarget.Global);
 }
 
+/** 正在退出的旧宿主：`ensureHost` 新建前会等它真正退出，避免新旧宿主并存。 */
+let disposingHost: Promise<void> | undefined;
+
 /** 重启宿主（配置变更后下次使用时按新配置拉起）。 */
 function disposeHost(): void {
   const old = host;
   host = undefined;
   provider?.setHost(undefined);
-  void old?.dispose();
+  if (old) {
+    disposingHost = old.dispose().catch(() => {
+      /* 退出异常不影响后续拉起 */
+    });
+  }
 }
 
 /** 插件专属 DSH home：VS Code globalStorage 下，与官方 dsh 的 ~/.dsh 完全隔离。 */
@@ -298,6 +339,9 @@ function pluginDshHome(context: vscode.ExtensionContext): string {
 function legacyDshHome(): string {
   return process.env.DSH_HOME || path.join(os.homedir(), ".dsh");
 }
+
+/** 正在创建的宿主（single-flight）：并发 ensureHost 复用同一 Promise，杜绝双 spawn。 */
+let creatingHost: Promise<AgentHost> | undefined;
 
 /** 确保宿主存在且已启动（惰性创建；视图/命令首次使用时才拉起子进程）。 */
 async function ensureHost(context: vscode.ExtensionContext): Promise<AgentHost> {
@@ -320,14 +364,27 @@ async function ensureHost(context: vscode.ExtensionContext): Promise<AgentHost> 
       return host;
     }
   }
+  // single-flight：并发 ensureHost 复用同一次创建，杜绝双 spawn（H5）。
+  if (creatingHost) return creatingHost;
+  creatingHost = createHost(context).finally(() => {
+    creatingHost = undefined;
+  });
+  return creatingHost;
+}
+
+/** 真正创建并启动宿主（single-flight 的实际执行体；仅由 ensureHost 调用）。 */
+async function createHost(context: vscode.ExtensionContext): Promise<AgentHost> {
+  // 关键：先等旧宿主**真正退出**再拉起新宿主。否则新旧两个 node 进程会并存
+  // （同一个 dsh-host.log 被两个进程交错写入、资源争用），表现为"两个宿主"。
+  if (disposingHost) {
+    await disposingHost;
+    disposingHost = undefined;
+  }
   await ensureWorkspaceChoice();
   const cfg = readConfig();
-  const secretKey = await context.secrets.get(SECRET_KEY);
   // deepseek-official（llm-deepseek 插件路由）密钥：配置面板统一界面保存于密钥库，
-  // 此处注入宿主 DEEPSEEK_API_KEY 环境变量（llm-deepseek 默认凭据引用），
-  // 用户无需手动配置环境变量；环境变量/设置已有值时优先（readConfig 已读入 cfg.apiKey）
-  const officialKey = await context.secrets.get("dshVscode.provider.deepseek-official.apiKey");
-  const apiKey = cfg.apiKey ?? officialKey ?? secretKey ?? undefined;
+  // 此处注入宿主 DEEPSEEK_API_KEY 环境变量（llm-deepseek 默认凭据引用）。优先级见 resolveApiKey。
+  const apiKey = await resolveApiKey(context, cfg);
   const h = new AgentHost(
     {
       extensionPath: context.extensionUri.fsPath,
@@ -462,16 +519,20 @@ function openSettings(context: vscode.ExtensionContext): void {
     // 避免无效写入与路由干扰；其余提供商原样同步。
     // 宿主不可用时静默失败（返回错误信息，不影响面板本身）。
     applyProviders: async (providers): Promise<string | undefined> => {
+      // 全量下发 dshProviders（配置真源，**含**官方路由 deepseek-official）：宿主需要
+      // 完整配置作为"对话面板可选项"的真源；是否写入 llm-pi-ai 由宿主内部决定
+      // （官方路由是 llm-deepseek 路由，跳过 pi-ai 写入）。
       const list = providers ?? [];
-      const hasOfficial = list.some((p) => p.id === "deepseek-official");
-      const piAi = list.filter((p) => p.id !== "deepseek-official");
+      const officialKey = list.find((p) => p.id === "deepseek-official")?.apiKey ?? "";
       try {
         const h = await ensureHost(context);
         if (h) {
-          const err = await h.applyProviders(piAi);
-          // deepseek-official 密钥注入宿主 DEEPSEEK_API_KEY 环境变量需重启宿主生效；
-          // 检测到本次保存包含该路由即重启（其余提供商仍热生效，不重启）
-          if (!err && hasOfficial) {
+          const err = await h.applyProviders(list);
+          // 只有"官方路由 API Key **实际变化**"才需要重启宿主（该密钥以进程环境变量注入）；
+          // 其余同步一律热生效。此前以"列表含 deepseek-official"为条件（恒真），
+          // 导致每次配置同步都重启宿主（缓存反复清空、思考级别反复查询——已修）。
+          if (!err && officialKey !== lastOfficialKey) {
+            lastOfficialKey = officialKey;
             disposeHost();
             void ensureHost(context);
           }
@@ -486,14 +547,28 @@ function openSettings(context: vscode.ExtensionContext): void {
     // deepseek-official 是插件路由（llm-deepseek），模型由其默认公布（含多模态），
     // 不走 pi-ai catalog/网络查询——直接返回官方模型清单（与插件 DEFAULT_MODELS 一致）。
     discoverModels: async (opts): Promise<{ models: { id: string; name?: string; contextWindow?: number; maxTokens?: number; inputModalities?: string[] }[]; error?: string }> => {
+      // deepseek-official（llm-deepseek 官方路由）不进 llm-pi-ai，无法走 pi-ai 发现，
+      // 过去这里写死过三模型清单。现在优先向宿主查询**内核真实目录**：0.1.5 起包含
+      // `deepseek-flash`——唯一默认声明 `systemPromptUpdate: in-history` 的条目（提示词
+      // 变更追加到缓存历史之后，长会话 KV cache 前缀可复用）。宿主不可用/查询失败时
+      // 回退下面的兜底清单（保持与内核目录同序，含 deepseek-flash）。
+      const OFFICIAL_FALLBACK = [
+        { id: "deepseek-flash", name: "DeepSeek-Flash", contextWindow: 1000000, maxTokens: 384000, inputModalities: ["text", "image"] },
+        { id: "deepseek-v4-flash", name: "DeepSeek-V4-Flash", contextWindow: 1000000, maxTokens: 384000, inputModalities: ["text"] },
+        { id: "deepseek-v4-pro", name: "DeepSeek-V4-Pro", contextWindow: 1000000, maxTokens: 384000, inputModalities: ["text"] },
+        { id: "deepseek-v4-flash-vision-exp", name: "DeepSeek-V4-Flash-Vision-Exp", contextWindow: 1000000, maxTokens: 384000, inputModalities: ["text", "image"] },
+      ];
       if (opts.provider === "deepseek-official") {
-        return {
-          models: [
-            { id: "deepseek-v4-flash", name: "DeepSeek-V4-Flash", contextWindow: 1000000, maxTokens: 384000, inputModalities: ["text"] },
-            { id: "deepseek-v4-pro", name: "DeepSeek-V4-Pro", contextWindow: 1000000, maxTokens: 384000, inputModalities: ["text"] },
-            { id: "deepseek-v4-flash-vision-exp", name: "DeepSeek-V4-Flash-Vision-Exp", contextWindow: 1000000, maxTokens: 384000, inputModalities: ["text", "image"] },
-          ],
-        };
+        try {
+          const h = await ensureHost(context);
+          if (h) {
+            const disc = await h.discoverModels(opts);
+            if (!disc.error && Array.isArray(disc.models) && disc.models.length > 0) return disc;
+          }
+        } catch {
+          // 宿主不可用：走兜底清单（面板不因此空列表）
+        }
+        return { models: OFFICIAL_FALLBACK };
       }
       try {
         const h = await ensureHost(context);
@@ -502,6 +577,16 @@ function openSettings(context: vscode.ExtensionContext): void {
         // 宿主不可用：回退网络查询
       }
       return { models: [], error: "host unavailable" };
+    },
+    // 配置页"审批规则"的工具名建议列表：查询宿主当前可见（裁剪后）的工具集。
+    queryToolCatalog: async (): Promise<{ name: string; description?: string; fields?: string[] }[]> => {
+      try {
+        const h = await ensureHost(context);
+        if (h) return await h.toolCatalog();
+      } catch {
+        /* 宿主不可用：建议列表留空，工具名仍可手填 */
+      }
+      return [];
     },
     // 提供商配置同步完成后：触发宿主 getModelInfo，让聊天面板底部模型选择器
     // 立即反映新增/变更的提供商与模型（宿主已通过 llm-pi-ai settings 热生效）。
@@ -565,9 +650,49 @@ function fixPackagedRipgrepExec(extensionPath: string): void {
   }
 }
 
+/** dshProviders 形式对齐（幂等迁移，**只补字段、绝不删内容**）。
+ *  历史数据的元素可能缺字段（如 type / models），而修正后的读取与下发逻辑要求统一形状；
+ *  这里补齐 name/type/baseUrl/models，并保留每个模型的全部已有参数
+ *  （displayName / contextWindow / maxOutput / inputModalities）——用户既有配置
+ *  （提供商 + 已选模型 + 参数）原样继续生效，不会被清空或重置。 */
+function normalizeDshProviders(context: vscode.ExtensionContext): void {
+  const KEY = "dshProviders";
+  const raw = context.globalState.get<unknown>(KEY);
+  if (!Array.isArray(raw) || raw.length === 0) return;
+  const normalized = raw
+    .filter(
+      (p): p is { id: string; name?: unknown; type?: unknown; baseUrl?: unknown; protocol?: unknown; models?: unknown } =>
+        Boolean(p) && typeof p === "object" && typeof (p as { id?: unknown }).id === "string" && (p as { id: string }).id !== ""
+    )
+    .map((src) => {
+      const models = Array.isArray(src.models)
+        ? src.models
+            .map((m) => (typeof m === "string" ? { id: m } : m))
+            .filter(
+              (m): m is Record<string, unknown> =>
+                Boolean(m) && typeof m === "object" && typeof (m as { id?: unknown }).id === "string" && (m as { id: string }).id !== ""
+            )
+        : [];
+      return {
+        id: src.id,
+        name: typeof src.name === "string" && src.name !== "" ? src.name : src.id,
+        type: typeof src.type === "string" && src.type !== "" ? src.type : "known",
+        baseUrl: typeof src.baseUrl === "string" ? src.baseUrl : "",
+        ...(typeof src.protocol === "string" && src.protocol !== "" ? { protocol: src.protocol } : {}),
+        models,
+      };
+    });
+  if (JSON.stringify(normalized) !== JSON.stringify(raw)) {
+    void context.globalState.update(KEY, normalized);
+  }
+}
+
 export function activate(context: vscode.ExtensionContext): void {
   // 远端平台：恢复打包 ripgrep 的可执行权限（见 fixPackagedRipgrepExec 注释）
   fixPackagedRipgrepExec(context.extensionPath);
+  // 配置真源形式对齐（幂等）：补齐历史 dshProviders 的字段形状，保证修正后的
+  // 读取/下发逻辑对既有配置平滑生效——只补字段，不删任何提供商、模型或参数。
+  normalizeDshProviders(context);
   provider = new ChatViewProvider({
     extensionUri: context.extensionUri,
     // 当前生效 DSH 版本（升级后 = 采纳版本；未升级 = VSIX 内置），顶栏展示
@@ -610,6 +735,21 @@ export function activate(context: vscode.ExtensionContext): void {
       backoffAttempt = 0;
       hostReadyAt = Date.now();
       hostReadyVersion = v;
+      // 配置真源重同步：**每个宿主实例只做一次**（宿主重启后新实例会再同步一次）。
+      // 不做"每次就绪都下发"——那会反复触发宿主 providersApply、清空适配缓存，
+      // 表现为"每轮对话都重复查询思考级别能力"。
+      const readyHost = host;
+      if (readyHost && readyHost !== syncedProviderHost) {
+        syncedProviderHost = readyHost;
+        void (async () => {
+          try {
+            const list = context.globalState.get<Parameters<typeof readyHost.applyProviders>[0]>("dshProviders") ?? [];
+            await readyHost.applyProviders(list);
+          } catch {
+            /* 同步失败不影响宿主使用；下次保存配置时会再次同步 */
+          }
+        })();
+      }
     },
     // 对话完成：累计稳定性统计（previous 提升门槛：>1h 且 >10 次对话）。
     onChatDone: () => {

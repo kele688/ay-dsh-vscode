@@ -23,6 +23,7 @@ import { mkdirSync, readFileSync, writeFileSync, existsSync, readdirSync, rmSync
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const NATIVES = join(root, "scripts", ".natives");
@@ -77,6 +78,28 @@ function fail(msg) {
   process.exit(1);
 }
 
+const sha512Base64 = (buf) => createHash("sha512").update(buf).digest("base64");
+
+/**
+ * 校验 npm tarball 与 registry 公布的 dist.integrity（sha512 SRI，供应链完整性）。
+ * 返回：true=通过；false=不匹配；undefined=registry 未提供 integrity（降级告警，不阻断）。
+ */
+async function verifyNpmIntegrity(buf, scope, name, version) {
+  let meta;
+  try {
+    const r = await fetch(`${REG}/${scope}/${name}`);
+    if (!r.ok) return undefined;
+    meta = await r.json();
+  } catch {
+    return undefined;
+  }
+  const integrity = meta?.versions?.[version]?.dist?.integrity;
+  if (typeof integrity !== "string") return undefined;
+  const m = /^sha512-([A-Za-z0-9+/]+={0,2})$/.exec(integrity);
+  if (!m) return undefined;
+  return sha512Base64(buf) === m[1];
+}
+
 /** Recursively copy a directory tree (koffi packages contain dirs like linux_x64/). */
 function copyTree(src, dest) {
   const st = statSync(src);
@@ -107,8 +130,16 @@ async function ensurePlatformPackage(scope, name, version) {
     rmSync(dest, { recursive: true, force: true });
   }
   const cacheFile = join(NATIVES, `${scope.replace(/^@/, "")}-${name}-${version}.tgz`);
+  const cacheShaFile = `${cacheFile}.sha512`;
   let tgz;
   if (existsSync(cacheFile)) {
+    // 缓存命中：若存在 sha512 旁车则校验，防本地缓存被篡改（首次下载时已写旁车）
+    if (existsSync(cacheShaFile)) {
+      const expect = readFileSync(cacheShaFile, "utf8").trim();
+      if (sha512Base64(readFileSync(cacheFile)) !== expect) {
+        fail(`cached tgz integrity mismatch: ${cacheFile}`);
+      }
+    }
     log(`${name}: using cached tgz (${cacheFile})`);
     tgz = cacheFile;
   } else {
@@ -117,10 +148,16 @@ async function ensurePlatformPackage(scope, name, version) {
     const res = await fetch(url);
     if (!res.ok) fail(`failed to download ${scope}/${name} (HTTP ${res.status})`);
     mkdirSync(NATIVES, { recursive: true });
+    const buf = Buffer.from(await res.arrayBuffer());
+    // 供应链完整性：校验下载 tgz 与 registry 公布的 dist.integrity（sha512）
+    const ok = await verifyNpmIntegrity(buf, scope, name, version);
+    if (ok === false) fail(`integrity mismatch for ${scope}/${name}@${version} (registry dist.integrity)`);
+    if (ok === undefined) log(`${name}: registry dist.integrity unavailable — skipping integrity check`);
     tgz = join(TMP, `${name}.tgz`);
-    writeFileSync(tgz, Buffer.from(await res.arrayBuffer()));
-    writeFileSync(cacheFile, readFileSync(tgz));
-    log(`${name}: cached to ${cacheFile}`);
+    writeFileSync(tgz, buf);
+    writeFileSync(cacheFile, buf);
+    writeFileSync(cacheShaFile, sha512Base64(buf) + "\n");
+    log(`${name}: cached to ${cacheFile} (sha512 recorded)`);
   }
   const x = join(TMP, name);
   rmSync(x, { recursive: true, force: true });
@@ -225,8 +262,18 @@ async function ensureNodePty() {
         const url = "https://github.com/kele688/ay-dsh-vscode/releases/latest/download/node-pty-linux-x64.pty.node";
         const res = await fetch(url);
         if (res.ok) {
+          const buf = Buffer.from(await res.arrayBuffer());
+          // 完整性：若存在 .sha256 旁车则校验（发布资产时同发一个 .sha256 即可硬化）
+          const shaFile = join(NATIVES, "node-pty-linux-x64.pty.node.sha256");
+          if (existsSync(shaFile)) {
+            const expect = readFileSync(shaFile, "utf8").trim().toLowerCase();
+            const actual = createHash("sha256").update(buf).digest("hex");
+            if (actual !== expect) fail(`node-pty ${plat}: GitHub asset integrity mismatch (sha256)`);
+          } else {
+            log(`node-pty ${plat}: no .sha256 sidecar — skipping integrity check (publish one to harden)`);
+          }
           mkdirSync(dirname(dest), { recursive: true });
-          writeFileSync(dest, Buffer.from(await res.arrayBuffer()));
+          writeFileSync(dest, buf);
           log(`node-pty ${plat}/pty.node: downloaded from GitHub Release`);
           continue;
         }

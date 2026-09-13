@@ -26,6 +26,20 @@ import { createUserMessage, BlockAssembler } from "@deepseek-ai/dsh-llm";
 import { SessionId } from "@deepseek-ai/dsh-session";
 import { installModelSelection } from "@deepseek-ai/dsh-agent";
 
+// 父进程（VS Code 扩展宿主）消失时自杀：协议管道关闭/断开即退出，避免留下孤儿宿主。
+// 扩展宿主被 Reload / 终止时不会执行 dispose()，若不自杀，本进程会长期存活、占用内存
+// 并继续写同一个 dsh-host.log（这正是历史上出现"多个 node 宿主并存"的原因之一）。
+for (const ev of ["end", "close"]) process.stdin.on(ev, () => process.exit(0));
+process.on("disconnect", () => process.exit(0));
+
+/** 统一读取扩展注入的布尔开关（"0"/"1"）。此前 composePatches 用分层 env、
+ *  attachAgent 用 process.env 判读 DSH_ENABLE_CUSTOM，两源不一致时定制人设会静默
+ *  丢失——这些开关只由扩展经 process.env 注入（host.ts），settings.yaml 不承载，
+ *  故以 process.env 为唯一真源。 */
+function envFlag(name) {
+  return String(process.env[name] ?? "0") !== "0";
+}
+
 const NAME = "dsh-vscode-host";
 const CORE_VERSION = "0.5.4";
 /** 插件会话 id 前缀（也是会话隔离的标识）。 */
@@ -33,6 +47,13 @@ const SESSION_PREFIX = "dsh-vscode-";
 
 /** 当前工作模式（模块级：createAgent 的 attachAgent 需要读取；setWorkMode 更新）。 */
 let workMode = "single";
+
+/** dshProviders（配置真源，与插件 globalState 的持久化键同名）：配置页保存的
+ *  "已接入提供商 + 已选中模型"清单（含自定义提供商；也含官方路由 deepseek-official）。
+ *  对话面板的提供商与模型**只**从这里取得——提供商及其模型都必须先在配置页配置，
+ *  才能被选用。内核目录（llm-pi-ai / llm-deepseek 的 listModels）只用于补元数据与
+ *  解析路由，不充当可选项枚举源。宿主重启后由扩展侧在 ready 时重新同步一次。 */
+let dshProviders = [];
 const getWorkMode = () => workMode;
 
 /* ------------------------------------------------------------------ */
@@ -71,7 +92,32 @@ function bundlePatchFile(specifier) {
  * 运行时升级场景下 import.meta.resolve 指向 DSH_RUNTIME_NODE_MODULES 隔离目录中的包，
  * 探测结果即实际加载版本，无需人工同步。
  */
+/** 判定内核版本是否 ≥ 0.1.5（persona → personaPrefix 的重命名版本）。 */
+function personaPrefixSince(version) {
+  const m = /^(\d+)\.(\d+)\.(\d+)/.exec(String(version ?? ""));
+  if (!m) return false;
+  const ma = Number(m[1]);
+  const mi = Number(m[2]);
+  const pa = Number(m[3]);
+  if (ma > 0) return true;
+  if (mi > 1) return true; // 0.2.x+ 也在 0.1.5 之后
+  if (mi < 1) return false; // 0.0.x
+  return pa >= 5; // 0.1.x：0.1.5 起
+}
+
 function detectPersonaPrefixField() {
+  // 版本优先（authoritative）：0.1.5 起 persona 永久改名为 personaPrefix，
+  // 版本可比对则不再依赖子串探测（子串会被注释/类型/重导出误报、被压缩漏报）。
+  try {
+    const pkgPath = fileURLToPath(import.meta.resolve("@deepseek-ai/dsh-system-prompt/package.json"));
+    const ver = JSON.parse(readFileSync(pkgPath, "utf8")).version;
+    if (typeof ver === "string" && /^(\d+)\.(\d+)\.(\d+)/.test(ver)) {
+      return personaPrefixSince(ver);
+    }
+  } catch {
+    /* 版本读取失败 → 回退源码特征探测 */
+  }
+  // 回退：源码特征探测（老包 exports 可能不允许 package.json 子路径）
   for (const spec of [
     "@deepseek-ai/dsh-system-prompt/lib/index.js",
     "@deepseek-ai/dsh-system-prompt/package.json",
@@ -155,12 +201,28 @@ function composePatches(env) {
     "or run `chcp 65001 >nul` first, and for Python set `$env:PYTHONIOENCODING='utf-8'` — " +
     "otherwise the captured output will be garbled.";
 
+  // 用户定制（ay-dsh-custom.md）的内核承载位：0.1.5 起 system-prompt 提供
+  // `personaSuffix`（全局部署模板，order 10200，位于第一方指导之后）。把这种
+  // **用户可编辑内容**放在后缀位，编辑文件后重启宿主不会改动靠前的 personaPrefix，
+  // 第一方可复用前缀保持不变（配合 deepseek-flash 的 in-history 追加，KV cache 继续命中）。
+  // 旧内核无该字段：保持原有 system-prompt/assemble 动态 section 注入路径。
+  let personaSuffixText = "";
+  if (DSH_PERSONA_PREFIX_SUPPORTED && envFlag("DSH_ENABLE_CUSTOM")) {
+    try {
+      personaSuffixText = readFileSync(join(resolveDshHome(), "ay-dsh-custom.md"), "utf8").trim();
+    } catch {
+      /* 文件不存在 / 不可读：不注入后缀（等同于未启用定制） */
+    }
+  }
+
   const overlay = [
     {
       id: "system-prompt",
       // 内核字段名适配（patch 为整行替换 config 语义：只提供内核实际支持的键，
       // 误用旧键会被新版 schema 丢弃 → 人设静默失效）。
-      config: DSH_PERSONA_PREFIX_SUPPORTED ? { personaPrefix: personaText } : { persona: personaText },
+      config: DSH_PERSONA_PREFIX_SUPPORTED
+        ? { personaPrefix: personaText, ...(personaSuffixText ? { personaSuffix: personaSuffixText } : {}) }
+        : { persona: personaText },
     },
     { id: "hmr", disabled: true },
     {
@@ -278,11 +340,10 @@ async function bootTree() {
  *  16ms（< 1 帧）足够合并高频事件，同时端到端感知延迟不可察觉；
  *  配合 UI 侧节流渲染，输出呈现链式流畅。 */
 class EventPump {
-  constructor(sizeProvider, afterFlush) {
+  constructor(sizeProvider) {
     this.queue = [];
     this.timer = undefined;
     this.sizeProvider = sizeProvider;
-    this.afterFlush = afterFlush;
   }
   push(event) {
     this.queue.push(event);
@@ -306,8 +367,6 @@ class EventPump {
         ? { t: "events", events: batch }
         : { t: "events", events: batch, sessionBytes }
     );
-    // 写日志后顺带触发轮转检查（防抖在调用方）；异常不影响事件下发
-    try { this.afterFlush?.(); } catch { /* ignore */ }
   }
 }
 
@@ -517,9 +576,12 @@ function applyEffort(request, effort) {
   return { ...request, reasoningEffort: effort };
 }
 
+/** 思考级别缓存挂在 globalThis：即使模块被加载多份（bundle / 源文件 / 多次实例化），
+ *  也共享同一份缓存，避免同一 `provider|model|effort` 组合在每个请求都重新查询能力。 */
+const EFFORT_CACHE_SLOT = "__ayDshVscodeEffortCaches";
+const effortCaches = (globalThis[EFFORT_CACHE_SLOT] ??= { capability: new Map(), adapted: new Map() });
 /** 模型思考能力缓存：`provider|model` -> 支持的档位数组（能力查询免重复开销）。 */
-const effortCapabilityCache = new Map();
-
+const effortCapabilityCache = effortCaches.capability;
 /**
  * 思考级别适配结果缓存：`provider|model|requestedEffort` -> 最终档位。
  * **每个模型每种档位组合首次请求时查询并适配一次，之后直接复用适配后的参数**，
@@ -527,7 +589,9 @@ const effortCapabilityCache = new Map();
  * 就 4 档，组合数量级极小）。值为 undefined 表示"该组合被判定为剔除参数
  * （走模型默认）"，与"未缓存"用 Map.has 区分。
  */
-const effortAdaptedCache = new Map();
+const effortAdaptedCache = effortCaches.adapted;
+/** 适配诊断日志开关（默认关）：需要排查时设 `DSH_DEBUG_ADAPT=1` 打开。 */
+const DEBUG_ADAPT = process.env.DSH_DEBUG_ADAPT === "1";
 
 /**
  * 系统提示层收尾引导（**从一开始就注入**，每轮系统提示均携带）：
@@ -1042,9 +1106,27 @@ function attachAgent(ctx, handle, pump) {
   // 模型忽视，工具拦截也保证收尾必然发生。scope 向上流动，主 agent 超限时
   // 子代理的工具同样被禁（整轮收尾，符合预期）。
   agent.ctx.on("tools/pre-execute", async (exec, next) => {
+    // 命令级规则的**前提**：只对"被命令级规则覆盖的工具"记录本次调用参数（按需，绝不逐个
+    // 工具一刀切；其余工具连一次序列化都没有）。approval 阶段用 callId 取回这份参数。
+    if (exec && typeof exec.name === "string" && exec.callId !== undefined && toolNeedsApprovalArgs(exec.name)) {
+      if (pendingApprovalArgs.size >= APPROVE_ARG_CALLID_LIMIT) {
+        const oldest = pendingApprovalArgs.keys().next().value;
+        if (oldest !== undefined) pendingApprovalArgs.delete(oldest);
+      }
+      pendingApprovalArgs.set(exec.callId, exec.arguments);
+    }
     const gate = await next();
     // 工具调用总次数统计（收尾报告用）：实际允许执行的才算一次
     if (gate.kind === "allow") toolCallCount++;
+    // 黑名单（deny）在准入阶段直接拒绝：工具级与命令级都生效
+    // （白名单 allow 不在此处理——它只在 approval 授权越界升级）
+    if (exec && typeof exec.name === "string") {
+      const rule = findAutoApproveRule(exec.name, exec.callId);
+      if (rule && rule.action === "deny") {
+        log("info", `auto-deny ${exec.name} at pre-execute (${ruleLabel(rule)})`);
+        return { kind: "deny", reason: autoApproveDenyReason(exec.name) };
+      }
+    }
     if (stepLimit > 0 && stepLimitHit && gate.kind === "allow") {
       return {
         kind: "deny",
@@ -1052,6 +1134,11 @@ function attachAgent(ctx, handle, pump) {
       };
     }
     return gate;
+  });
+
+  // 参数表清理：结果返回后不再需要（tools/result 是只读观察事件）。
+  agent.ctx.on("tools/result", (exec) => {
+    if (exec && exec.callId !== undefined) pendingApprovalArgs.delete(exec.callId);
   });
 
   // 思考级别实际值追踪 + 参数自动适配：agent/request 是每次模型请求配置的**唯一**入口
@@ -1084,7 +1171,7 @@ function attachAgent(ctx, handle, pump) {
         // 诊断日志：仅首次遇到（cacheHit=false）打印——将查询能力并适配一次；
         // 命中（cacheHit=true）静默复用，避免每步刷屏。
         if (!cacheHit) {
-          log("debug", `[adapt] ${request.provider}/${request.model} effort=${request.reasoningEffort} cacheHit=false`);
+          if (DEBUG_ADAPT) log("debug", `[adapt] ${request.provider}/${request.model} effort=${request.reasoningEffort} cacheHit=false`);
         }
         if (cacheHit) {
           // 该组合已适配过：直接套用记忆的最终档位（undefined = 剔除，走模型默认）。
@@ -1102,7 +1189,7 @@ function attachAgent(ctx, handle, pump) {
                 const info = await llm.resolveModelInfo(request.provider, request.model);
                 supported = (info?.reasoning?.efforts ?? []).map((e) => (typeof e === "string" ? e : e?.id)).filter(Boolean);
                 effortCapabilityCache.set(capKey, supported);
-                log("debug", `[adapt] capability ${capKey} → supported=[${supported.join(", ")}]`);
+                if (DEBUG_ADAPT) log("debug", `[adapt] capability ${capKey} → supported=[${supported.join(", ")}]`);
               }
               const from = request.reasoningEffort;
               const { value, adapted } = adaptEffort(from, supported);
@@ -1182,9 +1269,9 @@ function attachAgent(ctx, handle, pump) {
   // （配置面板"保存并应用"）或新建会话（agent 重建 → 重新快照）后生效。
   // "启用定制"/"启用经验"开关（DSH_ENABLE_CUSTOM / DSH_ENABLE_LEARNING=0 关闭）
   // 关闭时即使文件有内容也不加载。
-  const enableCustom = String(process.env.DSH_ENABLE_CUSTOM ?? "0") !== "0";
-  const enableLearning = String(process.env.DSH_ENABLE_LEARNING ?? "0") !== "0";
-  const enableReiteration = String(process.env.DSH_ENABLE_REITERATION ?? "0") !== "0";
+  const enableCustom = envFlag("DSH_ENABLE_CUSTOM");
+  const enableLearning = envFlag("DSH_ENABLE_LEARNING");
+  const enableReiteration = envFlag("DSH_ENABLE_REITERATION");
   const customPrompt = enableCustom ? readTextFile(CUSTOM_PROMPT_FILE) : "";
   const learningText = enableLearning ? readTextFile(LEARNING_FILE) : "";
   // [重申纪律]（"每轮重申指令"，2026-09 owner 定）：每轮首条系统消息（位于
@@ -1196,7 +1283,10 @@ function attachAgent(ctx, handle, pump) {
   agent.ctx.on("system-prompt/assemble", async (_assembly, _context, next) => {
     const assembled = await next();
     const sections = [...(assembled.sections ?? [])];
-    if (customPrompt) sections.push({ name: "user-custom-prompt", text: customPrompt });
+    // 0.1.5 起"用户定制"由 system-prompt 行的 personaSuffix 承载（见上方 overlay 构造）：
+    // 已由后缀注入时不再重复追加动态 section；旧内核仍走此处的 section 注入。
+    const customHandledByPersonaSuffix = DSH_PERSONA_PREFIX_SUPPORTED && customPrompt !== "";
+    if (customPrompt && !customHandledByPersonaSuffix) sections.push({ name: "user-custom-prompt", text: customPrompt });
     if (learningText) sections.push({ name: "user-learning", text: `以下是从既往对话沉淀的工作经验，请自觉遵守：\n${learningText}` });
     if (sections.length === (assembled.sections ?? []).length) return assembled;
     return { ...assembled, sections };
@@ -1212,41 +1302,154 @@ function attachAgent(ctx, handle, pump) {
  * 瀑布语义要求监听器唯一：若同时在 agent.ctx 挂监听，同一请求会被
  * 两个监听器各自 claim（重复弹窗/双帧），故全部审批集中在此。
  */
-/** 自动授权规则（工具级；Kilo Code 风格 {match, action}）。
- *  注意：DSH 内核暂不提供具体命令参数，仅支持工具级匹配（toolName），
- *  不支持带参数命令甄别（如 "git status"）。默认对明确只读的独立工具放行。 */
+/** 自动授权规则（白名单 / 黑名单）。
+ *  结构：{ match: 工具名(支持 "*" 通配), commands?: 前缀列表, action: "allow" | "deny" }
+ *  · `commands` 省略 = **工具级**规则；给出 = **命令级**规则（对命令类工具 bash/pwsh 有意义）：
+ *    语义是**前缀匹配**（命令以该前缀开头即命中）。允许在末尾写 `*` 作记号（解析时去掉，
+ *    与不写完全等价）；**拒绝中间/开头的 `*`**——不提供完整 glob，避免 `*rm*` 之类误放行。
+ *  · deny  → 在 tools/pre-execute 阶段直接拒绝（工具级 / 命令级都生效）；
+ *  · allow → 在 approval/request 阶段自动放行（= 越界升级重试不再弹框）；
+ *  · 未命中 / 无参数 / 无 callId → 继续弹框（fail-safe）。
+ *  **复合命令保护**：命令含 && || ; | > < 反引号 $( 时，allow 规则一律不命中
+ *  （`git status && rm -rf /` 不会因前缀 `git status` 被放行），仍走弹框；deny 不受此限。
+ *  默认空表 = 一切走内核默认（write/edit/bash/pwsh 越界升级时弹框）。
+ *  注意：approval 请求不带参数（subsystems/approval.md："deliberately omits tool arguments"），
+ *  参数靠 callId 关联 pre-execute 记录的调用参数——内核设计意图即如此。 */
+
+/** 命令含这些 shell 组合符时，白名单不放行（交人工审批）。 */
+const SHELL_COMPOSITE_RE = /(&&|\|\||;|\||>|<|`|\$\()/;
+/** 单条前缀长度上限（防御性）。 */
+const COMMAND_PREFIX_MAX = 200;
+
+/** 工具名匹配：字面量，或仅含 `*` 的简单通配（其余字符一律转义，不引入正则元字符）。 */
+function toolNameMatches(pattern, toolName) {
+  if (pattern === "*") return true;
+  if (!pattern.includes("*")) return pattern === toolName;
+  const escaped = pattern.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/\\\*/g, ".*");
+  try {
+    return new RegExp(`^${escaped}$`).test(toolName);
+  } catch {
+    return false;
+  }
+}
+
+/** 归一化一条命令前缀：去空白；只允许末尾一个 `*`；其余位置的 `*` = 非法（丢弃该条）。
+ *  复合命令门禁：含 shell 元字符（&& || ; | > < 反引号 $(）的前缀一律丢弃——
+ *  与 UI 文案 permissionCommandNote、前端 config-panel.js、后端 configPanel.ts 三方一致。 */
+function normalizeCommandPrefix(raw) {
+  const text = String(raw ?? "").trim();
+  if (text === "" || text.length > COMMAND_PREFIX_MAX) return undefined;
+  if (SHELL_COMPOSITE_RE.test(text)) return undefined;
+  const body = text.endsWith("*") ? text.slice(0, -1) : text;
+  if (body === "" || body.includes("*")) return undefined;
+  return body;
+}
+
+/** 规则归一化（host 侧兜底：非法条目丢弃并告警；UI 保存时另有正式校验）。 */
+function normalizeAutoApproveRules(input) {
+  const out = [];
+  for (const r of Array.isArray(input) ? input : []) {
+    const action = r?.action === "deny" ? "deny" : r?.action === "allow" ? "allow" : undefined;
+    if (action === undefined) continue; // "ask" 或不认识的值 = 不配置
+    const match = String(r?.match ?? "").trim();
+    if (match === "") continue;
+    const rule = { match, action };
+    if (Array.isArray(r?.commands) && r.commands.length > 0) {
+      const prefixes = [];
+      for (const c of r.commands) {
+        const p = normalizeCommandPrefix(c);
+        if (p === undefined) {
+          log("warn", `auto-approve rule: illegal command prefix dropped: ${JSON.stringify(c)} (rule ${match})`);
+          continue;
+        }
+        if (!prefixes.includes(p)) prefixes.push(p);
+      }
+      // 声明了命令但全部非法 → **丢弃整条规则**，绝不降级为工具级：
+      // 那会把"允许某条命令"放大成"允许该工具的全部命令"（安全放大）。
+      if (prefixes.length === 0) {
+        log("warn", `auto-approve rule dropped: no legal command prefix (rule ${match})`);
+        continue;
+      }
+      rule.commands = prefixes;
+    }
+    out.push(rule);
+  }
+  return out;
+}
+
 function loadAutoApproveRules() {
-  const DEFAULT_RULES = [
-    { match: "glob", action: "allow" },
-    { match: "grep", action: "allow" },
-    { match: "read", action: "allow" },
-    { match: "find", action: "allow" },
-  ];
   try {
     const raw = process.env.DSH_AUTO_APPROVE;
-    if (!raw) return DEFAULT_RULES;
-    const arr = JSON.parse(raw);
-    if (!Array.isArray(arr)) return DEFAULT_RULES;
-    const valid = arr
-      .map((r) => ({ match: String(r?.match ?? "").trim(), action: ["allow", "ask", "deny"].includes(r?.action) ? r.action : "ask" }))
-      .filter((r) => r.match);
-    return valid.length > 0 ? valid : DEFAULT_RULES;
-  } catch {
-    return DEFAULT_RULES;
+    if (!raw) return [];
+    return normalizeAutoApproveRules(JSON.parse(raw));
+  } catch (error) {
+    log("warn", "auto-approve rules unreadable; falling back to an empty table", error instanceof Error ? error.message : String(error));
+    return [];
   }
 }
 const autoApproveRules = loadAutoApproveRules();
 
+/** 该工具是否需要记录参数：只有**命令级**规则覆盖的工具才记录；其余工具调用零开销。 */
+function toolNeedsApprovalArgs(toolName) {
+  return autoApproveRules.some((r) => r.commands !== undefined && toolNameMatches(r.match, toolName));
+}
+
+/** callId → 工具参数（对象引用，不做 JSON 序列化）；结果返回即清理，另有条数上限兜底。 */
+const pendingApprovalArgs = new Map();
+const APPROVE_ARG_CALLID_LIMIT = 512;
+
+/** 取该调用的命令文本（命令类工具的 `command` 参数，见内核 tool-catalog）。 */
+function commandOfArgs(args) {
+  if (args === null || typeof args !== "object") return undefined;
+  const c = args.command;
+  return typeof c === "string" ? c : undefined;
+}
+
+/** 规则匹配：工具名命中 +（命令级则）前缀命中；allow 还要过复合命令保护。 */
+function ruleMatchesCall(rule, toolName, args) {
+  if (!toolNameMatches(rule.match, toolName)) return false;
+  if (rule.commands === undefined) return true;
+  const command = commandOfArgs(args);
+  if (command === undefined) return false;
+  if (rule.action === "allow" && SHELL_COMPOSITE_RE.test(command)) return false;
+  return rule.commands.some((p) => command.startsWith(p));
+}
+
+/** 按规则表顺序取首个命中规则（工具级 / 命令级；命令级需 callId 已关联到参数）。 */
+function findAutoApproveRule(toolName, callId) {
+  const args = callId !== undefined ? pendingApprovalArgs.get(callId) : undefined;
+  for (const r of autoApproveRules) {
+    if (r.commands !== undefined && args === undefined) continue; // 命令级规则：无参数不判定
+    if (ruleMatchesCall(r, toolName, args)) return r;
+  }
+  return undefined;
+}
+
+/** 规则描述（日志用）。 */
+function ruleLabel(rule) {
+  return rule.commands === undefined ? "tool-level" : `commands=[${rule.commands.join(", ")}]`;
+}
+
+/** deny 文案（模型收到的工具拒绝原因）。 */
+function autoApproveDenyReason(toolName) {
+  return UI_LANG === "zh"
+    ? `工具 ${toolName} 被授权规则拒绝（配置项 dshVscode.autoApproveRules）。`
+    : `Tool ${toolName} was denied by an approval rule (dshVscode.autoApproveRules).`;
+}
+
 function installApprovalListener(ctx, approvals) {
   ctx.on("approval/request", async (req) => {
-    // 自动授权前置（工具级）：命中规则直接应答，不打扰用户。
-    const rule = autoApproveRules.find((r) => r.match === req.toolName);
+    // 规则裁决：工具级直接命中；命令级用 callId 关联 pre-execute 记录的参数（approval 请求
+    // 本身不带参数）。命中即应答；未命中继续走瀑布 → 弹框（fail-safe）。
+    const rule = findAutoApproveRule(req.toolName, req.callId);
     if (rule && rule.action === "allow") {
-      log("info", `auto-approve ${req.toolName} (tool-level rule allow)`);
+      log("info", `auto-approve ${req.toolName} (${ruleLabel(rule)})`);
+      if (req.callId !== undefined) pendingApprovalArgs.delete(req.callId);
       return "allowed-once";
     }
     if (rule && rule.action === "deny") {
-      log("info", `auto-deny ${req.toolName} (tool-level rule deny)`);
+      log("info", `auto-deny ${req.toolName} (${ruleLabel(rule)})`);
+      if (req.callId !== undefined) pendingApprovalArgs.delete(req.callId);
       return "rejected";
     }
     const id = approvals.nextId();
@@ -1383,19 +1586,31 @@ function sessionMetaPath() {
   return join(dshHomePath("sessions-ay-dsh"), SESSION_META_FILE);
 }
 
+/** 全部会话元数据的内存缓存（session/flush 等热路径不再每次 readFileSync 全量解析）。 */
+let sessionMetaCache = null;
+let sessionMetaCacheAt = 0;
+/** 缓存 TTL：跨实例对 session-meta.json 的并发写（无锁）最多造成 1.5s 的标题/统计陈旧。 */
+const SESSION_META_CACHE_TTL = 1500;
+
 /** 读取全部会话元数据（无文件/损坏时返回空对象，不抛错）。 */
 function loadSessionMeta() {
+  const now = Date.now();
+  if (sessionMetaCache !== null && now - sessionMetaCacheAt < SESSION_META_CACHE_TTL) return sessionMetaCache;
   try {
     const raw = readFileSync(sessionMetaPath(), "utf8");
     const parsed = JSON.parse(raw);
-    return parsed && typeof parsed === "object" ? parsed : {};
+    sessionMetaCache = parsed && typeof parsed === "object" ? parsed : {};
   } catch {
-    return {};
+    sessionMetaCache = {};
   }
+  sessionMetaCacheAt = now;
+  return sessionMetaCache;
 }
 
-/** 写入全部会话元数据（原子写：先写临时文件再 rename）。 */
+/** 写入全部会话元数据（原子写：先写临时文件再 rename；同步更新内存缓存）。 */
 function saveSessionMeta(meta) {
+  sessionMetaCache = meta;
+  sessionMetaCacheAt = Date.now();
   try {
     const dir = dirname(sessionMetaPath());
     mkdirSync(dir, { recursive: true });
@@ -1448,12 +1663,23 @@ async function sessionDisplayTitle(ctx, sessionId, kernelTitle) {
  *  不依赖 Object.defineProperty 注入（Session 实例可能不可扩展）。
  *  250ms TTL 缓存避免长会话被 flush/统计高频读取时反复全量拷贝。 */
 const sessionEventsCache = new WeakMap();
+
+/** 会话事件读取策略：统一判定内核版本分支（≤0.1.1 数组 / ≥0.1.5 snapshotEvents /
+ *  ownEvents），供 sessionEventsOf 与 sessionEventsSince 共用，避免同一判断双处漂移。 */
+function sessionEventReader(session) {
+  if (session === undefined || session === null) return null;
+  if (Array.isArray(session.events)) return { kind: "array", events: session.events }; // ≤0.1.1
+  if (typeof session.snapshotEvents === "function") return { kind: "snapshot" }; // ≥0.1.5
+  if (typeof session.ownEvents === "function") return { kind: "own" };
+  return null;
+}
+
 function sessionEventsOf(session) {
-  if (session === undefined || session === null) return [];
-  if (Array.isArray(session.events)) return session.events; // ≤0.1.1
-  if (typeof session.snapshotEvents !== "function") {
-    return typeof session.ownEvents === "function" ? session.ownEvents() : [];
-  }
+  const reader = sessionEventReader(session);
+  if (reader === null) return [];
+  if (reader.kind === "array") return reader.events;
+  if (reader.kind === "own") return session.ownEvents();
+  // snapshot：250ms TTL 缓存（长会话全量拷贝昂贵）
   const hit = sessionEventsCache.get(session);
   const now = Date.now();
   if (hit !== undefined && now - hit.at < 250) return hit.list;
@@ -1520,15 +1746,27 @@ const SESSION_LOG_RE = /^session(?:\.v(\d+))?\.jsonl(?:\.zstd?)?$/;
  */
 function sessionEventsSince(session, fromSeq) {
   const from = Number.isFinite(fromSeq) && fromSeq > 0 ? Math.floor(fromSeq) : 0;
-  if (session === undefined || session === null) return [];
-  if (Array.isArray(session.events)) {
-    return from === 0 ? session.events : session.events.slice(from); // ≤0.1.1
+  const reader = sessionEventReader(session);
+  if (reader === null) return [];
+  if (reader.kind === "array") return from === 0 ? reader.events : reader.events.slice(from); // ≤0.1.1
+  if (reader.kind === "own") return session.ownEvents();
+  return from === 0 ? session.snapshotEvents() : session.snapshotEvents(from); // ≥0.1.5
+}
+
+/** 取 seq < beforeSeq 的最近 limit 条非 chunk/end-seed 事件（反向单遍，
+ *  避免 `sessionEventsOf().filter()` 构造全量过滤数组——向上滚动分页的热路径）。 */
+function olderSessionEvents(events, beforeSeq, limit) {
+  const older = [];
+  let hasMore = false;
+  for (let i = events.length - 1; i >= 0; i--) {
+    const e = events[i];
+    if (e.type === "assistant/chunk" || e.type === "session/end-seed") continue;
+    if ((e.seq ?? 0) >= beforeSeq) continue;
+    if (older.length < limit) older.push(e);
+    else { hasMore = true; break; }
   }
-  if (typeof session.snapshotEvents === "function") {
-    return from === 0 ? session.snapshotEvents() : session.snapshotEvents(from);
-  }
-  if (typeof session.ownEvents === "function") return session.ownEvents();
-  return [];
+  older.reverse();
+  return { older, hasMore };
 }
 
 /** 文件名 → 代数（无法识别返回 -1）。 */
@@ -1584,7 +1822,13 @@ function sessionFileSize(sessionId) {
     const hit = sessionSizeCache.get(key);
     if (hit !== undefined && now - hit.at < SESSION_SIZE_CACHE_TTL) return hit.size;
     const root = dshHomePath("sessions-ay-dsh");
-    const dir = join(root, projectKey(process.cwd()), encodeSegment(key));
+    // 按会话**实际所在目录**反查：跨项目/工作区恢复的会话，其目录键取创建时 cwd，
+    // 不等于当前 process.cwd() 的 projectKey（与 acquireSessionLock 同理），否则大小显示错误。
+    let dir = null;
+    for (const entry of scanSessionDirs()) {
+      if (entry.id === key) { dir = dirname(entry.logPath); break; }
+    }
+    if (dir === null) dir = join(root, projectKey(process.cwd()), encodeSegment(key));
     let size;
     // 多代日志（0.1.5）：pickSessionLog 取当前活跃（最近写入）日志文件大小；无日志则 undefined
     const logPath = pickSessionLog(dir);
@@ -1691,6 +1935,10 @@ function readTextFile(p) {
 /** 自动学习信号：用户消息出现明确的规则/指示表达才触发提炼（避免每轮都调 LLM）。 */
 const LEARNING_SIGNAL_RE = /记住|教训|经验|以后|规则|禁止|不要|千万别|务必|必须|always|never|remember|rule|lesson|do not|don't/i;
 
+/** 对抗性指令信号（自动学习门禁用）：这些措辞几乎不会出现在用户真实偏好中，却是指示
+ *  模型"忽略系统提示/外泄密钥/窃取凭据"的典型提示注入载荷。命中则拒绝持久化。 */
+const INJECTION_SIGNAL_RE = /忽略|无视|系统提示|system\s*prompt|system\s*message|外泄|泄露|泄漏|leak|exfiltrat|密钥|api\s*key|credential|secret|password/i;
+
 /** 自动学习：检测用户消息中的"明确规则/被肯定经验"信号，用 LLM 提炼一条简洁
  *  经验，追加到工作区学习文件（去重：已存在相同条目则跳过）。异步、静默失败。 */
 async function maybeLearnFromTurn(ctx, agent, userText) {
@@ -1734,13 +1982,26 @@ async function maybeLearnFromTurn(ctx, agent, userText) {
       .join("")
       .trim();
     if (text.length === 0) return;
-    const clean = text.replace(/^[-•*\s]+/, "").slice(0, 200);
+    // 【门禁】自动学习把 LLM 输出持久化并注入后续系统提示，需防"提示注入跨会话固化"：
+    //  合并为单行（去代码围栏/Markdown 结构）、长度 20~200、拒绝对抗性指令措辞。
+    const collapsed = text
+      .replace(/```[\s\S]*?```/g, " ")
+      .replace(/[#*_>`~|]/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (collapsed.length < 20 || collapsed.length > 200) return;
+    if (INJECTION_SIGNAL_RE.test(collapsed)) return;
+    const clean = collapsed;
     const file = LEARNING_FILE;
     const existing = existsSync(file) ? readFileSync(file, "utf8") : "";
     if (existing.includes(clean)) return; // 简单去重：已存在相同条目
+    if (existing.length > 64 * 1024) return; // 文件上限兜底，防被持续注入撑大
     const next = existing.trim() ? `${existing.trim()}\n\n- ${clean}` : `- ${clean}`;
     mkdirSync(dirname(file), { recursive: true });
-    writeFileSync(file, next, "utf8");
+    // 原子写（temp + rename），避免读-改-写交错产生半截文件（L4）
+    const tmp = `${file}.tmp`;
+    writeFileSync(tmp, next, "utf8");
+    renameSync(tmp, file);
     log("info", `learned rule: ${clean}`);
   } catch (e) {
     log("warn", "auto-learn llm failed", e instanceof Error ? e.message : String(e));
@@ -1782,7 +2043,7 @@ function scanSessionDirs() {
     }
     for (const s of sessions) {
       if (!s.isDirectory()) continue;
-      // 多代日志（0.1.5）：取该会话目录中最高代的日志文件
+      // 多代日志（0.1.5）：取该会话目录中**当前活跃**（最近写入）的日志文件
       const logPath = pickSessionLog(join(root, p.name, s.name));
       if (logPath === null) continue; // 无日志文件 → 非会话目录（跳过）
       out.push({ id: s.name, logPath, project: p.name });
@@ -1898,6 +2159,7 @@ function computeSessionStats(events, base) {
   if (base?.title) stats.title = base.title;
   if (base?.contextWindow) stats.contextWindow = base.contextWindow;
   if (base?.model) stats.model = base.model;
+  if (base?.lastRequestInput) stats.lastRequestInput = base.lastRequestInput; // 增量落盘勿丢该字段（compact 依赖）
   for (const e of events) {
     if (base !== undefined && (e.seq ?? 0) <= base.lastSeq) continue; // 已在基准内，跳过
     const d = e.data ?? {};
@@ -1935,14 +2197,16 @@ function computeSessionStats(events, base) {
  * @param {object|undefined} metaStats 会话 meta 中已存的 stats
  * @param {Array} events 当前日志事件（过滤后）
  * @param {string} sessionId 会话 id（落盘用）
+ * @param {boolean} persist 是否把重算的统计落盘 meta（只读浏览传 false）
  */
-function resolveSessionStats(metaStats, events, sessionId) {
-  const maxSeq = events.reduce((m, e) => Math.max(m, e.seq ?? 0), 0);
+function resolveSessionStats(metaStats, events, sessionId, persist = true) {
+  // 事件按 seq 升序，末元素即 maxSeq（避免 O(n) reduce）
+  const maxSeq = events.length > 0 ? (events[events.length - 1].seq ?? 0) : 0;
   if (metaStats && Number.isFinite(metaStats.lastSeq) && metaStats.lastSeq <= maxSeq) {
     // 有效：直读（同步）或滞后补算（崩溃/重启一致）
     if (metaStats.lastSeq === maxSeq) return metaStats;
     const stats = computeSessionStats(events, metaStats); // base 增量：只算尾部
-    try {
+    if (persist) try {
       const meta = loadSessionMeta();
       meta[sessionId] = { ...(meta[sessionId] ?? {}), stats: { ...stats } };
       saveSessionMeta(meta);
@@ -1951,9 +2215,9 @@ function resolveSessionStats(metaStats, events, sessionId) {
     }
     return stats;
   }
-  // 首次迁移 / 异常修复：全量纯算并落盘，之后直读
+  // 首次迁移 / 异常修复：全量纯算（persist 时才落盘，之后直读）
   const stats = computeSessionStats(events);
-  try {
+  if (persist) try {
     const meta = loadSessionMeta();
     meta[sessionId] = { ...(meta[sessionId] ?? {}), stats: { ...stats } };
     saveSessionMeta(meta);
@@ -1979,7 +2243,6 @@ function resolveSessionStats(metaStats, events, sessionId) {
  * 会话删除时目录连带删除。
  */
 const SESSION_LOCK_NAME = ".host-lock.json";
-let hostToken = (globalThis.crypto?.randomUUID?.() ?? `h-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`);
 let currentSessionLock = null; // { file } 当前宿主持有的会话锁
 
 function processAlive(pid) {
@@ -2007,12 +2270,13 @@ function clearOwnLock() {
 }
 
 /**
- * 接管会话：先释放旧锁，再原子独占抢占目标会话锁。
+ * 接管会话：先原子独占抢占目标会话锁，**成功后才释放旧锁**——若目标锁被他实例
+ * 占用（busy）则旧锁保留，旧会话仍受互斥保护（避免"先释放旧锁再抢失败"把仍存活的
+ * 旧会话暴露成无锁态、他方接管造成双写）。
  * @returns {ok:true} 或 {ok:false, busy:true, holderPid}（他实例进程活着）
  *         或 {ok:true, degraded:true}（锁不可用但不阻断会话功能）。
  */
 function acquireSessionLock(sessionId) {
-  clearOwnLock();
   // 锁文件锚定会话**实际所在目录**（按日志目录反查），而不是检查方当前 cwd 的
   // projectKey——否则不同工作区/项目的窗口（cwd 不同）会各自写不同路径的锁文件，
   // 互斥失效（会话 id 全局唯一、目录按项目分档，锁必须落在真实目录）。restorePreview
@@ -2031,6 +2295,10 @@ function acquireSessionLock(sessionId) {
   }
   if (dir === null) dir = sessionDirFor(sessionId);
   const file = join(dir, SESSION_LOCK_NAME);
+  // 已持有同一会话锁：幂等成功（不清旧锁再抢，避免 EEXIST 误判他实例占用）。
+  if (currentSessionLock !== null && currentSessionLock.file === file) {
+    return { ok: true };
+  }
   try {
     mkdirSync(dir, { recursive: true });
   } catch {
@@ -2038,13 +2306,13 @@ function acquireSessionLock(sessionId) {
   }
   const payload = JSON.stringify({
     pid: process.pid,
-    hostToken,
     project: projectKey(process.cwd()),
     acquiredAt: Date.now(),
   });
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
       writeFileSync(file, payload, { flag: "wx" }); // 原子独占创建
+      clearOwnLock(); // 新锁已到手，才释放旧锁（busy 时旧锁保留，旧会话仍受保护）
       currentSessionLock = { file };
       return { ok: true };
     } catch (err) {
@@ -2067,9 +2335,11 @@ function acquireSessionLock(sessionId) {
       }
       // 其它异常（目录只读等）：降级为无锁继续，不阻断会话功能
       log("warn", "session lock acquire degraded", err instanceof Error ? err.message : String(err));
+      clearOwnLock(); // 降级：新会话无锁、旧会话即将被 dispose，释放旧锁避免自留 stale
       return { ok: true, degraded: true };
     }
   }
+  clearOwnLock();
   return { ok: true, degraded: true };
 }
 
@@ -2127,6 +2397,19 @@ function projectKey(cwd) {
 }
 
 /** 删除一个持久化会话（物理删除其会话日志目录，仅限插件独立存储）。 */
+/** 会话锁是否被**他实例**（存活的其它进程）持有。删除前互斥检查用。 */
+function isSessionLockedByOther(dir) {
+  try {
+    const holder = JSON.parse(readFileSync(join(dir, SESSION_LOCK_NAME), "utf8"));
+    if (holder !== null && Number.isInteger(holder.pid) && holder.pid !== process.pid && processAlive(holder.pid)) {
+      return true;
+    }
+  } catch {
+    /* 无锁/坏锁 → 不忙 */
+  }
+  return false;
+}
+
 async function deleteSession(ctx, sessionId) {
   try {
     // **零解压定位目录**（scanSessionDirs 只 readdir，不读日志）——原实现用
@@ -2143,6 +2426,15 @@ async function deleteSession(ctx, sessionId) {
       const query = ctx.get("sessionQuery");
       const cwd = query !== undefined ? (await query.readSession(SessionId(sessionId))).session.cwd ?? process.cwd() : process.cwd();
       dir = join(dshHomePath("sessions-ay-dsh"), projectKey(cwd), encodeSegment(sessionId));
+    }
+    // 互斥检查：会话正被（本进程当前使用 或 他实例存活持有）→ 拒绝删除，
+    // 避免在他实例/本进程正在写入时 rmSync 删目录造成写坏会话。
+    const lockFile = join(dir, SESSION_LOCK_NAME);
+    if (currentSessionLock !== null && currentSessionLock.file === lockFile) {
+      return { ok: false, error: "正在使用的会话无法删除，请先切换到其它会话或新建会话" };
+    }
+    if (isSessionLockedByOther(dir)) {
+      return { ok: false, error: "会话正被另一 VS Code 实例使用中，无法删除" };
     }
     // 多代日志（0.1.5）：目录内存在**任一世代**日志（v0 旧名或 session.v<N>.jsonl[.zstd]）
     // 即视为有效会话；删除时整目录递归移除（覆盖全部世代文件与 .host-lock.json）。
@@ -2298,7 +2590,9 @@ async function exportSession(ctx, sessionId) {
     // 那里含密钥等敏感文件，不轻易留存导出内容）
     const exportDir = join(process.cwd(), "exports");
     mkdirSync(exportDir, { recursive: true });
-    const outPath = join(exportDir, `${sessionId}.html`);
+    // 文件名清洗：sessionId 来自 webview 帧，未校验不得直接拼路径（防 ../ 穿越）
+    const safeId = /^[A-Za-z0-9._-]+$/.test(String(sessionId)) ? sessionId : "session";
+    const outPath = join(exportDir, `${safeId}.html`);
     writeFileSync(outPath, parts.join("\n"), "utf8");
     return { ok: true, path: outPath };
   } catch (error) {
@@ -2315,8 +2609,7 @@ async function main() {
   // 轮转检测**不挂在写日志/事件 flush 上**（恢复会话重放也会 flush 造成误触发，
   // 且每次写日志都检查降低效率）——改由定时器**闲时**检查日志文件大小（见下方定时器）。
   const pump = new EventPump(
-    () => (agent === undefined || agent.session === undefined ? undefined : sessionFileSize(String(agent.session.id))),
-    undefined
+    () => (agent === undefined || agent.session === undefined ? undefined : sessionFileSize(String(agent.session.id)))
   );
   const approvals = { nextId: (() => { let n = 0; return () => ++n; })(), pending: new Map() };
 
@@ -2532,9 +2825,10 @@ async function main() {
       version: CORE_VERSION,
     });
     log("info", "host ready (lazy session)");
-    // 自检模式（运行时升级验证用）：就绪即输出哨兵并退出（扩展侧据此判定闭包可用）
-    if (process.env.DSH_SELF_TEST === "1") {
-      process.stdout.write("DSH_SELF_TEST_OK\n");
+    // 自检模式（运行时升级验证用）：DSH_SELF_TEST 为一次性 nonce 时回显该 nonce 并退出
+    // （扩展侧据此判定闭包可用；nonce 防伪造静态哨兵提前通过）
+    if (typeof process.env.DSH_SELF_TEST === "string" && process.env.DSH_SELF_TEST !== "" && process.env.DSH_SELF_TEST !== "0") {
+      process.stdout.write(`${process.env.DSH_SELF_TEST}\n`);
       log("info", "self-test ok — exiting");
       process.exit(0);
     }
@@ -2596,7 +2890,7 @@ async function main() {
    * 正在运行的 chat（chat 帧 await whenIdle 时会阻塞队列，stop 不能等它）。
    */
   let criticalQueue = Promise.resolve();
-  const CRITICAL_FRAMES = new Set(["chat", "newSession", "resumeSession", "deleteSession", "compact"]);
+  const CRITICAL_FRAMES = new Set(["chat", "newSession", "resumeSession", "restorePreview", "deleteSession", "compact"]);
 
   rl.on("line", (line) => {
     if (line.trim() === "") return;
@@ -3020,8 +3314,8 @@ async function main() {
               const tail = events.slice(-limit);
               const hasMore = events.length > tail.length;
               const nextSeq = hasMore ? tail[0].seq : undefined;
-              // 统计：meta.stats 直读（合理则用）；无/异常则全量算（只读浏览不落盘）
-              const stats = resolveSessionStats(getSessionMeta(msg.id).stats, events, msg.id);
+              // 统计：meta.stats 直读（合理则用）；无/异常则全量算（只读浏览不落盘，persist=false）
+              const stats = resolveSessionStats(getSessionMeta(msg.id).stats, events, msg.id, false);
               post({ t: "history", sessionId: msg.id, events: tail, hasMore, nextSeq, stats });
               post({ t: "viewSession", id: msg.id });
             } catch (error) {
@@ -3039,11 +3333,7 @@ async function main() {
             }
             const limit = Number.isInteger(msg.limit) && msg.limit > 0 ? msg.limit : 200;
             if (agent !== undefined) {
-              const allEvents = sessionEventsOf(agent.session).filter(
-                (e) => e.type !== "assistant/chunk" && e.type !== "session/end-seed"
-              );
-              const older = allEvents.filter((e) => e.seq < msg.beforeSeq).slice(-limit);
-              const hasMore = allEvents.some((e) => e.seq < (older[0]?.seq ?? msg.beforeSeq));
+              const { older, hasMore } = olderSessionEvents(sessionEventsOf(agent.session), msg.beforeSeq, limit);
               post({
                 t: "historyMore",
                 sessionId: agent.session.id,
@@ -3057,11 +3347,7 @@ async function main() {
                 // prepared 缓存；≥0.1.5 走 open(id,"read")+read(0)。避免每次滚动
                 // 都独立全量解压（readSession 无缓存复用）。
                 const inspected = await inspectStoredSession(ctx, msg.sessionId);
-                const allEvents = (inspected.events ?? []).filter(
-                  (e) => e.type !== "assistant/chunk" && e.type !== "session/end-seed"
-                );
-                const older = allEvents.filter((e) => e.seq < msg.beforeSeq).slice(-limit);
-                const hasMore = allEvents.some((e) => e.seq < (older[0]?.seq ?? msg.beforeSeq));
+                const { older, hasMore } = olderSessionEvents(inspected.events ?? [], msg.beforeSeq, limit);
                 post({
                   t: "historyMore",
                   sessionId: msg.sessionId,
@@ -3249,54 +3535,77 @@ async function main() {
             try {
               const llm = ctx.get("llm");
               const defaultModel = ctx.get("agentDefaultModel");
-              let providers = [];
-              if (llm !== undefined && typeof llm.listProviders === "function") {
-                // deepseek-official 是 llm-deepseek 的官方路由，用户可将其作为独立提供商
-                // （DeepSeek (Official)，含多模态）配置；这里不排除，而是独立命名以免与
-                // pi-ai 的 deepseek 路由（纯文本）在聊天面板混淆。
-                providers = llm
-                  .listProviders()
-                  .map((p) => ({ id: p.id, name: p.id === "deepseek-official" ? "DeepSeek (Official)" : (p.name ?? p.id) }));
-              }
-              if (providers.length === 0) {
-                // 兜底：没有任何已配置路由时，至少提供官方 DeepSeek 可选
-                providers = [{ id: "deepseek-official", name: "DeepSeek" }];
-              }
-              // 每个提供商的模型分组（聊天面板按所选提供商过滤模型下拉）。
-              // 条目带 id+name：界面显示名称、内部以 id 传递识别。
+              // 可选项 = 配置结果（dshProviders）：提供商与模型都必须先在配置页
+              // "已接入 + 已勾选"，才会出现在对话面板；内核目录只用于补元数据（名称/模态），
+              // 绝不新增或扩大可选项。
+              let providers = dshProviders.map((p) => ({ id: p.id, name: p.name }));
               const providerModels = {};
               let models = [];
-              if (llm !== undefined && typeof llm.listModels === "function" && providers.length > 0) {
+              if (dshProviders.length > 0) {
                 const merged = new Set();
-                for (const p of providers) {
+                for (const p of dshProviders) {
+                  // 元数据补齐：仅按**已选中的 id**匹配内核目录，目录里多出来的模型一概忽略。
+                  const metaById = new Map();
                   try {
-                    const listed = await llm.listModels(p.id);
-                    const entries = listed.map((m) => {
-                      const e = { id: m.id, name: m.name || m.id };
-                      // 携带模态信息：前端据此判断当前模型是否支持图片输入
-                      if (Array.isArray(m.inputModalities)) e.inputModalities = m.inputModalities;
+                    if (llm !== undefined && typeof llm.listModels === "function") {
+                      const listed = await llm.listModels(p.id);
+                      for (const m of Array.isArray(listed) ? listed : []) {
+                        if (m && typeof m.id === "string" && m.id !== "") metaById.set(m.id, m);
+                      }
+                    }
+                  } catch {
+                    /* 目录不可用：元数据留空，不影响可选集合 */
+                  }
+                  const entries = (p.models ?? [])
+                    .filter((m) => m && typeof m.id === "string" && m.id !== "")
+                    .map((m) => {
+                      const info = metaById.get(m.id);
+                      const e = { id: m.id, name: m.displayName || m.name || info?.name || m.id };
+                      // 模态信息：配置里编辑过的值优先，未编辑则取内核目录的元数据
+                      const mods = Array.isArray(m.inputModalities) ? m.inputModalities : info?.inputModalities;
+                      if (Array.isArray(mods) && mods.length > 0) e.inputModalities = mods;
                       return e;
                     });
-                    providerModels[p.id] = entries;
-                    for (const e of entries) merged.add(e.id);
-                  } catch {
-                    providerModels[p.id] = [];
-                  }
+                  providerModels[p.id] = entries;
+                  for (const e of entries) merged.add(e.id);
                 }
                 models = [...merged];
+              } else {
+                // 配置尚未同步到宿主（刚启动 / ready 竞态）：回退到内核已注册路由，
+                // 保证面板不空；扩展侧在 ready 后会立刻重新同步 dshProviders。
+                if (llm !== undefined && typeof llm.listProviders === "function") {
+                  providers = llm
+                    .listProviders()
+                    .map((p) => ({ id: p.id, name: p.id === "deepseek-official" ? "DeepSeek (Official)" : (p.name ?? p.id) }));
+                }
+                if (llm !== undefined && typeof llm.listModels === "function" && providers.length > 0) {
+                  const merged = new Set();
+                  for (const p of providers) {
+                    try {
+                      const listed = await llm.listModels(p.id);
+                      const entries = listed.map((m) => {
+                        const e = { id: m.id, name: m.name || m.id };
+                        if (Array.isArray(m.inputModalities)) e.inputModalities = m.inputModalities;
+                        return e;
+                      });
+                      providerModels[p.id] = entries;
+                      for (const e of entries) merged.add(e.id);
+                    } catch {
+                      providerModels[p.id] = [];
+                    }
+                  }
+                  models = [...merged];
+                }
               }
-              if (models.length === 0) {
-                // 兜底：现役 DeepSeek 模型（也包含当前选择，保证下拉至少可选回当前模型）。
-                // 备忘：deepseek-chat / deepseek-reasoner 已停止服务（旧模型下线），
-                // 不再列入候选；现役为 deepseek-v4-flash / deepseek-v4-pro。
+              if (models.length === 0 && dshProviders.length === 0) {
+                // 末级兜底：**只**在"配置尚未同步到宿主"时生效，保证下拉能选回当前模型；
+                // 配置已存在时严格以 dshProviders 为准（未配置 = 不可选）。
                 const cur = defaultModel?.currentSelection?.();
-                const extra = new Set(["deepseek-v4-flash", "deepseek-v4-pro"]);
-                if (cur?.model) extra.add(cur.model);
-                models = [...extra];
-                for (const p of providers) {
-                  providerModels[p.id] = providerModels[p.id]?.length
-                    ? providerModels[p.id]
-                    : [...extra].map((id) => ({ id, name: id }));
+                const extra = new Set(cur?.model ? [cur.model] : []);
+                if (extra.size > 0) models = [...extra];
+                if (providers.length === 0 && extra.size > 0) {
+                  providers = [{ id: cur.provider || "deepseek-official", name: cur.provider === "deepseek-official" ? "DeepSeek (Official)" : (cur.provider || "deepseek-official") }];
+                  providerModels[providers[0].id] = [...extra].map((id) => ({ id, name: id }));
                 }
               }
               // 当前选择：优先取当前 agent 的会话级选择（恢复历史会话后应反映
@@ -3352,13 +3661,14 @@ async function main() {
             break;
           }
           case "llmProviders": {
-            // 配置面板：提供商目录（已注册路由 + 可配置目录合并），供 Provider ID 下拉。
-            // 排除 deepseek-official：它是 llm-deepseek 的官方路由（displayName "DeepSeek"），
-            // 与 pi-ai 目录里的 deepseek（OpenAI 兼容知名条目）并列会造成"两个 DeepSeek"混淆；
-            // 面板的 deepseek 条目走 pi-ai 路由，官方路由不需要出现在候选里。
+            // 配置面板：提供商目录 = llm-pi-ai 的注册/可配置目录 ∪ 已注册路由（含
+            // llm-deepseek 的 deepseek-official），供 Provider ID 下拉。两个并列路由的
+            // 提供商都进候选：pi-ai 的 `deepseek`（OpenAI 兼容知名条目）与官方路由
+            // `deepseek-official` 同时出现，靠显示名区分（后者统一显示 DeepSeek (Official)）；
+            // "已接入的 id 不再出现在候选"由面板侧过滤（config-panel.js applyCatalogRef）。
             try {
               const llm = ctx.get("llm");
-              const skip = (id) => id === "deepseek-official";
+              const skip = () => false;
               // pi-ai 内置目录：提供真实提供商名称与公开 baseUrl（供面板自动填写）
               const catalogNames = new Map();
               const catalogBaseUrls = new Map();
@@ -3373,7 +3683,7 @@ async function main() {
               const providers = [];
               if (llm && typeof llm.listProviders === "function") {
                 for (const p of llm.listProviders()) {
-                  if (!skip(p.id)) providers.push({ id: p.id, name: p.name, baseUrl: catalogBaseUrls.get(p.id) });
+                  if (!skip(p.id)) providers.push({ id: p.id, name: p.id === "deepseek-official" ? "DeepSeek (Official)" : (p.name ?? p.id), baseUrl: catalogBaseUrls.get(p.id) });
                 }
               }
               if (llm && typeof llm.listConfigurableProviders === "function") {
@@ -3386,6 +3696,13 @@ async function main() {
                     });
                   }
                 }
+              }
+              // Ollama 与 DeepSeek (Official) 同规则：两者都是**默认已配置的种子项**，
+              // 默认被面板的"已接入跳过"挡在候选之外；**删除后**才会回到候选列表供重新
+              // 选中与配置。区别只在数据来源——official 由内核路由目录提供，Ollama 是本地
+              // 提供商，内核目录通常没有它，故在此补齐候选条目（保证删除后仍能加回）。
+              if (!providers.some((x) => x.id === "ollama")) {
+                providers.push({ id: "ollama", name: "Ollama (local)", baseUrl: "http://localhost:11434/v1" });
               }
               post({ t: "llmProviders", id: msg.id, providers });
             } catch (error) {
@@ -3400,6 +3717,43 @@ async function main() {
             // 失败回退扩展侧 OpenAI /models 查询（仅 id）。
             try {
               const llm = ctx.get("llm");
+              // 官方路由（llm-deepseek）的模型目录只在内核里，且它刻意不写入 llm-pi-ai
+              // （双注册会冲突），因此不能用 pi-ai 发现——必须直接读内核目录。
+              // 0.1.5 起该目录新增 `deepseek-flash`（唯一默认声明 systemPromptUpdate:
+              // in-history 的条目），旧版只有 v4 系列；一律以内核返回为准，不写死清单。
+              if (msg.provider === "deepseek-official" && llm && typeof llm.listModels === "function") {
+                // 单模型默认容量（**按需查询**）：配置页只在"打开尚未配置过的模型编辑窗口"
+                // 时才带 model 调用——列表查询保持轻量，避免对整份目录做无用功。
+                if (typeof msg.model === "string" && msg.model !== "") {
+                  let contextWindow;
+                  let maxTokens;
+                  if (typeof llm.resolveModelInfo === "function") {
+                    try {
+                      const info = await llm.resolveModelInfo(msg.provider, msg.model, undefined);
+                      const ctxWin = info?.context?.contextWindow;
+                      if (typeof ctxWin === "number") contextWindow = ctxWin;
+                      if (typeof info?.defaultMaxTokens === "number") maxTokens = info.defaultMaxTokens;
+                    } catch {
+                      /* 该模型无精确元数据：留空，由配置页按"可选"处理 */
+                    }
+                  }
+                  post({ t: "discoveredModels", id: msg.id, models: [{ id: msg.model, contextWindow, maxTokens }] });
+                  break;
+                }
+                const listed = await llm.listModels(msg.provider);
+                // 列表只回目录事实（id/name/模态）：容量不在此处逐个查询。
+                const models = (Array.isArray(listed) ? listed : [])
+                  .filter((m) => m && typeof m.id === "string" && m.id !== "")
+                  .map((m) => {
+                    const entry = { id: m.id, name: m.name || m.id };
+                    if (Array.isArray(m.inputModalities)) entry.inputModalities = m.inputModalities;
+                    if (typeof m.contextWindow === "number") entry.contextWindow = m.contextWindow;
+                    if (typeof m.maxTokens === "number") entry.maxTokens = m.maxTokens;
+                    return entry;
+                  });
+                post({ t: "discoveredModels", id: msg.id, models });
+                break;
+              }
               if (llm && typeof llm.discoverModels === "function") {
                 const models = await llm.discoverModels("llm-pi-ai", {
                   provider: typeof msg.provider === "string" ? msg.provider : undefined,
@@ -3446,12 +3800,53 @@ async function main() {
             }
             break;
           }
+          case "toolCatalog": {
+            // 供配置页"添加规则"：当前可见（经裁剪后）的工具 schema 及其参数字段名。
+            // ctx.tools.schemas() 由 dsh-tools 提供（注册表投影出的模型可见工具集）。
+            try {
+              const tools = ctx.get("tools");
+              let schemas = [];
+              if (tools && typeof tools.schemas === "function") {
+                try {
+                  schemas = tools.schemas(agent ?? undefined) ?? [];
+                } catch {
+                  schemas = [];
+                }
+              }
+              const list = (Array.isArray(schemas) ? schemas : [])
+                .map((s) => ({
+                  name: typeof s?.name === "string" ? s.name : "",
+                  description: typeof s?.description === "string" ? s.description : "",
+                  fields:
+                    s && s.parameters && typeof s.parameters === "object" && s.parameters.properties && typeof s.parameters.properties === "object"
+                      ? Object.keys(s.parameters.properties)
+                      : [],
+                }))
+                .filter((s) => s.name !== "");
+              post({ t: "toolCatalog", id: msg.id, tools: list });
+            } catch (error) {
+              post({ t: "toolCatalog", id: msg.id, tools: [], error: error instanceof Error ? error.message : String(error) });
+            }
+            break;
+          }
           case "providersApply": {
             // 配置面板保存/删除提供商后，把整套提供商配置同步进 DSH：
             // 1) llm-pi-ai settings（providers dict）→ 适配器目录与路由热更新；
             // 2) API Key 写入 credentials（ref = dsh-vscode:<id>），profile.apiKeyEnv 指向它。
             try {
               const list = Array.isArray(msg.providers) ? msg.providers : [];
+              // 配置真源（dshProviders）：含自定义提供商及其"已选中"模型，
+              // 也含官方路由 deepseek-official（它不写入 llm-pi-ai，但仍是配置项）。
+              // 每次同步都整体替换，保证与配置面板的持久化结果一致。
+              dshProviders = list
+                .filter((p) => p && typeof p.id === "string" && p.id !== "")
+                .map((p) => ({
+                  id: p.id,
+                  name: p.name || p.id,
+                  models: Array.isArray(p.models)
+                    ? p.models.map((m) => (typeof m === "string" ? { id: m } : { ...m })).filter((m) => m && m.id)
+                    : [],
+                }));
               const settings = ctx.get("settings");
               const credentials = ctx.get("credentials");
               const section = { providers: {} };
@@ -3474,24 +3869,27 @@ async function main() {
                   displayName: p.name || p.id,
                   api: p.protocol || "openai-completions",
                   baseURL: p.baseUrl || undefined,
-                  models: Array.isArray(p.models)
-                    ? p.models
-                        .map((m) => {
-                          const mid = typeof m === "string" ? m : m?.id;
-                          if (!mid) return undefined;
-                          const out = { id: mid };
-                          if (m && typeof m === "object") {
-                            if (m.displayName) out.name = m.displayName;
-                            const ctxWin = parseTokens(m.contextWindow);
-                            if (ctxWin !== undefined) out.contextWindow = ctxWin;
-                            const maxTok = parseTokens(m.maxOutput);
-                            if (maxTok !== undefined) out.maxTokens = maxTok;
-                          }
-                          return out;
-                        })
-                        .filter(Boolean)
-                    : [],
                 };
+                // models 只承载"用户选定的模型"：省略该键 = 使用该提供商的完整目录
+                // （pi-ai catalog / 探活发现）；显式空数组会被理解为"没有可用模型"，
+                // 反而误伤路由，故未选择时不写入。
+                if (Array.isArray(p.models) && p.models.length > 0) {
+                  profile.models = p.models
+                    .map((m) => {
+                      const mid = typeof m === "string" ? m : m?.id;
+                      if (!mid) return undefined;
+                      const out = { id: mid };
+                      if (m && typeof m === "object") {
+                        if (m.displayName) out.name = m.displayName;
+                        const ctxWin = parseTokens(m.contextWindow);
+                        if (ctxWin !== undefined) out.contextWindow = ctxWin;
+                        const maxTok = parseTokens(m.maxOutput);
+                        if (maxTok !== undefined) out.maxTokens = maxTok;
+                      }
+                      return out;
+                    })
+                    .filter(Boolean);
+                }
                 if (typeof p.apiKey === "string" && p.apiKey !== "") {
                   profile.apiKeyEnv = ref;
                   if (credentials) await credentials.set(credentialRef(ref), p.apiKey);
@@ -3506,6 +3904,8 @@ async function main() {
               // 配置变更：模型能力可能变化，清空思考级别适配缓存（下次请求重新查询/适配）
               effortCapabilityCache.clear();
               effortAdaptedCache.clear();
+              // info 级、默认可见：清空缓存是"配置变更"语义，**必须可观测**（不做掩盖）。
+              log("info", "[adapt] effort caches cleared (providersApply)");
               post({ t: "providersApplied", id: msg.id, ok: true });
             } catch (error) {
               log("error", "providersApply failed", error instanceof Error ? error.message : String(error));
@@ -3569,11 +3969,52 @@ async function main() {
       } catch (error) {
         log("error", "frame handling failed", error instanceof Error ? error.stack ?? error.message : String(error));
         const message = error instanceof Error ? error.message : String(error);
-        // 按帧类型补发失败响应（否则扩展/UI 会永久等待，如 resume 卡在"正在恢复会话…"）
-        if (msg.t === "resumeSession") {
-          post({ t: "sessionResumed", id: msg.id, ok: false, error: message });
-        } else if (msg.id !== undefined) {
-          post({ t: "chatDone", id: msg.id, ok: false, error: message });
+        // 按帧类型补发**对应**失败 ack（否则扩展/UI 会等错类型或永久等待）
+        const id = msg.id;
+        switch (msg.t) {
+          case "resumeSession":
+            post({ t: "sessionResumed", id, ok: false, error: message });
+            break;
+          case "deleteSession":
+            post({ t: "sessionDeleted", id, ok: false, error: message });
+            break;
+          case "renameSession":
+            post({ t: "sessionRenamed", id, ok: false, error: message });
+            break;
+          case "exportSession":
+            post({ t: "sessionExported", id, ok: false, error: message });
+            break;
+          case "compact":
+            post({ t: "compactDone", id, ok: false, error: message });
+            break;
+          case "loadMoreHistory":
+            post({ t: "historyMore", sessionId: typeof msg.sessionId === "string" ? msg.sessionId : "", events: [], hasMore: false });
+            break;
+          case "restorePreview":
+          case "viewSession":
+            post({ t: "viewSessionFailed", id: msg.id, error: message });
+            break;
+          case "chat":
+            post({ t: "chatDone", id, ok: false, error: message });
+            break;
+          case "readAttachment":
+            post({ t: "attachmentResult", id, ok: false });
+            break;
+          case "discoverModels":
+            post({ t: "discoveredModels", id, models: [], error: message });
+            break;
+          case "llmProviders":
+            post({ t: "llmProviders", id, providers: [] });
+            break;
+          case "toolCatalog":
+            post({ t: "toolCatalog", id, tools: [], error: message });
+            break;
+          case "providersApply":
+            post({ t: "providersApplied", id, ok: false, error: message });
+            break;
+          default:
+            // 无明确 ack 的帧（newSession/stop/setModel 等）：不补发，避免错帧
+            break;
         }
       }
   }

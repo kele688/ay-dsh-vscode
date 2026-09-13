@@ -20,6 +20,9 @@ import type {
   ViewEvent,
 } from "./protocol";
 
+/** 单条宿主帧的字节上限（防御半可信子进程的超大帧/异常输出导致内存放大）。 */
+const MAX_FRAME_BYTES = 64 * 1024 * 1024;
+
 /** 一次工具调用在 UI 上的聚合状态。 */
 interface ToolCallState {
   callId: string;
@@ -63,8 +66,8 @@ export interface AgentHostOptions {
   subagentMaxDepth?: number;
   /** 多 agent 模式并行子代理数量上限（prompt 级约束）。 */
   maxParallelSubagents?: number;
-  /** 自动授权规则（工具级 {match, action}；Kilo Code 风格）。 */
-  autoApproveRules?: { match: string; action: string }[];
+  /** 自动授权规则（白名单/黑名单：{match, action, commands?}；Kilo Code 风格三态）。 */
+  autoApproveRules?: { match: string; action: string; commands?: string[] }[];
   /** 上下文自动压缩：是否启用。 */
   autoCompaction?: boolean;
   /** 上下文自动压缩触发比例（contextWindow 占比，0~1）。 */
@@ -222,6 +225,8 @@ export class AgentHost {
   private pendingProviderApply = new Map<number, { resolve: (err: string | undefined) => void }>();
   /** 模型发现（discoverModels → discoveredModels）。 */
   private pendingDiscoverModels = new Map<number, { resolve: (r: { models: { id: string; name?: string; contextWindow?: number; maxTokens?: number }[]; error?: string }) => void }>();
+  /** 工具清单请求（toolCatalog → toolCatalog）。 */
+  private pendingToolCatalog = new Map<number, { resolve: (r: { name: string; description?: string; fields?: string[] }[]) => void }>();
   /** 按 turn 聚合的渲染状态（chunk → 增量 ViewEvent）。 */
   private turns = new Map<number, TurnState>();
   private disposed = false;
@@ -394,6 +399,11 @@ export class AgentHost {
     this.rl = readline.createInterface({ input: child.stdout, crlfDelay: Infinity });
     this.rl.on("line", (line) => {
       if (!line.trim()) return;
+      // 帧大小上限：宿主子进程属半可信，超大帧（异常工具输出/恶意注入）先拒，防内存放大。
+      if (line.length > MAX_FRAME_BYTES) {
+        this.output.appendLine(`[host] oversize frame dropped (${line.length} chars)`);
+        return;
+      }
       let frame: HostFrame;
       try {
         frame = JSON.parse(line) as HostFrame;
@@ -401,7 +411,16 @@ export class AgentHost {
         this.output.appendLine(`[host] unparseable: ${line.slice(0, 200)}`);
         return;
       }
-      this.handleFrame(frame);
+      // 帧结构最小校验 + 异常隔离：单帧畸形不得击穿 extension host（H3）。
+      if (!frame || typeof frame !== "object" || typeof frame.t !== "string") {
+        this.output.appendLine(`[host] malformed frame: ${line.slice(0, 200)}`);
+        return;
+      }
+      try {
+        this.handleFrame(frame);
+      } catch (err) {
+        this.output.appendLine(`[host] frame handler error: ${err instanceof Error ? err.message : String(err)}`);
+      }
     });
   }
 
@@ -438,7 +457,7 @@ export class AgentHost {
         break;
       }
       case "events": {
-        for (const event of frame.events) {
+        for (const event of Array.isArray(frame.events) ? frame.events : []) {
           this.trackStats(event);
           const view = this.translateEvent(event);
           if (view) this.emit({ type: "view", event: view });
@@ -492,15 +511,17 @@ export class AgentHost {
       case "history": {
         const viewEvents: ViewEvent[] = [];
         this.lastHistorySessionId = frame.sessionId;
-        for (const event of frame.events) {
-          this.trackStats(event);
-          const view = this.translateEvent(event, { includeUser: true, history: true });
-          if (view) viewEvents.push(view);
-        }
-        // 分页模式下宿主已提供完整统计快照（host 侧只有部分事件无法累计），
-        // 有快照时直接采用；否则用重放事件的累计值。
+        // 统计快照优先（零累计、无中间态）；缺失时清零后纯累计重放，
+        // 避免把上一会话的统计掺入（双计/跨会话污染，M5）。
         if (frame.stats) {
           this.stats = { ...frame.stats };
+        } else {
+          this.stats = { inputTokens: 0, cacheReadTokens: 0, outputTokens: 0, steps: 0 };
+        }
+        for (const event of Array.isArray(frame.events) ? frame.events : []) {
+          if (!frame.stats) this.trackStats(event); // 有快照时不累计（避免中间态错误统计）
+          const view = this.translateEvent(event, { includeUser: true, history: true });
+          if (view) viewEvents.push(view);
         }
         this.emit({
           type: "history",
@@ -516,7 +537,7 @@ export class AgentHost {
       }
       case "historyMore": {
         const viewEvents: ViewEvent[] = [];
-        for (const event of frame.events) {
+        for (const event of Array.isArray(frame.events) ? frame.events : []) {
           const view = this.translateEvent(event, { includeUser: true, history: true });
           if (view) viewEvents.push(view);
         }
@@ -621,6 +642,14 @@ export class AgentHost {
         }
         break;
       }
+      case "toolCatalog": {
+        const pending = this.pendingToolCatalog.get(frame.id);
+        if (pending) {
+          this.pendingToolCatalog.delete(frame.id);
+          pending.resolve(frame.tools ?? []);
+        }
+        break;
+      }
       case "providersApplied": {
         const pending = this.pendingProviderApply.get(frame.id);
         if (pending) {
@@ -646,7 +675,8 @@ export class AgentHost {
 
   /** 从会话事件中累计统计（标题 / token 用量 / 上下文窗口 / API 调用次数）。 */
   private trackStats(event: SessionEvent): void {
-    const d = event.data as Record<string, any>;
+    if (!event || typeof event !== "object" || typeof event.type !== "string") return;
+    const d = (event.data && typeof event.data === "object" ? event.data : {}) as Record<string, any>;
     switch (event.type) {
       case "step/start": {
         this.stats.steps = (this.stats.steps ?? 0) + 1;
@@ -704,7 +734,8 @@ export class AgentHost {
     event: SessionEvent,
     opts?: { includeUser?: boolean; history?: boolean }
   ): ViewEvent | null {
-    const d = event.data as Record<string, any>;
+    if (!event || typeof event !== "object" || typeof event.type !== "string") return null;
+    const d = (event.data && typeof event.data === "object" ? event.data : {}) as Record<string, any>;
     switch (event.type) {
       case "user/message": {
         // 实时会话中用户消息由 UI 在发送时本地渲染；历史重放时则需要渲染
@@ -993,14 +1024,27 @@ export class AgentHost {
     });
   }
 
-  /** 模型发现（catalog 提供商免网络返回模型+元数据；未知提供商探活端点）。 */
-  discoverModels(opts: { provider?: string; baseURL?: string; api?: string; apiKey?: string }): Promise<{ models: { id: string; name?: string; contextWindow?: number; maxTokens?: number }[]; error?: string }> {
+  /** 模型发现（catalog 提供商免网络返回模型+元数据；未知提供商探活端点）。
+   *  带 `model` 时为按需单模型查询（只取该模型的默认容量），列表查询不带容量。 */
+  discoverModels(opts: { provider?: string; baseURL?: string; api?: string; apiKey?: string; model?: string }): Promise<{ models: { id: string; name?: string; contextWindow?: number; maxTokens?: number }[]; error?: string }> {
     return new Promise((resolve) => {
       const id = ++this.llmSeq;
       this.pendingDiscoverModels.set(id, { resolve });
       this.send({ t: "discoverModels", id, ...opts });
       setTimeout(() => {
         if (this.pendingDiscoverModels.delete(id)) resolve({ models: [], error: "timeout" });
+      }, 8000);
+    });
+  }
+
+  /** 当前可见（裁剪后）工具集：配置页"审批规则"的工具名建议列表。 */
+  toolCatalog(): Promise<{ name: string; description?: string; fields?: string[] }[]> {
+    return new Promise((resolve) => {
+      const id = ++this.llmSeq;
+      this.pendingToolCatalog.set(id, { resolve });
+      this.send({ t: "toolCatalog", id });
+      setTimeout(() => {
+        if (this.pendingToolCatalog.delete(id)) resolve([]);
       }, 8000);
     });
   }

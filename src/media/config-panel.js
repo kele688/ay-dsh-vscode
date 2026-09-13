@@ -68,7 +68,8 @@
     modReadonly: zh ? "知名模型模态能力由系统确定（只读）" : "Modality is provided by the vendor (read-only)",
     maxOut: zh ? "最大输出" : "Max output",
     modelEditTitle: zh ? "编辑模型" : "Edit model",
-    tokenSizePlaceholder: zh ? "纯数字 或 带单位，如 200k / 256K / 1m" : "Plain number or unit suffix, e.g. 200k / 256K / 1m",
+    tokenSizeHint: zh ? "可填纯数字（以 token 为单位）或带单位数字（如 256K / 1M）" : "Plain number in tokens, or a number with a unit (e.g. 256K / 1M)",
+    tokenSizeRequired: zh ? "自定义模型必须填写该项" : "Required for custom models",
     tokenSizeInvalid: zh ? "格式无效：请输入纯数字或带单位（如 200k / 256K / 1m）" : "Invalid format: use a plain number or unit suffix (e.g. 200k / 256K / 1m)",
     tokenSizeTooSmall: zh ? "不能小于 1k（1k = 1024）：200k = 204800，1m = 1048576" : "Must be at least 1k (1k = 1024): 200k = 204800, 1m = 1048576",
     modelIdRequired: zh ? "模型 ID 不能为空" : "Model ID is required",
@@ -77,6 +78,7 @@
     modelNameDuplicate: zh ? "该模型名称已在本提供商中存在" : "This model name already exists in this provider",
     manualModelsHint: zh ? "自定义提供商：请点击「添加模型」按钮配置要调用的模型" : "Custom provider: click Add model to configure the models to use",
     optional: zh ? "可选" : "optional",
+    required: zh ? "必填" : "required",
     baseUrl: zh ? "Base URL" : "Base URL",
     apiKeyFor: zh ? "API Key（可选）" : "API Key (optional)",
     apiKeyPlaceholder: zh ? "填入合法 API Key 后即可查询模型" : "Enter a valid API Key to fetch models",
@@ -120,24 +122,27 @@
     enableAutoLearnOff: zh ? "关闭：不会自动学习新经验（已有经验仍可按“启用经验”开关加载）。" : "Off: no auto-learning (existing rules can still be loaded via “Enable learned rules”).",
     enableReiterationOn: zh ? "开启：宿主在每轮对话首条注入“重申纪律”，重申“用户定制品格/自动学习经验”中的规定标签（重启后生效）。" : "On: the host starts every round with a “reiterate discipline” message that re-states the labels from your custom persona / learned rules (effective on restart).",
     enableReiterationOff: zh ? "关闭：每轮不注入重申指令。" : "Off: no per-round reiteration message.",
-    permissionMatch: zh ? "工具名" : "Tool",
-    permissionAction: zh ? "动作" : "Action",
+    permissionMatch: zh ? "工具" : "Tool",
+    permissionCommand: zh ? "命令" : "Command",
+    permissionAction: zh ? "策略" : "Policy",
     permissionActionAllow: zh ? "允许" : "Allow",
     permissionActionAsk: zh ? "询问" : "Ask",
     permissionActionDeny: zh ? "拒绝" : "Deny",
     permissionAdd: zh ? "＋ 添加规则" : "+ Add rule",
     permissionRemove: zh ? "删除" : "Delete",
-    permissionEmpty: zh ? "（暂无规则；使用内置默认：glob / grep / read / find 自动允许）" : "(no rules; built-in defaults: glob / grep / read / find allowed)",
-    permissionSystemDefault: zh ? "系统默认规则" : "System default",
-    permissionDuplicate: zh ? "同名规则已存在，不能重复配置" : "A rule with this tool name already exists",
-    permissionCommandRejected: zh ? "该配置不被接受：DSH 内核暂未提供具体命令参数，仅支持工具级（如 glob / grep / read），不支持带参数命令甄别" : "Rejected: command-level rules are unsupported (the DSH kernel does not expose command args). Use tool-level matches only (e.g. glob / grep / read)",
-    permissionSave: zh ? "保存" : "Save",
+    permissionOp: zh ? "操作" : "Actions",
+    permissionNeedFinish: zh ? "请先完成当前编辑的规则行（确认、取消或者删除）" : "Finish the rule row being edited first (confirm, cancel or delete)",
+    permissionEmpty: zh ? "（暂无自定义规则）" : "(no custom rules)",
+    permissionDuplicate: zh ? "同样的规则已存在（工具 + 命令 + 策略重复）" : "An identical rule already exists (tool + command + policy)",
+    permissionInvalidCommand: zh ? "命令前缀不合法：`*` 只能出现在末尾（如 `npm run *`）" : "Invalid command prefix: `*` may only appear at the end (e.g. `npm run *`)",
+    permissionActionRequired: zh ? "请选择策略" : "Select a policy",
+    permissionConfirm: zh ? "确认" : "Confirm",
     permissionCancel: zh ? "取消" : "Cancel",
     permissionApplyNow: zh ? "立即应用" : "Apply now",
     permissionTitle: zh ? "提示" : "Notice",
     permissionOk: zh ? "确定" : "OK",
     permissionEmptyName: zh ? "工具名不能为空" : "Tool name must not be empty",
-    permissionInvalidName: zh ? "请输入合法命令行（不带参数）" : "Enter a valid command (without arguments)",
+    permissionInvalidName: zh ? "工具名不合法：只允许字母/数字/._- 以及通配 `*`（如 pwsh、mcp_*）" : "Invalid tool name: only letters/digits/._- plus `*` (e.g. pwsh, mcp_*)",
     compactThreshold: zh ? "自动压缩触发比例" : "Auto-compaction threshold ratio",
     compactThresholdHint: zh ? "上下文用到窗口的多少比例时触发压缩（10% ~ 100%，默认 80%）" : "Compact when context reaches this share of the window (10%–100%, default 80%)",
     compactMaxTokens: zh ? "压缩摘要 token 上限" : "Compaction summary token cap",
@@ -222,26 +227,52 @@
     field.addEventListener("change", update);
   }
 
-  // ---- 权限审批组：工具级自动授权规则（Kilo Code 风格）----
-  // 系统默认规则 = DSH 宿主内置的无配置兜底（agent-host.mjs loadAutoApproveRules）：
-  // 只读展示（不可删除/修改，标注"系统默认规则"），也不参与保存（宿主已内置）。
-  // 用户自定义规则与其（及彼此）同名查重，保存时只写用户规则。
-  const SYSTEM_DEFAULT_RULES = [
-    { match: "glob", action: "allow", system: true },
-    { match: "grep", action: "allow", system: true },
-    { match: "read", action: "allow", system: true },
-    { match: "find", action: "allow", system: true },
-  ];
+  // ---- 权限审批组：自动授权规则（白名单 / 黑名单）----
+  // 每条规则 = 一行：{ match 工具, command 单条命令前缀（可留空 = 工具级）, action }
+  //  · **无预置规则**：默认空表 = 一切走内核默认（默认行为见组说明文字）。
+  //  · 命令前缀仅对命令类工具（bash / pwsh）生效；前缀匹配、区分大小写。
+  //  · 保存时逐行校验，不合法 → 拒绝保存；每条规则必须"保存"或"取消"后才能继续添加。
   const permissionRulesEl = $("permissionRules");
   const addPermissionBtn = $("cfgAddPermission");
-  // 工具名合法性：仅字母/数字开头，允许点/下划线/连字符（命令行 token，拒绝中文/空格/特殊字符）
-  const TOOL_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+  // 工具名：字母/数字/`*` 开头，允许 . _ - 与通配 *（如 pwsh、mcp_*）
+  const TOOL_NAME_RE = /^[A-Za-z0-9*][A-Za-z0-9._*-]*$/;
+  const RULE_MATCH_MAX = 64;
+  const COMMAND_PREFIX_MAX = 200;
+  // 复合命令门禁：与配置面板后端 configPanel.ts 的 COMMAND_METACHAR_RE、宿主
+  // agent-host.mjs 的 SHELL_COMPOSITE_RE 保持同步（shell 元字符见 permissionCommandNote 文案）。
+  const COMMAND_METACHAR_RE = /(&&|\|\||;|\||>|<|`|\$\()/;
   function validateToolName(name) {
     const v = String(name ?? "").trim();
-    // 校验不合格统一提示：请输入合法命令行（不带参数）
-    if (!v) return L.permissionInvalidName;
+    if (!v) return L.permissionEmptyName; // 空值 → 明确提示"工具名不能为空"（而非笼统的"不合法"）
+    if (v.length > RULE_MATCH_MAX) return L.permissionInvalidName;
     if (!TOOL_NAME_RE.test(v)) return L.permissionInvalidName;
     return "";
+  }
+  /** 命令前缀校验/规范化：空 = 工具级规则；只允许末尾一个 `*`（等价于不写）。 */
+  function normalizeCommandPrefix(raw) {
+    const text = String(raw ?? "").trim();
+    if (text === "") return { prefix: "" };
+    if (text.length > COMMAND_PREFIX_MAX) return { error: L.permissionInvalidCommand };
+    // 复合命令门禁：命令字段不允许包含 shell 元字符（&& || ; | > < 反引号 $(）
+    if (COMMAND_METACHAR_RE.test(text)) return { error: L.permissionInvalidCommand };
+    const body = text.endsWith("*") ? text.slice(0, -1) : text;
+    if (body === "" || body.includes("*")) return { error: L.permissionInvalidCommand };
+    return { prefix: body };
+  }
+  /** 规则行 → 配置对象（不合法返回 { error }）；保存校验与查重共用。 */
+  function toRulePayload(rule) {
+    const nameErr = validateToolName(rule.match);
+    if (nameErr) return { error: nameErr };
+    // 策略必须显式选择（UI 不预置默认值）：未选择时"确认"与组级"保存"都拒绝，行为一致
+    if (!["allow", "ask", "deny"].includes(rule.action)) return { error: L.permissionActionRequired };
+    const cmd = normalizeCommandPrefix(rule.command);
+    if (cmd.error) return { error: cmd.error };
+    const payload = {
+      match: String(rule.match).trim(),
+      action: rule.action,
+    };
+    if (cmd.prefix !== "") payload.commands = [cmd.prefix];
+    return { rule: payload };
   }
   // 校验/限制提示：用配置面板 modal 弹框（webview 禁用 alert；不使用对话区红条）
   function showPermissionError(text) {
@@ -285,52 +316,118 @@
     });
     overlay.addEventListener("click", (e) => { if (e.target === overlay) close(); });
   }
-  let permissionRules = []; // [{ match, action, saved, dirty, baseMatch, baseAction }]
-  // 权限规则不再按条单独写盘：所有规则统一由本组"保存"按钮
-  // （t:"save" 携带 autoApproveRules）写盘并重启宿主生效，
-  // 保证"没点保存不落盘、点了统一落盘 + 最多一次重启"行为一致。
+  let permissionRules = []; // [{ match, command, action, saved, dirty, baseMatch, baseCommand, baseAction }]
+  // 规则不按条单独写盘：统一由本组"保存"按钮（t:"savePermission"）写盘，
+  // 再由"重启应用"统一重启一次生效。
+  /** 工具名建议列表（宿主 toolCatalog：裁剪后可见的工具集）。 */
+  let permissionToolNames = [];
+  function applyToolCatalog(tools) {
+    permissionToolNames = (Array.isArray(tools) ? tools : [])
+      .map((t) => (t && typeof t.name === "string" ? t.name : ""))
+      .filter((n) => n !== "");
+    renderPermissionRules(); // 工具目录到达后刷新"工具"下拉的选项
+  }
+  // 未完成行存在时：添加按钮不禁用（点击时给出提示），其余行由渲染逻辑锁定。
   function renderPermissionRules() {
     if (!permissionRulesEl) return;
     permissionRulesEl.innerHTML = "";
     if (permissionRules.length === 0) {
-      permissionRulesEl.innerHTML = `<span class="hint">${L.permissionEmpty}</span>`;
+      permissionRulesEl.innerHTML = `<div class="hint">${L.permissionEmpty}</div>`;
       return;
     }
+    // 真正的表格：表头 thead 与内容 tbody 同属一张 table，配合 table-layout: fixed
+    // 保证列宽与表头严格对齐。
+    const table = document.createElement("table");
+    table.className = "permission-table";
+    const thead = document.createElement("thead");
+    const htr = document.createElement("tr");
+    for (const label of [L.permissionMatch, L.permissionCommand, L.permissionAction, L.permissionOp]) {
+      const th = document.createElement("th");
+      th.textContent = label;
+      htr.appendChild(th);
+    }
+    thead.appendChild(htr);
+    table.appendChild(thead);
+    const tbody = document.createElement("tbody");
+    // 存在未完成行时：未完成行可继续编辑，其余行一律锁定（不可改、不可删）
+    const locked = permissionRules.some((r) => r.saved !== true);
     permissionRules.forEach((rule, i) => {
-      const row = document.createElement("div");
-      row.className = "permission-rule-row";
-      const inp = document.createElement("input");
-      inp.type = "text";
-      inp.value = rule.match || "";
-      inp.placeholder = "glob";
-      inp.spellcheck = false;
-      inp.readOnly = rule.saved || rule.system === true; // 已配置 / 系统默认：工具名只读
-      inp.addEventListener("input", () => {
-        rule.match = inp.value;
+      const frozen = locked && rule.saved === true;
+      const row = document.createElement("tr");
+      // 工具：与"策略"**完全相同的 select 控件**（同一套样式、同一个原生下拉箭头）；
+      // 选项 = 当前可用工具集；已保存但当前不可见的工具名动态补一项，保证旧配置正常显示。
+      const toolSel = document.createElement("select");
+      {
+        const current = String(rule.match ?? "").trim();
+        const names = permissionToolNames.slice();
+        if (current !== "" && !names.includes(current)) names.unshift(current);
+        for (const n of names) {
+          const opt = document.createElement("option");
+          opt.value = n;
+          opt.textContent = n;
+          toolSel.appendChild(opt);
+        }
+        if (current !== "") toolSel.value = current;
+        else toolSel.selectedIndex = -1;
+      }
+      toolSel.disabled = rule.saved === true || frozen;
+      toolSel.addEventListener("change", () => {
+        rule.match = toolSel.value;
+        rule.dirty = true;
+      });
+      // 命令：**单条**前缀（留空 = 工具级规则；仅命令类工具 bash/pwsh 生效）
+      const cmdInp = document.createElement("input");
+      cmdInp.type = "text";
+      cmdInp.value = rule.command || "";
+      cmdInp.spellcheck = false;
+      cmdInp.readOnly = rule.saved === true || frozen;
+      cmdInp.addEventListener("input", () => {
+        rule.command = cmdInp.value;
         rule.dirty = true;
       });
       const sel = document.createElement("select");
+      // 无默认值、也无空白项：展开列表只有三项；未配置策略时用 selectedIndex = -1 显示为空
       sel.innerHTML = `<option value="allow">${L.permissionActionAllow}</option><option value="ask">${L.permissionActionAsk}</option><option value="deny">${L.permissionActionDeny}</option>`;
-      sel.value = ["allow", "ask", "deny"].includes(rule.action) ? rule.action : "ask";
-      if (rule.system === true) sel.disabled = true; // 系统默认：动作下拉只读
+      if (["allow", "ask", "deny"].includes(rule.action)) sel.value = rule.action;
+      else sel.selectedIndex = -1;
+      sel.disabled = rule.saved === true || frozen; // 已保存行 / 被锁定行：策略不可改（只能删除后重加）
       sel.addEventListener("change", () => {
         rule.action = sel.value;
         rule.dirty = true;
         renderPermissionRules(); // 有变化：显示"保存/取消"
       });
-      // 保存：确认该行编辑（不单独落盘）；**查重**——与系统默认或其余规则同名则拒绝
+      // 保存：校验该行并查重；不合法 → 拒绝并提示
       const save = document.createElement("button");
       save.type = "button";
       save.className = "secondary";
-      save.textContent = L.permissionSave;
+      save.textContent = L.permissionConfirm;
       save.addEventListener("click", () => {
-        const err = validateToolName(rule.match);
-        if (err) { showPermissionError(err); return; }
-        const dup = permissionRules.some((r2, j) => j !== i && r2.match === rule.match.trim());
-        if (dup) { showPermissionError(L.permissionDuplicate); return; }
+        const built = toRulePayload(rule);
+        if (built.error) {
+          showPermissionError(built.error);
+          return;
+        }
+        const dup = permissionRules.some((r2, j) => {
+          if (j === i) return false;
+          const other = toRulePayload(r2);
+          if (other.error) return false;
+          return (
+            other.rule.match === built.rule.match &&
+            (other.rule.commands?.[0] ?? "") === (built.rule.commands?.[0] ?? "") &&
+            other.rule.action === built.rule.action
+          );
+        });
+        if (dup) {
+          showPermissionError(L.permissionDuplicate);
+          return;
+        }
         rule.saved = true;
         rule.dirty = false;
-        rule.baseMatch = rule.match.trim();
+        rule.match = built.rule.match;
+        rule.command = built.rule.commands?.[0] ?? "";
+        rule.action = built.rule.action;
+        rule.baseMatch = rule.match;
+        rule.baseCommand = rule.command;
         rule.baseAction = rule.action;
         renderPermissionRules();
       });
@@ -341,6 +438,7 @@
       cancel.addEventListener("click", () => {
         if (rule.saved) {
           rule.match = rule.baseMatch;
+          rule.command = rule.baseCommand;
           rule.action = rule.baseAction;
           rule.dirty = false;
         } else {
@@ -348,8 +446,8 @@
         }
         renderPermissionRules();
       });
-      // 删除：仅用户规则可删（系统默认不可删、不显示按钮）
       const rm = document.createElement("button");
+      rm.disabled = frozen;
       rm.type = "button";
       rm.className = "secondary";
       rm.textContent = L.permissionRemove;
@@ -357,17 +455,36 @@
         permissionRules.splice(i, 1);
         renderPermissionRules();
       });
-      // 系统默认标注（只读展示，不显示保存/删除按钮）
-      const badge = document.createElement("span");
-      badge.className = "permission-system-badge";
-      badge.textContent = L.permissionSystemDefault;
-      row.append(inp, sel, ...(rule.dirty ? [save, cancel] : []), ...(rule.system === true ? [badge] : [rm]));
-      permissionRulesEl.appendChild(row);
+      const tdTool = document.createElement("td");
+      tdTool.appendChild(toolSel);
+      const tdCmd = document.createElement("td");
+      tdCmd.appendChild(cmdInp);
+      const tdPolicy = document.createElement("td");
+      tdPolicy.appendChild(sel);
+      const tdActions = document.createElement("td");
+      tdActions.append(...(rule.dirty ? [save, cancel] : []), rm);
+      row.append(tdTool, tdCmd, tdPolicy, tdActions);
+      tbody.appendChild(row);
     });
+    table.appendChild(tbody);
+    permissionRulesEl.appendChild(table);
   }
   if (addPermissionBtn) {
     addPermissionBtn.addEventListener("click", () => {
-      permissionRules.push({ match: "", action: "allow", saved: false, dirty: true, baseMatch: "", baseAction: "allow" });
+      if (permissionRules.some((r) => r.saved !== true)) {
+        showPermissionError(L.permissionNeedFinish);
+        return;
+      }
+      permissionRules.push({
+        match: "",
+        command: "",
+        action: "",
+        saved: false,
+        dirty: true,
+        baseMatch: "",
+        baseCommand: "",
+        baseAction: "",
+      });
       renderPermissionRules();
     });
   }
@@ -426,6 +543,10 @@
   let editingProviderId = null;
   /** 当前编辑表单的模型元数据暂存：modelId -> {displayName, contextWindow, maxOutput}。 */
   let currentModelMeta = new Map();
+  /** 待回填的"按需模型默认容量"请求：openModelEditor 发起，收到 modelDefaults 后回填。 */
+  let pendingModelDefaults = null;
+  /** 当前提供商表单选中的 provider id（新增模式下表单尚未保存时也要能按需查询模型默认值）。 */
+  let currentProviderFormId = null;
   /** 当前自定义供应商表单的模型 id 列表（openProviderForm 时初始化）。 */
   let customModels = [];
 
@@ -439,6 +560,12 @@
   sidebar.addEventListener("click", (ev) => {
     const btn = ev.target.closest(".cfg-nav");
     if (!btn) return;
+    // 未完成的规则必须先处理（保存 / 取消 / 删除）：阻止切换分组与"重启应用"，
+    // 避免未完成内容被静默丢弃、或带着半成品规则重启宿主。
+    if (permissionRules.some((r) => r.saved !== true)) {
+      showPermissionError(L.permissionNeedFinish);
+      return;
+    }
     if (btn.dataset.group === "restartApply") {
       // "重启应用"是命令入口：弹配置页面内确认框（标题 AY-DSH、确认/取消各一个），
       // 确认后才发消息重启宿主；取消则停留在当前功能组（不切换页面）。
@@ -678,6 +805,26 @@
     if (!isCustom) {
       // 知名供应商：Provider ID 下拉 = DSH 目录（不含自定义项）；选中联动填显示名与默认 Base URL
       const pidSel = $("pfProviderId");
+      // 模型清单**实时查询**（不落盘）：目录就绪/切换提供商后自动查询一次并渲染勾选；
+      // 勾选状态来自"用户此前选定过的模型"（provider.models）——用户没选过则全不勾选，
+      // 保存时省略 models，运行时用该提供商当下的完整目录（内核升级新增模型自动可见）。
+      const autoFetchKnownModels = () => {
+        const toggle = $("pfToggleModels");
+        const checkEl = $("pfModelsCheck");
+        if (!toggle || !checkEl) return;
+        const pid = editingProviderId || pidSel.value || "";
+        if (!pid) return;
+        checkEl.classList.remove("hidden");
+        checkEl.textContent = L.fetching;
+        toggle.textContent = `▾ ${L.configureModels}`;
+        vscode.postMessage({
+          t: "fetchModels",
+          providerId: pid,
+          baseUrl: $("pfBaseUrl").value.trim(),
+          apiKey: $("pfApiKey").value.trim(),
+          protocol: $("pfProtocol").value,
+        });
+      };
       applyCatalogRef = (list) => {
         pidSel.innerHTML = "";
         catalogBaseUrlMap = {};
@@ -713,11 +860,16 @@
         // 编辑模式：名称保留已接入的原值（readonly 展示）；添加模式：名称跟随目录
         if (!editingProviderId) applyAutoName(pidSel.value);
         applyDefaultBaseUrl(pidSel.value);
+        currentProviderFormId = editingProviderId || pidSel.value || null;
+        // 目录就绪即自动查询模型（知名提供商的模型清单必须来自实时查询）
+        autoFetchKnownModels();
       };
       pidSel.addEventListener("change", () => {
-        // 切换提供商：名称（只读跟随目录）/ Base URL 跟随
+        // 切换提供商：名称（只读跟随目录）/ Base URL 跟随，并刷新模型清单
         applyAutoName(pidSel.value);
         applyDefaultBaseUrl(pidSel.value);
+        currentProviderFormId = pidSel.value || null;
+        autoFetchKnownModels();
       });
       vscode.postMessage({ t: "queryProviders" });
 
@@ -846,7 +998,10 @@
         });
         providerId = editingProviderId || $("pfProviderId").value.trim() || name.toLowerCase().replace(/[^a-z0-9-]/g, "-");
       } else {
-        models = [...$("pfModelsCheck").querySelectorAll("input[type=checkbox]:checked")].map((cb) => {
+        // 勾选集合 = 用户选中的模型，写进 dshProviders 成为对话面板的可选项；
+        // 一个都没勾选就是**空数组**（该提供商暂无可选模型）——不会退化成"全集"，
+        // 因为厂家支持哪些模型永远由「获取模型」实时查询展示、不落盘。
+        const chosenModels = [...$("pfModelsCheck").querySelectorAll("input[type=checkbox]:checked")].map((cb) => {
           const meta = currentModelMeta.get(cb.dataset.model);
           return {
             id: cb.dataset.model,
@@ -856,6 +1011,7 @@
             inputModalities: Array.isArray(meta?.inputModalities) ? meta.inputModalities : undefined,
           };
         });
+        models = chosenModels;
         providerId = $("pfProviderId").value;
         // 知名模式必须显式选择提供商（目录未就绪时下拉可能为空，阻止保存）
         if (!providerId) {
@@ -890,8 +1046,10 @@
    * 校验规则（isCustom 决定预填策略，校验规则统一）：
    * - 模型 ID / 模型名称：必须非空；且在本提供商范围内唯一（id 与 name 都不能与
    *   其它模型的 id 或 name 重叠）；
-   * - 上下文窗口 / 最大输出：可留空（自定义模型留空 = 不传递该参数，模型用默认值）；
-   *   填了就必须合法（纯数字或 K/M 单位）且 ≥ 1k（1024），最大值不限；
+   * - 上下文窗口 / 最大输出：**自定义模型必填**（缺失即阻止保存）；知名模型可选——
+   *   其默认值由供应商目录实时查询后预填，留空 = 不传该参数、用模型默认；
+   *   非空时必须合法（纯数字或 K/M 单位）且 ≥ 1k（1024），最大值不限；
+   * - 输入框内不放占位文案（长文案会被截断），说明统一放在框下方的小字体 hint；
    * - 知名提供商：以查出的模型能力默认值预填（查不到则留空）；自定义：默认留空。
    */
   function openModelEditor(modelId, meta, onSave, idReadonly = true, isCustom = true) {
@@ -910,13 +1068,15 @@
         <div class="field"><label>${L.modelDisplayName}</label><input type="text" id="meName" value="${esc(meta?.displayName || "")}" spellcheck="false">
           <span class="token-note hidden" id="meNameNote"></span></div>
         <div class="field">
-          <label>${L.contextWindow}${isCustom ? `（${L.optional}）` : ""}</label>
-          <input type="text" id="meCtx" value="${esc(ctxVal)}" placeholder="${esc(L.tokenSizePlaceholder)}" spellcheck="false">
+          <label>${L.contextWindow}${isCustom ? `（${L.required}）` : `（${L.optional}）`}</label>
+          <input type="text" id="meCtx" value="${esc(ctxVal)}" spellcheck="false">
+          <span class="hint">${L.tokenSizeHint}</span>
           <span class="token-note hidden" id="meCtxNote"></span>
         </div>
         <div class="field">
-          <label>${L.maxOut}${isCustom ? `（${L.optional}）` : ""}</label>
-          <input type="text" id="meMax" value="${esc(maxVal)}" placeholder="${esc(L.tokenSizePlaceholder)}" spellcheck="false">
+          <label>${L.maxOut}${isCustom ? `（${L.required}）` : `（${L.optional}）`}</label>
+          <input type="text" id="meMax" value="${esc(maxVal)}" spellcheck="false">
+          <span class="hint">${L.tokenSizeHint}</span>
           <span class="token-note hidden" id="meMaxNote"></span>
         </div>
         <div class="field">
@@ -937,6 +1097,15 @@
       if (e.target === overlay) overlay.remove();
     });
     const $me = (id) => overlay.querySelector(`#${id}`);
+
+    // 按需查询默认容量：**只**在该模型尚未配置过（没有已保存的上下文窗口/最大输出）
+    // 且属于知名提供商时，查这**一个**模型的默认值；已配置过就直接显示配置值，不再查询。
+    // （列表查询因此可以保持轻量：不必为整份目录逐个查容量。）
+    const providerForDefaults = editingProviderId || currentProviderFormId;
+    if (!isCustom && providerForDefaults && modelId && (!ctxVal || !maxVal)) {
+      pendingModelDefaults = { model: modelId, ctxEl: $me("meCtx"), maxEl: $me("meMax") };
+      vscode.postMessage({ t: "fetchModelDefaults", providerId: providerForDefaults, modelId });
+    }
 
     // 回填模态能力：模型已存/查出的 inputModalities（含 image 则回填"文本+图片"）
     const mods = Array.isArray(meta?.inputModalities) ? meta.inputModalities : (isCustom ? ["text"] : ["text"]);
@@ -1011,9 +1180,15 @@
      * 且 ≥1k（1024）。非法格式与过小均阻止保存（信息不同）。
      * @returns {{ok: boolean}}
      */
-    const validateSize = (input, noteEl) => {
+    const validateSize = (input, noteEl, required = false) => {
       const raw = input.value.trim();
       if (raw === "") {
+        // 自定义模型必须显式给出：留空即不传该参数，模型行为不可预期，故阻止保存
+        if (required) {
+          showNote(noteEl, L.tokenSizeRequired, "error");
+          input.classList.add("invalid");
+          return { ok: false };
+        }
         showNote(noteEl, "", "");
         input.classList.remove("invalid", "warn");
         return { ok: true };
@@ -1034,8 +1209,8 @@
       return { ok: true };
     };
 
-    const checkCtx = () => validateSize($me("meCtx"), "meCtxNote");
-    const checkMax = () => validateSize($me("meMax"), "meMaxNote");
+    const checkCtx = () => validateSize($me("meCtx"), "meCtxNote", isCustom);
+    const checkMax = () => validateSize($me("meMax"), "meMaxNote", isCustom);
     $me("meId").addEventListener("input", validateId);
     $me("meName").addEventListener("input", validateName);
     $me("meCtx").addEventListener("input", checkCtx);
@@ -1146,13 +1321,23 @@
       },
     });
   });
-  // 权限审批组：整体写回规则列表（只落盘，不重启）
+  // 权限审批组：整体写回规则列表（存在未完成行 → 拒绝；逐行校验；任何一行不合法 → 拒绝并提示）
   $("cfgSavePermission").addEventListener("click", () => {
+    if (permissionRules.some((r) => r.saved !== true)) {
+      showPermissionError(L.permissionNeedFinish);
+      return;
+    }
+    const rules = [];
+    for (const r of permissionRules) {
+      const built = toRulePayload(r);
+      if (built.error) {
+        showPermissionError(built.error);
+        return;
+      }
+      rules.push(built.rule);
+    }
     disableGroupSaves(true);
-    vscode.postMessage({
-      t: "savePermission",
-      rules: permissionRules.filter((r) => !r.system && r.match && r.match.trim() !== "").map((r) => ({ match: r.match.trim(), action: r.action })),
-    });
+    vscode.postMessage({ t: "savePermission", rules });
   });
   // 个性定制组：三个开关（个性文件内容随编辑即时落盘，重启后注入生效）
   $("cfgSavePersonal").addEventListener("click", () => {
@@ -1196,18 +1381,27 @@
     fields.enableAutoLearn.checked = c.enableAutoLearn === true;
     fields.enableReiteration.checked = c.enableReiteration === true;
     personalStateUpdaters.forEach((fn) => fn());
-    // 权限规则 = 系统默认（只读展示，宿主内置）+ 用户自定义（可增删改）：
-    // 配置中与系统默认同名的条目被系统默认覆盖（宿主内置即生效，无需重复写盘）；
-    // 用户规则彼此同名在行级保存时查重拒绝。
-    const sysMatches = new Set(SYSTEM_DEFAULT_RULES.map((r) => r.match));
-    const userRules = Array.isArray(c.autoApproveRules)
-      ? c.autoApproveRules.map((r) => ({ match: String(r.match ?? ""), action: ["allow", "ask", "deny"].includes(r.action) ? r.action : "ask", saved: true, dirty: false, baseMatch: String(r.match ?? ""), baseAction: ["allow", "ask", "deny"].includes(r.action) ? r.action : "ask", system: false }))
-      : [];
-    permissionRules = [
-      ...SYSTEM_DEFAULT_RULES.map((r) => ({ ...r, saved: true, dirty: false, baseMatch: r.match, baseAction: r.action })),
-      ...userRules.filter((r) => !sysMatches.has(r.match)),
-    ];
+    // 审批规则：**每条规则一行**（一个命令前缀一行）；无预置项。
+    const expandRule = (r) => {
+      const action = ["allow", "ask", "deny"].includes(r.action) ? r.action : "";
+      const match = String(r.match ?? "");
+      const cmds = Array.isArray(r.commands) ? r.commands.map((c) => String(c ?? "").trim()).filter((c) => c !== "") : [];
+      const rows = cmds.length > 0 ? cmds : [""];
+      return rows.map((command) => ({
+        match,
+        command,
+        action,
+        saved: true,
+        dirty: false,
+        baseMatch: match,
+        baseCommand: command,
+        baseAction: action,
+      }));
+    };
+    permissionRules = Array.isArray(c.autoApproveRules) ? c.autoApproveRules.flatMap(expandRule) : [];
     renderPermissionRules();
+    // 工具名建议列表：向宿主查询当前可见（裁剪后）的工具集
+    vscode.postMessage({ t: "toolCatalog" });
     cwdEl.value = c.cwd || "";
     disableGroupSaves(false);
   }
@@ -1220,6 +1414,11 @@
         providers = Array.isArray(msg.providers) ? msg.providers : [];
         renderProviders();
         break;
+      case "toolCatalog": {
+        // 宿主返回当前可见工具集：填充"工具名"建议列表（仍可手填 * / mcp_*）
+        applyToolCatalog(msg.tools);
+        break;
+      }
       case "providerKeys": {
         // 密钥库状态异步到达：合并后重渲染（更新 🔑 徽标，不阻塞首次列表显示）
         const states = msg.states || {};
@@ -1257,6 +1456,21 @@
           applyCatalogRef = null;
         }
         break;
+      case "modelDefaults": {
+        // 按需回填：仅当对应编辑框仍为空时填入（用户已手输的值绝不覆盖）；弹框已关闭时
+        // 元素失联（isConnected=false），自然跳过。
+        const p = pendingModelDefaults;
+        if (!p || p.model !== msg.model) break;
+        pendingModelDefaults = null;
+        const setIfEmpty = (el, v) => {
+          if (el && el.isConnected && el.value.trim() === "" && typeof v === "number" && v > 0) {
+            el.value = fmtTokenSize(v) ?? "";
+          }
+        };
+        setIfEmpty(p.ctxEl, msg.contextWindow);
+        setIfEmpty(p.maxEl, msg.maxTokens);
+        break;
+      }
       case "models": {
         // 实时模型查询结果：渲染勾选列表（勾选 + 模型名/ID + 编辑按钮）。
         // 条目兼容字符串（回退网络查询，仅 id）与对象（DSH 发现，含 contextWindow/maxTokens）。
@@ -1409,12 +1623,28 @@
     const out = [];
     let inCode = false;
     let codeBuf = [];
-    const inline = (s) =>
-      s
+    const inline = (s) => {
+      // 先转义后格式化（与 chat.js 同款，防 HTML 注入）。链接单独在【原始】文本上识别：
+      // href 经严格字符集校验（http(s)、不含引号/空白/尖括号/括号）后原样插入，
+      // 标签文本另行转义——避免"先转义再拼 href"导致 &quot; 二次解码逃出属性。
+      const links = [];
+      let body = String(s).replace(
+        /\[([^\]]+)\]\((https?:\/\/[^\s"'<>()]+)\)/g,
+        (_, label, href) => {
+          links.push({ label, href: href.replace(/&/g, "&amp;") });
+          return `\u0000L${links.length - 1}\u0000`;
+        }
+      );
+      body = escapeHtml(body);
+      body = body
         .replace(/`([^`]+)`/g, "<code>$1</code>")
         .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
-        .replace(/\*([^*]+)\*/g, "<em>$1</em>")
-        .replace(/\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g, '<a href="$2">$1</a>');
+        .replace(/\*([^*]+)\*/g, "<em>$1</em>");
+      return body.replace(/\u0000L(\d+)\u0000/g, (_, id) => {
+        const l = links[Number(id)];
+        return `<a href="${l.href}" rel="noopener noreferrer">${escapeHtml(l.label)}</a>`;
+      });
+    };
     for (const line of lines) {
       if (/^```/.test(line)) {
         if (inCode) {

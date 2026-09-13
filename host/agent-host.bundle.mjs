@@ -85896,10 +85896,16 @@ function installModelSelection(agentCtx, selection) {
 }
 
 // host/agent-host.mjs
+for (const ev of ["end", "close"]) process.stdin.on(ev, () => process.exit(0));
+process.on("disconnect", () => process.exit(0));
+function envFlag(name) {
+  return String(process.env[name] ?? "0") !== "0";
+}
 var NAME2 = "dsh-vscode-host";
 var CORE_VERSION = "0.5.4";
 var SESSION_PREFIX = "dsh-vscode-";
 var workMode = "single";
+var dshProviders = [];
 var getWorkMode = () => workMode;
 function post(frame) {
   process.stdout.write(JSON.stringify(frame) + "\n");
@@ -85912,7 +85918,26 @@ function log(level, message, extra2) {
 function bundlePatchFile(specifier) {
   return fileURLToPath2(import.meta.resolve(specifier));
 }
+function personaPrefixSince(version2) {
+  const m2 = /^(\d+)\.(\d+)\.(\d+)/.exec(String(version2 ?? ""));
+  if (!m2) return false;
+  const ma = Number(m2[1]);
+  const mi = Number(m2[2]);
+  const pa = Number(m2[3]);
+  if (ma > 0) return true;
+  if (mi > 1) return true;
+  if (mi < 1) return false;
+  return pa >= 5;
+}
 function detectPersonaPrefixField() {
+  try {
+    const pkgPath = fileURLToPath2(import.meta.resolve("@deepseek-ai/dsh-system-prompt/package.json"));
+    const ver = JSON.parse(readFileSync2(pkgPath, "utf8")).version;
+    if (typeof ver === "string" && /^(\d+)\.(\d+)\.(\d+)/.test(ver)) {
+      return personaPrefixSince(ver);
+    }
+  } catch {
+  }
   for (const spec of [
     "@deepseek-ai/dsh-system-prompt/lib/index.js",
     "@deepseek-ai/dsh-system-prompt/package.json"
@@ -85958,12 +85983,19 @@ function composePatches(env) {
   }
   const currentCwd = process.cwd();
   const personaText = `You are a coding agent powered by the {{model}} model, running inside the DeepSeek Harness VS Code extension. Your working directory is ${currentCwd} \u2014 the user's current workspace. Use this directory for all file operations and command workdirs. Help with coding tasks: read and edit files, run commands, search the web, and orchestrate subagents and workflows. File edits you make appear live in the editor. Plan before large changes; prefer the plan-mode workflow for ambiguous or big tasks. Work is driven turn by turn by the user: a long-running task that cannot be finished within one turn must end with a clear summary of progress and next steps, waiting for the user's next instruction. Tool calls, approvals, and todos are shown to the user in real time; keep them informed and concise. Permissions: operations outside the workspace are denied by the sandbox by default. When a task genuinely needs wider access (e.g. reading or writing files outside the workspace, or system-level commands), you may request a one-time escalation by passing \`sandbox_permissions\` (the narrowest wider mode that suffices, e.g. "danger-full-access") together with a clear \`justification\` to the file/command tools and parameters in detail \u2014 the user is then prompted to approve or deny in the UI. Do not request escalation casually; prefer working inside the workspace. Encoding: on Windows, command output (PowerShell 5.1 / Python) defaults to the system code page, which garbles non-ASCII text (any language) when captured. When running a command whose output may contain non-ASCII characters, force UTF-8 output: prefix PowerShell commands with \`[Console]::OutputEncoding = [Text.Encoding]::UTF8; $OutputEncoding = [Text.Encoding]::UTF8;\` or run \`chcp 65001 >nul\` first, and for Python set \`$env:PYTHONIOENCODING='utf-8'\` \u2014 otherwise the captured output will be garbled.`;
+  let personaSuffixText = "";
+  if (DSH_PERSONA_PREFIX_SUPPORTED && envFlag("DSH_ENABLE_CUSTOM")) {
+    try {
+      personaSuffixText = readFileSync2(join4(resolveDshHome(), "ay-dsh-custom.md"), "utf8").trim();
+    } catch {
+    }
+  }
   const overlay = [
     {
       id: "system-prompt",
       // 内核字段名适配（patch 为整行替换 config 语义：只提供内核实际支持的键，
       // 误用旧键会被新版 schema 丢弃 → 人设静默失效）。
-      config: DSH_PERSONA_PREFIX_SUPPORTED ? { personaPrefix: personaText } : { persona: personaText }
+      config: DSH_PERSONA_PREFIX_SUPPORTED ? { personaPrefix: personaText, ...personaSuffixText ? { personaSuffix: personaSuffixText } : {} } : { persona: personaText }
     },
     { id: "hmr", disabled: true },
     {
@@ -86046,11 +86078,10 @@ async function bootTree() {
   return ctx;
 }
 var EventPump = class {
-  constructor(sizeProvider, afterFlush) {
+  constructor(sizeProvider) {
     this.queue = [];
     this.timer = void 0;
     this.sizeProvider = sizeProvider;
-    this.afterFlush = afterFlush;
   }
   push(event) {
     this.queue.push(event);
@@ -86074,10 +86105,6 @@ var EventPump = class {
     post(
       sessionBytes === void 0 ? { t: "events", events: batch } : { t: "events", events: batch, sessionBytes }
     );
-    try {
-      this.afterFlush?.();
-    } catch {
-    }
   }
 };
 async function createAgent(ctx, options, pump2, approvals) {
@@ -86177,8 +86204,11 @@ function applyEffort(request, effort) {
   }
   return { ...request, reasoningEffort: effort };
 }
-var effortCapabilityCache = /* @__PURE__ */ new Map();
-var effortAdaptedCache = /* @__PURE__ */ new Map();
+var EFFORT_CACHE_SLOT = "__ayDshVscodeEffortCaches";
+var effortCaches = globalThis[EFFORT_CACHE_SLOT] ??= { capability: /* @__PURE__ */ new Map(), adapted: /* @__PURE__ */ new Map() };
+var effortCapabilityCache = effortCaches.capability;
+var effortAdaptedCache = effortCaches.adapted;
+var DEBUG_ADAPT = process.env.DSH_DEBUG_ADAPT === "1";
 var UI_LANG = process.env.DSH_LOCALE === "zh" ? "zh" : "en";
 var L = (zh, en) => UI_LANG === "zh" ? zh : en;
 var userEffortChanged = false;
@@ -86407,8 +86437,22 @@ ${reiterationText}`);
     return changed ? { ...decision, messages } : decision;
   });
   agent.ctx.on("tools/pre-execute", async (exec, next) => {
+    if (exec && typeof exec.name === "string" && exec.callId !== void 0 && toolNeedsApprovalArgs(exec.name)) {
+      if (pendingApprovalArgs.size >= APPROVE_ARG_CALLID_LIMIT) {
+        const oldest = pendingApprovalArgs.keys().next().value;
+        if (oldest !== void 0) pendingApprovalArgs.delete(oldest);
+      }
+      pendingApprovalArgs.set(exec.callId, exec.arguments);
+    }
     const gate = await next();
     if (gate.kind === "allow") toolCallCount++;
+    if (exec && typeof exec.name === "string") {
+      const rule = findAutoApproveRule(exec.name, exec.callId);
+      if (rule && rule.action === "deny") {
+        log("info", `auto-deny ${exec.name} at pre-execute (${ruleLabel(rule)})`);
+        return { kind: "deny", reason: autoApproveDenyReason(exec.name) };
+      }
+    }
     if (stepLimit > 0 && stepLimitHit && gate.kind === "allow") {
       return {
         kind: "deny",
@@ -86416,6 +86460,9 @@ ${reiterationText}`);
       };
     }
     return gate;
+  });
+  agent.ctx.on("tools/result", (exec) => {
+    if (exec && exec.callId !== void 0) pendingApprovalArgs.delete(exec.callId);
   });
   agent.ctx.on(
     "agent/request",
@@ -86425,7 +86472,7 @@ ${reiterationText}`);
         const cacheKey = `${request.provider}|${request.model}|${request.reasoningEffort}`;
         const cacheHit = effortAdaptedCache.has(cacheKey);
         if (!cacheHit) {
-          log("debug", `[adapt] ${request.provider}/${request.model} effort=${request.reasoningEffort} cacheHit=false`);
+          if (DEBUG_ADAPT) log("debug", `[adapt] ${request.provider}/${request.model} effort=${request.reasoningEffort} cacheHit=false`);
         }
         if (cacheHit) {
           const cached = effortAdaptedCache.get(cacheKey);
@@ -86440,7 +86487,7 @@ ${reiterationText}`);
                 const info = await llm.resolveModelInfo(request.provider, request.model);
                 supported2 = (info?.reasoning?.efforts ?? []).map((e2) => typeof e2 === "string" ? e2 : e2?.id).filter(Boolean);
                 effortCapabilityCache.set(capKey, supported2);
-                log("debug", `[adapt] capability ${capKey} \u2192 supported=[${supported2.join(", ")}]`);
+                if (DEBUG_ADAPT) log("debug", `[adapt] capability ${capKey} \u2192 supported=[${supported2.join(", ")}]`);
               }
               const from2 = request.reasoningEffort;
               const { value, adapted } = adaptEffort(from2, supported2);
@@ -86500,16 +86547,17 @@ ${reiterationText}`);
       sections: [...assembled.sections ?? [], multiAgentSection(process.env)]
     };
   });
-  const enableCustom = String(process.env.DSH_ENABLE_CUSTOM ?? "0") !== "0";
-  const enableLearning = String(process.env.DSH_ENABLE_LEARNING ?? "0") !== "0";
-  const enableReiteration = String(process.env.DSH_ENABLE_REITERATION ?? "0") !== "0";
+  const enableCustom = envFlag("DSH_ENABLE_CUSTOM");
+  const enableLearning = envFlag("DSH_ENABLE_LEARNING");
+  const enableReiteration = envFlag("DSH_ENABLE_REITERATION");
   const customPrompt = enableCustom ? readTextFile(CUSTOM_PROMPT_FILE) : "";
   const learningText = enableLearning ? readTextFile(LEARNING_FILE) : "";
   const reiterationText = enableReiteration ? readTextFile(REITERATION_FILE) : "";
   agent.ctx.on("system-prompt/assemble", async (_assembly, _context, next) => {
     const assembled = await next();
     const sections = [...assembled.sections ?? []];
-    if (customPrompt) sections.push({ name: "user-custom-prompt", text: customPrompt });
+    const customHandledByPersonaSuffix = DSH_PERSONA_PREFIX_SUPPORTED && customPrompt !== "";
+    if (customPrompt && !customHandledByPersonaSuffix) sections.push({ name: "user-custom-prompt", text: customPrompt });
     if (learningText) sections.push({ name: "user-learning", text: `\u4EE5\u4E0B\u662F\u4ECE\u65E2\u5F80\u5BF9\u8BDD\u6C89\u6DC0\u7684\u5DE5\u4F5C\u7ECF\u9A8C\uFF0C\u8BF7\u81EA\u89C9\u9075\u5B88\uFF1A
 ${learningText}` });
     if (sections.length === (assembled.sections ?? []).length) return assembled;
@@ -86517,34 +86565,108 @@ ${learningText}` });
   });
   return { resetStepBudget };
 }
+var SHELL_COMPOSITE_RE = /(&&|\|\||;|\||>|<|`|\$\()/;
+var COMMAND_PREFIX_MAX = 200;
+function toolNameMatches(pattern2, toolName2) {
+  if (pattern2 === "*") return true;
+  if (!pattern2.includes("*")) return pattern2 === toolName2;
+  const escaped = pattern2.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/\\\*/g, ".*");
+  try {
+    return new RegExp(`^${escaped}$`).test(toolName2);
+  } catch {
+    return false;
+  }
+}
+function normalizeCommandPrefix(raw) {
+  const text = String(raw ?? "").trim();
+  if (text === "" || text.length > COMMAND_PREFIX_MAX) return void 0;
+  if (SHELL_COMPOSITE_RE.test(text)) return void 0;
+  const body = text.endsWith("*") ? text.slice(0, -1) : text;
+  if (body === "" || body.includes("*")) return void 0;
+  return body;
+}
+function normalizeAutoApproveRules(input) {
+  const out = [];
+  for (const r2 of Array.isArray(input) ? input : []) {
+    const action = r2?.action === "deny" ? "deny" : r2?.action === "allow" ? "allow" : void 0;
+    if (action === void 0) continue;
+    const match = String(r2?.match ?? "").trim();
+    if (match === "") continue;
+    const rule = { match, action };
+    if (Array.isArray(r2?.commands) && r2.commands.length > 0) {
+      const prefixes = [];
+      for (const c of r2.commands) {
+        const p = normalizeCommandPrefix(c);
+        if (p === void 0) {
+          log("warn", `auto-approve rule: illegal command prefix dropped: ${JSON.stringify(c)} (rule ${match})`);
+          continue;
+        }
+        if (!prefixes.includes(p)) prefixes.push(p);
+      }
+      if (prefixes.length === 0) {
+        log("warn", `auto-approve rule dropped: no legal command prefix (rule ${match})`);
+        continue;
+      }
+      rule.commands = prefixes;
+    }
+    out.push(rule);
+  }
+  return out;
+}
 function loadAutoApproveRules() {
-  const DEFAULT_RULES = [
-    { match: "glob", action: "allow" },
-    { match: "grep", action: "allow" },
-    { match: "read", action: "allow" },
-    { match: "find", action: "allow" }
-  ];
   try {
     const raw = process.env.DSH_AUTO_APPROVE;
-    if (!raw) return DEFAULT_RULES;
-    const arr = JSON.parse(raw);
-    if (!Array.isArray(arr)) return DEFAULT_RULES;
-    const valid = arr.map((r2) => ({ match: String(r2?.match ?? "").trim(), action: ["allow", "ask", "deny"].includes(r2?.action) ? r2.action : "ask" })).filter((r2) => r2.match);
-    return valid.length > 0 ? valid : DEFAULT_RULES;
-  } catch {
-    return DEFAULT_RULES;
+    if (!raw) return [];
+    return normalizeAutoApproveRules(JSON.parse(raw));
+  } catch (error) {
+    log("warn", "auto-approve rules unreadable; falling back to an empty table", error instanceof Error ? error.message : String(error));
+    return [];
   }
 }
 var autoApproveRules = loadAutoApproveRules();
+function toolNeedsApprovalArgs(toolName2) {
+  return autoApproveRules.some((r2) => r2.commands !== void 0 && toolNameMatches(r2.match, toolName2));
+}
+var pendingApprovalArgs = /* @__PURE__ */ new Map();
+var APPROVE_ARG_CALLID_LIMIT = 512;
+function commandOfArgs(args) {
+  if (args === null || typeof args !== "object") return void 0;
+  const c = args.command;
+  return typeof c === "string" ? c : void 0;
+}
+function ruleMatchesCall(rule, toolName2, args) {
+  if (!toolNameMatches(rule.match, toolName2)) return false;
+  if (rule.commands === void 0) return true;
+  const command = commandOfArgs(args);
+  if (command === void 0) return false;
+  if (rule.action === "allow" && SHELL_COMPOSITE_RE.test(command)) return false;
+  return rule.commands.some((p) => command.startsWith(p));
+}
+function findAutoApproveRule(toolName2, callId) {
+  const args = callId !== void 0 ? pendingApprovalArgs.get(callId) : void 0;
+  for (const r2 of autoApproveRules) {
+    if (r2.commands !== void 0 && args === void 0) continue;
+    if (ruleMatchesCall(r2, toolName2, args)) return r2;
+  }
+  return void 0;
+}
+function ruleLabel(rule) {
+  return rule.commands === void 0 ? "tool-level" : `commands=[${rule.commands.join(", ")}]`;
+}
+function autoApproveDenyReason(toolName2) {
+  return UI_LANG === "zh" ? `\u5DE5\u5177 ${toolName2} \u88AB\u6388\u6743\u89C4\u5219\u62D2\u7EDD\uFF08\u914D\u7F6E\u9879 dshVscode.autoApproveRules\uFF09\u3002` : `Tool ${toolName2} was denied by an approval rule (dshVscode.autoApproveRules).`;
+}
 function installApprovalListener(ctx, approvals) {
   ctx.on("approval/request", async (req) => {
-    const rule = autoApproveRules.find((r2) => r2.match === req.toolName);
+    const rule = findAutoApproveRule(req.toolName, req.callId);
     if (rule && rule.action === "allow") {
-      log("info", `auto-approve ${req.toolName} (tool-level rule allow)`);
+      log("info", `auto-approve ${req.toolName} (${ruleLabel(rule)})`);
+      if (req.callId !== void 0) pendingApprovalArgs.delete(req.callId);
       return "allowed-once";
     }
     if (rule && rule.action === "deny") {
-      log("info", `auto-deny ${req.toolName} (tool-level rule deny)`);
+      log("info", `auto-deny ${req.toolName} (${ruleLabel(rule)})`);
+      if (req.callId !== void 0) pendingApprovalArgs.delete(req.callId);
       return "rejected";
     }
     const id = approvals.nextId();
@@ -86647,16 +86769,25 @@ var SESSION_META_FILE = "session-meta.json";
 function sessionMetaPath() {
   return join4(dshHomePath("sessions-ay-dsh"), SESSION_META_FILE);
 }
+var sessionMetaCache = null;
+var sessionMetaCacheAt = 0;
+var SESSION_META_CACHE_TTL = 1500;
 function loadSessionMeta() {
+  const now = Date.now();
+  if (sessionMetaCache !== null && now - sessionMetaCacheAt < SESSION_META_CACHE_TTL) return sessionMetaCache;
   try {
     const raw = readFileSync2(sessionMetaPath(), "utf8");
     const parsed = JSON.parse(raw);
-    return parsed && typeof parsed === "object" ? parsed : {};
+    sessionMetaCache = parsed && typeof parsed === "object" ? parsed : {};
   } catch {
-    return {};
+    sessionMetaCache = {};
   }
+  sessionMetaCacheAt = now;
+  return sessionMetaCache;
 }
 function saveSessionMeta(meta) {
+  sessionMetaCache = meta;
+  sessionMetaCacheAt = Date.now();
   try {
     const dir = dirname4(sessionMetaPath());
     mkdirSync2(dir, { recursive: true });
@@ -86684,12 +86815,18 @@ function removeSessionMeta(sessionId) {
   }
 }
 var sessionEventsCache = /* @__PURE__ */ new WeakMap();
+function sessionEventReader(session) {
+  if (session === void 0 || session === null) return null;
+  if (Array.isArray(session.events)) return { kind: "array", events: session.events };
+  if (typeof session.snapshotEvents === "function") return { kind: "snapshot" };
+  if (typeof session.ownEvents === "function") return { kind: "own" };
+  return null;
+}
 function sessionEventsOf(session) {
-  if (session === void 0 || session === null) return [];
-  if (Array.isArray(session.events)) return session.events;
-  if (typeof session.snapshotEvents !== "function") {
-    return typeof session.ownEvents === "function" ? session.ownEvents() : [];
-  }
+  const reader = sessionEventReader(session);
+  if (reader === null) return [];
+  if (reader.kind === "array") return reader.events;
+  if (reader.kind === "own") return session.ownEvents();
   const hit = sessionEventsCache.get(session);
   const now = Date.now();
   if (hit !== void 0 && now - hit.at < 250) return hit.list;
@@ -86726,15 +86863,27 @@ async function inspectStoredSession(ctx, sessionId) {
 var SESSION_LOG_RE = /^session(?:\.v(\d+))?\.jsonl(?:\.zstd?)?$/;
 function sessionEventsSince(session, fromSeq) {
   const from2 = Number.isFinite(fromSeq) && fromSeq > 0 ? Math.floor(fromSeq) : 0;
-  if (session === void 0 || session === null) return [];
-  if (Array.isArray(session.events)) {
-    return from2 === 0 ? session.events : session.events.slice(from2);
+  const reader = sessionEventReader(session);
+  if (reader === null) return [];
+  if (reader.kind === "array") return from2 === 0 ? reader.events : reader.events.slice(from2);
+  if (reader.kind === "own") return session.ownEvents();
+  return from2 === 0 ? session.snapshotEvents() : session.snapshotEvents(from2);
+}
+function olderSessionEvents(events, beforeSeq, limit3) {
+  const older = [];
+  let hasMore = false;
+  for (let i2 = events.length - 1; i2 >= 0; i2--) {
+    const e2 = events[i2];
+    if (e2.type === "assistant/chunk" || e2.type === "session/end-seed") continue;
+    if ((e2.seq ?? 0) >= beforeSeq) continue;
+    if (older.length < limit3) older.push(e2);
+    else {
+      hasMore = true;
+      break;
+    }
   }
-  if (typeof session.snapshotEvents === "function") {
-    return from2 === 0 ? session.snapshotEvents() : session.snapshotEvents(from2);
-  }
-  if (typeof session.ownEvents === "function") return session.ownEvents();
-  return [];
+  older.reverse();
+  return { older, hasMore };
 }
 function sessionLogGeneration(name) {
   const m2 = SESSION_LOG_RE.exec(name);
@@ -86776,7 +86925,14 @@ function sessionFileSize(sessionId) {
     const hit = sessionSizeCache.get(key);
     if (hit !== void 0 && now - hit.at < SESSION_SIZE_CACHE_TTL) return hit.size;
     const root = dshHomePath("sessions-ay-dsh");
-    const dir = join4(root, projectKey(process.cwd()), encodeSegment(key));
+    let dir = null;
+    for (const entry of scanSessionDirs()) {
+      if (entry.id === key) {
+        dir = dirname4(entry.logPath);
+        break;
+      }
+    }
+    if (dir === null) dir = join4(root, projectKey(process.cwd()), encodeSegment(key));
     let size;
     const logPath = pickSessionLog(dir);
     if (logPath !== null) size = statSync3(logPath).size;
@@ -86853,6 +87009,7 @@ function readTextFile(p) {
   return "";
 }
 var LEARNING_SIGNAL_RE = /记住|教训|经验|以后|规则|禁止|不要|千万别|务必|必须|always|never|remember|rule|lesson|do not|don't/i;
+var INJECTION_SIGNAL_RE = /忽略|无视|系统提示|system\s*prompt|system\s*message|外泄|泄露|泄漏|leak|exfiltrat|密钥|api\s*key|credential|secret|password/i;
 async function maybeLearnFromTurn(ctx, agent, userText) {
   if (String(process.env.DSH_ENABLE_LEARN ?? "0") === "0") return;
   if (typeof userText !== "string" || userText.trim() === "") return;
@@ -86884,15 +87041,21 @@ async function maybeLearnFromTurn(ctx, agent, userText) {
     }
     const text = assembler.blocks().map((b) => b.type === "text" ? b.text : "").join("").trim();
     if (text.length === 0) return;
-    const clean = text.replace(/^[-•*\s]+/, "").slice(0, 200);
+    const collapsed = text.replace(/```[\s\S]*?```/g, " ").replace(/[#*_>`~|]/g, " ").replace(/\s+/g, " ").trim();
+    if (collapsed.length < 20 || collapsed.length > 200) return;
+    if (INJECTION_SIGNAL_RE.test(collapsed)) return;
+    const clean = collapsed;
     const file = LEARNING_FILE;
     const existing = existsSync2(file) ? readFileSync2(file, "utf8") : "";
     if (existing.includes(clean)) return;
+    if (existing.length > 64 * 1024) return;
     const next = existing.trim() ? `${existing.trim()}
 
 - ${clean}` : `- ${clean}`;
     mkdirSync2(dirname4(file), { recursive: true });
-    writeFileSync2(file, next, "utf8");
+    const tmp = `${file}.tmp`;
+    writeFileSync2(tmp, next, "utf8");
+    renameSync(tmp, file);
     log("info", `learned rule: ${clean}`);
   } catch (e2) {
     log("warn", "auto-learn llm failed", e2 instanceof Error ? e2.message : String(e2));
@@ -87004,6 +87167,7 @@ function computeSessionStats(events, base) {
   if (base?.title) stats.title = base.title;
   if (base?.contextWindow) stats.contextWindow = base.contextWindow;
   if (base?.model) stats.model = base.model;
+  if (base?.lastRequestInput) stats.lastRequestInput = base.lastRequestInput;
   for (const e2 of events) {
     if (base !== void 0 && (e2.seq ?? 0) <= base.lastSeq) continue;
     const d = e2.data ?? {};
@@ -87029,12 +87193,12 @@ function computeSessionStats(events, base) {
   }
   return stats;
 }
-function resolveSessionStats(metaStats, events, sessionId) {
-  const maxSeq = events.reduce((m2, e2) => Math.max(m2, e2.seq ?? 0), 0);
+function resolveSessionStats(metaStats, events, sessionId, persist = true) {
+  const maxSeq = events.length > 0 ? events[events.length - 1].seq ?? 0 : 0;
   if (metaStats && Number.isFinite(metaStats.lastSeq) && metaStats.lastSeq <= maxSeq) {
     if (metaStats.lastSeq === maxSeq) return metaStats;
     const stats2 = computeSessionStats(events, metaStats);
-    try {
+    if (persist) try {
       const meta = loadSessionMeta();
       meta[sessionId] = { ...meta[sessionId] ?? {}, stats: { ...stats2 } };
       saveSessionMeta(meta);
@@ -87044,7 +87208,7 @@ function resolveSessionStats(metaStats, events, sessionId) {
     return stats2;
   }
   const stats = computeSessionStats(events);
-  try {
+  if (persist) try {
     const meta = loadSessionMeta();
     meta[sessionId] = { ...meta[sessionId] ?? {}, stats: { ...stats } };
     saveSessionMeta(meta);
@@ -87054,7 +87218,6 @@ function resolveSessionStats(metaStats, events, sessionId) {
   return stats;
 }
 var SESSION_LOCK_NAME = ".host-lock.json";
-var hostToken = globalThis.crypto?.randomUUID?.() ?? `h-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
 var currentSessionLock = null;
 function processAlive(pid) {
   try {
@@ -87076,7 +87239,6 @@ function clearOwnLock() {
   currentSessionLock = null;
 }
 function acquireSessionLock(sessionId) {
-  clearOwnLock();
   let dir = null;
   try {
     for (const entry of scanSessionDirs()) {
@@ -87089,19 +87251,22 @@ function acquireSessionLock(sessionId) {
   }
   if (dir === null) dir = sessionDirFor(sessionId);
   const file = join4(dir, SESSION_LOCK_NAME);
+  if (currentSessionLock !== null && currentSessionLock.file === file) {
+    return { ok: true };
+  }
   try {
     mkdirSync2(dir, { recursive: true });
   } catch {
   }
   const payload = JSON.stringify({
     pid: process.pid,
-    hostToken,
     project: projectKey(process.cwd()),
     acquiredAt: Date.now()
   });
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
       writeFileSync2(file, payload, { flag: "wx" });
+      clearOwnLock();
       currentSessionLock = { file };
       return { ok: true };
     } catch (err) {
@@ -87121,9 +87286,11 @@ function acquireSessionLock(sessionId) {
         continue;
       }
       log("warn", "session lock acquire degraded", err instanceof Error ? err.message : String(err));
+      clearOwnLock();
       return { ok: true, degraded: true };
     }
   }
+  clearOwnLock();
   return { ok: true, degraded: true };
 }
 async function pauseLegacyActiveGoal(ctx, agent) {
@@ -87172,6 +87339,16 @@ function projectKey(cwd) {
   }
   return `--${(readable.replace(/^-+/, "") || "root").slice(0, 251)}--`;
 }
+function isSessionLockedByOther(dir) {
+  try {
+    const holder = JSON.parse(readFileSync2(join4(dir, SESSION_LOCK_NAME), "utf8"));
+    if (holder !== null && Number.isInteger(holder.pid) && holder.pid !== process.pid && processAlive(holder.pid)) {
+      return true;
+    }
+  } catch {
+  }
+  return false;
+}
 async function deleteSession(ctx, sessionId) {
   try {
     let dir = null;
@@ -87185,6 +87362,13 @@ async function deleteSession(ctx, sessionId) {
       const query = ctx.get("sessionQuery");
       const cwd = query !== void 0 ? (await query.readSession(SessionId(sessionId))).session.cwd ?? process.cwd() : process.cwd();
       dir = join4(dshHomePath("sessions-ay-dsh"), projectKey(cwd), encodeSegment(sessionId));
+    }
+    const lockFile = join4(dir, SESSION_LOCK_NAME);
+    if (currentSessionLock !== null && currentSessionLock.file === lockFile) {
+      return { ok: false, error: "\u6B63\u5728\u4F7F\u7528\u7684\u4F1A\u8BDD\u65E0\u6CD5\u5220\u9664\uFF0C\u8BF7\u5148\u5207\u6362\u5230\u5176\u5B83\u4F1A\u8BDD\u6216\u65B0\u5EFA\u4F1A\u8BDD" };
+    }
+    if (isSessionLockedByOther(dir)) {
+      return { ok: false, error: "\u4F1A\u8BDD\u6B63\u88AB\u53E6\u4E00 VS Code \u5B9E\u4F8B\u4F7F\u7528\u4E2D\uFF0C\u65E0\u6CD5\u5220\u9664" };
     }
     if (pickSessionLog(dir) === null) {
       return { ok: false, error: `\u4F1A\u8BDD\u6587\u4EF6\u4E0D\u5B58\u5728: ${dir}` };
@@ -87319,7 +87503,8 @@ async function exportSession(ctx, sessionId) {
     parts.push(`</body></html>`);
     const exportDir = join4(process.cwd(), "exports");
     mkdirSync2(exportDir, { recursive: true });
-    const outPath = join4(exportDir, `${sessionId}.html`);
+    const safeId = /^[A-Za-z0-9._-]+$/.test(String(sessionId)) ? sessionId : "session";
+    const outPath = join4(exportDir, `${safeId}.html`);
     writeFileSync2(outPath, parts.join("\n"), "utf8");
     return { ok: true, path: outPath };
   } catch (error) {
@@ -87329,8 +87514,7 @@ async function exportSession(ctx, sessionId) {
 async function main() {
   const env = { ...process.env };
   const pump2 = new EventPump(
-    () => agent === void 0 || agent.session === void 0 ? void 0 : sessionFileSize(String(agent.session.id)),
-    void 0
+    () => agent === void 0 || agent.session === void 0 ? void 0 : sessionFileSize(String(agent.session.id))
   );
   const approvals = { nextId: /* @__PURE__ */ (() => {
     let n = 0;
@@ -87501,8 +87685,9 @@ ${summary}` }] }
       version: CORE_VERSION
     });
     log("info", "host ready (lazy session)");
-    if (process.env.DSH_SELF_TEST === "1") {
-      process.stdout.write("DSH_SELF_TEST_OK\n");
+    if (typeof process.env.DSH_SELF_TEST === "string" && process.env.DSH_SELF_TEST !== "" && process.env.DSH_SELF_TEST !== "0") {
+      process.stdout.write(`${process.env.DSH_SELF_TEST}
+`);
       log("info", "self-test ok \u2014 exiting");
       process.exit(0);
     }
@@ -87547,7 +87732,7 @@ ${summary}` }] }
   process.on("SIGINT", () => void shutdown(0));
   const rl = createInterface2({ input: process.stdin, crlfDelay: Infinity });
   let criticalQueue = Promise.resolve();
-  const CRITICAL_FRAMES = /* @__PURE__ */ new Set(["chat", "newSession", "resumeSession", "deleteSession", "compact"]);
+  const CRITICAL_FRAMES = /* @__PURE__ */ new Set(["chat", "newSession", "resumeSession", "restorePreview", "deleteSession", "compact"]);
   rl.on("line", (line) => {
     if (line.trim() === "") return;
     let msg;
@@ -87875,7 +88060,7 @@ ${meta.seedSummary}` }],
             const tail = events.slice(-limit3);
             const hasMore = events.length > tail.length;
             const nextSeq = hasMore ? tail[0].seq : void 0;
-            const stats = resolveSessionStats(getSessionMeta(msg.id).stats, events, msg.id);
+            const stats = resolveSessionStats(getSessionMeta(msg.id).stats, events, msg.id, false);
             post({ t: "history", sessionId: msg.id, events: tail, hasMore, nextSeq, stats });
             post({ t: "viewSession", id: msg.id });
           } catch (error) {
@@ -87891,11 +88076,7 @@ ${meta.seedSummary}` }],
           }
           const limit3 = Number.isInteger(msg.limit) && msg.limit > 0 ? msg.limit : 200;
           if (agent !== void 0) {
-            const allEvents = sessionEventsOf(agent.session).filter(
-              (e2) => e2.type !== "assistant/chunk" && e2.type !== "session/end-seed"
-            );
-            const older = allEvents.filter((e2) => e2.seq < msg.beforeSeq).slice(-limit3);
-            const hasMore = allEvents.some((e2) => e2.seq < (older[0]?.seq ?? msg.beforeSeq));
+            const { older, hasMore } = olderSessionEvents(sessionEventsOf(agent.session), msg.beforeSeq, limit3);
             post({
               t: "historyMore",
               sessionId: agent.session.id,
@@ -87906,11 +88087,7 @@ ${meta.seedSummary}` }],
           } else if (typeof msg.sessionId === "string" && msg.sessionId !== "") {
             try {
               const inspected = await inspectStoredSession(ctx, msg.sessionId);
-              const allEvents = (inspected.events ?? []).filter(
-                (e2) => e2.type !== "assistant/chunk" && e2.type !== "session/end-seed"
-              );
-              const older = allEvents.filter((e2) => e2.seq < msg.beforeSeq).slice(-limit3);
-              const hasMore = allEvents.some((e2) => e2.seq < (older[0]?.seq ?? msg.beforeSeq));
+              const { older, hasMore } = olderSessionEvents(inspected.events ?? [], msg.beforeSeq, limit3);
               post({
                 t: "historyMore",
                 sessionId: msg.sessionId,
@@ -88073,40 +88250,63 @@ ${meta.seedSummary}` }],
           try {
             const llm = ctx.get("llm");
             const defaultModel = ctx.get("agentDefaultModel");
-            let providers = [];
-            if (llm !== void 0 && typeof llm.listProviders === "function") {
-              providers = llm.listProviders().map((p) => ({ id: p.id, name: p.id === "deepseek-official" ? "DeepSeek (Official)" : p.name ?? p.id }));
-            }
-            if (providers.length === 0) {
-              providers = [{ id: "deepseek-official", name: "DeepSeek" }];
-            }
+            let providers = dshProviders.map((p) => ({ id: p.id, name: p.name }));
             const providerModels = {};
             let models = [];
-            if (llm !== void 0 && typeof llm.listModels === "function" && providers.length > 0) {
+            if (dshProviders.length > 0) {
               const merged = /* @__PURE__ */ new Set();
-              for (const p of providers) {
+              for (const p of dshProviders) {
+                const metaById = /* @__PURE__ */ new Map();
                 try {
-                  const listed = await llm.listModels(p.id);
-                  const entries = listed.map((m2) => {
-                    const e2 = { id: m2.id, name: m2.name || m2.id };
-                    if (Array.isArray(m2.inputModalities)) e2.inputModalities = m2.inputModalities;
-                    return e2;
-                  });
-                  providerModels[p.id] = entries;
-                  for (const e2 of entries) merged.add(e2.id);
+                  if (llm !== void 0 && typeof llm.listModels === "function") {
+                    const listed = await llm.listModels(p.id);
+                    for (const m2 of Array.isArray(listed) ? listed : []) {
+                      if (m2 && typeof m2.id === "string" && m2.id !== "") metaById.set(m2.id, m2);
+                    }
+                  }
                 } catch {
-                  providerModels[p.id] = [];
                 }
+                const entries = (p.models ?? []).filter((m2) => m2 && typeof m2.id === "string" && m2.id !== "").map((m2) => {
+                  const info = metaById.get(m2.id);
+                  const e2 = { id: m2.id, name: m2.displayName || m2.name || info?.name || m2.id };
+                  const mods = Array.isArray(m2.inputModalities) ? m2.inputModalities : info?.inputModalities;
+                  if (Array.isArray(mods) && mods.length > 0) e2.inputModalities = mods;
+                  return e2;
+                });
+                providerModels[p.id] = entries;
+                for (const e2 of entries) merged.add(e2.id);
               }
               models = [...merged];
+            } else {
+              if (llm !== void 0 && typeof llm.listProviders === "function") {
+                providers = llm.listProviders().map((p) => ({ id: p.id, name: p.id === "deepseek-official" ? "DeepSeek (Official)" : p.name ?? p.id }));
+              }
+              if (llm !== void 0 && typeof llm.listModels === "function" && providers.length > 0) {
+                const merged = /* @__PURE__ */ new Set();
+                for (const p of providers) {
+                  try {
+                    const listed = await llm.listModels(p.id);
+                    const entries = listed.map((m2) => {
+                      const e2 = { id: m2.id, name: m2.name || m2.id };
+                      if (Array.isArray(m2.inputModalities)) e2.inputModalities = m2.inputModalities;
+                      return e2;
+                    });
+                    providerModels[p.id] = entries;
+                    for (const e2 of entries) merged.add(e2.id);
+                  } catch {
+                    providerModels[p.id] = [];
+                  }
+                }
+                models = [...merged];
+              }
             }
-            if (models.length === 0) {
+            if (models.length === 0 && dshProviders.length === 0) {
               const cur = defaultModel?.currentSelection?.();
-              const extra2 = /* @__PURE__ */ new Set(["deepseek-v4-flash", "deepseek-v4-pro"]);
-              if (cur?.model) extra2.add(cur.model);
-              models = [...extra2];
-              for (const p of providers) {
-                providerModels[p.id] = providerModels[p.id]?.length ? providerModels[p.id] : [...extra2].map((id) => ({ id, name: id }));
+              const extra2 = new Set(cur?.model ? [cur.model] : []);
+              if (extra2.size > 0) models = [...extra2];
+              if (providers.length === 0 && extra2.size > 0) {
+                providers = [{ id: cur.provider || "deepseek-official", name: cur.provider === "deepseek-official" ? "DeepSeek (Official)" : cur.provider || "deepseek-official" }];
+                providerModels[providers[0].id] = [...extra2].map((id) => ({ id, name: id }));
               }
             }
             const current = selection !== null && selection.provider && selection.model ? { provider: selection.provider, model: selection.model, reasoningEffort: selection.reasoningEffort } : defaultModel?.currentSelection?.() ?? { provider: "", model: "" };
@@ -88153,7 +88353,7 @@ ${meta.seedSummary}` }],
         case "llmProviders": {
           try {
             const llm = ctx.get("llm");
-            const skip = (id) => id === "deepseek-official";
+            const skip = () => false;
             const catalogNames = /* @__PURE__ */ new Map();
             const catalogBaseUrls = /* @__PURE__ */ new Map();
             try {
@@ -88166,7 +88366,7 @@ ${meta.seedSummary}` }],
             const providers = [];
             if (llm && typeof llm.listProviders === "function") {
               for (const p of llm.listProviders()) {
-                if (!skip(p.id)) providers.push({ id: p.id, name: p.name, baseUrl: catalogBaseUrls.get(p.id) });
+                if (!skip(p.id)) providers.push({ id: p.id, name: p.id === "deepseek-official" ? "DeepSeek (Official)" : p.name ?? p.id, baseUrl: catalogBaseUrls.get(p.id) });
               }
             }
             if (llm && typeof llm.listConfigurableProviders === "function") {
@@ -88180,6 +88380,9 @@ ${meta.seedSummary}` }],
                 }
               }
             }
+            if (!providers.some((x2) => x2.id === "ollama")) {
+              providers.push({ id: "ollama", name: "Ollama (local)", baseUrl: "http://localhost:11434/v1" });
+            }
             post({ t: "llmProviders", id: msg.id, providers });
           } catch (error) {
             log("error", "listProviders failed", error instanceof Error ? error.message : String(error));
@@ -88190,6 +88393,33 @@ ${meta.seedSummary}` }],
         case "discoverModels": {
           try {
             const llm = ctx.get("llm");
+            if (msg.provider === "deepseek-official" && llm && typeof llm.listModels === "function") {
+              if (typeof msg.model === "string" && msg.model !== "") {
+                let contextWindow;
+                let maxTokens;
+                if (typeof llm.resolveModelInfo === "function") {
+                  try {
+                    const info = await llm.resolveModelInfo(msg.provider, msg.model, void 0);
+                    const ctxWin = info?.context?.contextWindow;
+                    if (typeof ctxWin === "number") contextWindow = ctxWin;
+                    if (typeof info?.defaultMaxTokens === "number") maxTokens = info.defaultMaxTokens;
+                  } catch {
+                  }
+                }
+                post({ t: "discoveredModels", id: msg.id, models: [{ id: msg.model, contextWindow, maxTokens }] });
+                break;
+              }
+              const listed = await llm.listModels(msg.provider);
+              const models = (Array.isArray(listed) ? listed : []).filter((m2) => m2 && typeof m2.id === "string" && m2.id !== "").map((m2) => {
+                const entry = { id: m2.id, name: m2.name || m2.id };
+                if (Array.isArray(m2.inputModalities)) entry.inputModalities = m2.inputModalities;
+                if (typeof m2.contextWindow === "number") entry.contextWindow = m2.contextWindow;
+                if (typeof m2.maxTokens === "number") entry.maxTokens = m2.maxTokens;
+                return entry;
+              });
+              post({ t: "discoveredModels", id: msg.id, models });
+              break;
+            }
             if (llm && typeof llm.discoverModels === "function") {
               const models = await llm.discoverModels("llm-pi-ai", {
                 provider: typeof msg.provider === "string" ? msg.provider : void 0,
@@ -88235,9 +88465,36 @@ ${meta.seedSummary}` }],
           }
           break;
         }
+        case "toolCatalog": {
+          try {
+            const tools = ctx.get("tools");
+            let schemas = [];
+            if (tools && typeof tools.schemas === "function") {
+              try {
+                schemas = tools.schemas(agent ?? void 0) ?? [];
+              } catch {
+                schemas = [];
+              }
+            }
+            const list = (Array.isArray(schemas) ? schemas : []).map((s3) => ({
+              name: typeof s3?.name === "string" ? s3.name : "",
+              description: typeof s3?.description === "string" ? s3.description : "",
+              fields: s3 && s3.parameters && typeof s3.parameters === "object" && s3.parameters.properties && typeof s3.parameters.properties === "object" ? Object.keys(s3.parameters.properties) : []
+            })).filter((s3) => s3.name !== "");
+            post({ t: "toolCatalog", id: msg.id, tools: list });
+          } catch (error) {
+            post({ t: "toolCatalog", id: msg.id, tools: [], error: error instanceof Error ? error.message : String(error) });
+          }
+          break;
+        }
         case "providersApply": {
           try {
             const list = Array.isArray(msg.providers) ? msg.providers : [];
+            dshProviders = list.filter((p) => p && typeof p.id === "string" && p.id !== "").map((p) => ({
+              id: p.id,
+              name: p.name || p.id,
+              models: Array.isArray(p.models) ? p.models.map((m2) => typeof m2 === "string" ? { id: m2 } : { ...m2 }).filter((m2) => m2 && m2.id) : []
+            }));
             const settings = ctx.get("settings");
             const credentials = ctx.get("credentials");
             const section = { providers: {} };
@@ -88255,8 +88512,10 @@ ${meta.seedSummary}` }],
               const profile = {
                 displayName: p.name || p.id,
                 api: p.protocol || "openai-completions",
-                baseURL: p.baseUrl || void 0,
-                models: Array.isArray(p.models) ? p.models.map((m2) => {
+                baseURL: p.baseUrl || void 0
+              };
+              if (Array.isArray(p.models) && p.models.length > 0) {
+                profile.models = p.models.map((m2) => {
                   const mid = typeof m2 === "string" ? m2 : m2?.id;
                   if (!mid) return void 0;
                   const out = { id: mid };
@@ -88268,8 +88527,8 @@ ${meta.seedSummary}` }],
                     if (maxTok !== void 0) out.maxTokens = maxTok;
                   }
                   return out;
-                }).filter(Boolean) : []
-              };
+                }).filter(Boolean);
+              }
               if (typeof p.apiKey === "string" && p.apiKey !== "") {
                 profile.apiKeyEnv = ref;
                 if (credentials) await credentials.set(credentialRef(ref), p.apiKey);
@@ -88283,6 +88542,7 @@ ${meta.seedSummary}` }],
             }
             effortCapabilityCache.clear();
             effortAdaptedCache.clear();
+            log("info", "[adapt] effort caches cleared (providersApply)");
             post({ t: "providersApplied", id: msg.id, ok: true });
           } catch (error) {
             log("error", "providersApply failed", error instanceof Error ? error.message : String(error));
@@ -88342,10 +88602,50 @@ ${meta.seedSummary}` }],
     } catch (error) {
       log("error", "frame handling failed", error instanceof Error ? error.stack ?? error.message : String(error));
       const message = error instanceof Error ? error.message : String(error);
-      if (msg.t === "resumeSession") {
-        post({ t: "sessionResumed", id: msg.id, ok: false, error: message });
-      } else if (msg.id !== void 0) {
-        post({ t: "chatDone", id: msg.id, ok: false, error: message });
+      const id = msg.id;
+      switch (msg.t) {
+        case "resumeSession":
+          post({ t: "sessionResumed", id, ok: false, error: message });
+          break;
+        case "deleteSession":
+          post({ t: "sessionDeleted", id, ok: false, error: message });
+          break;
+        case "renameSession":
+          post({ t: "sessionRenamed", id, ok: false, error: message });
+          break;
+        case "exportSession":
+          post({ t: "sessionExported", id, ok: false, error: message });
+          break;
+        case "compact":
+          post({ t: "compactDone", id, ok: false, error: message });
+          break;
+        case "loadMoreHistory":
+          post({ t: "historyMore", sessionId: typeof msg.sessionId === "string" ? msg.sessionId : "", events: [], hasMore: false });
+          break;
+        case "restorePreview":
+        case "viewSession":
+          post({ t: "viewSessionFailed", id: msg.id, error: message });
+          break;
+        case "chat":
+          post({ t: "chatDone", id, ok: false, error: message });
+          break;
+        case "readAttachment":
+          post({ t: "attachmentResult", id, ok: false });
+          break;
+        case "discoverModels":
+          post({ t: "discoveredModels", id, models: [], error: message });
+          break;
+        case "llmProviders":
+          post({ t: "llmProviders", id, providers: [] });
+          break;
+        case "toolCatalog":
+          post({ t: "toolCatalog", id, tools: [], error: message });
+          break;
+        case "providersApply":
+          post({ t: "providersApplied", id, ok: false, error: message });
+          break;
+        default:
+          break;
       }
     }
   }
