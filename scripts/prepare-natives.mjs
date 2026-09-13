@@ -237,8 +237,12 @@ function readAddonSystemPlatforms() {
       readFileSync(join(root, "node_modules", "@deepseek-ai", "node-addon-system", "package.json"), "utf8")
     );
     entryVersion = sj.version || "";
+    const scopePrefix = "@deepseek-ai/";
     for (const [name, v] of Object.entries(sj.optionalDependencies || {})) {
-      if (name.startsWith("node-addon-system-")) pkgVersions[name] = v;
+      // optionalDependencies 的键是完整作用域名（@deepseek-ai/node-addon-system-*），
+      // 去作用域后才是 ensurePlatformPackage 需要的非作用域包名。
+      const unscoped = name.startsWith(scopePrefix) ? name.slice(scopePrefix.length) : name;
+      if (unscoped.startsWith("node-addon-system-")) pkgVersions[unscoped] = v;
     }
   } catch { /* keep empty */ }
   return { entryVersion, pkgVersions };
