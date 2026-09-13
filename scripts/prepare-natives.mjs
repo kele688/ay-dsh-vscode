@@ -12,6 +12,10 @@
  *      — downloaded from the npm registry;
  *   2. node-pty linux prebuild — from scripts/.natives/ (built once on a
  *      Linux machine; win32/darwin prebuilds ship with the npm package).
+ *   3. @deepseek-ai/node-addon-system platform packages (flock / landlock-run
+ *      native binaries) — downloaded from the npm registry; npm skips them on
+ *      the Windows packaging machine because they carry `os`/`cpu` fields, yet
+ *      they are REQUIRED on linux/darwin (session restore calls flock).
  * Prints a manifest when done; exits with an error if anything is missing.
  *
  * One-time node-pty linux prebuild (needs one Linux machine):
@@ -224,6 +228,41 @@ async function ensureSharp() {
   }
 }
 
+/** 读取 @deepseek-ai/node-addon-system 入口包的版本与其 optionalDependencies 平台包映射。 */
+function readAddonSystemPlatforms() {
+  let entryVersion = "";
+  const pkgVersions = {};
+  try {
+    const sj = JSON.parse(
+      readFileSync(join(root, "node_modules", "@deepseek-ai", "node-addon-system", "package.json"), "utf8")
+    );
+    entryVersion = sj.version || "";
+    for (const [name, v] of Object.entries(sj.optionalDependencies || {})) {
+      if (name.startsWith("node-addon-system-")) pkgVersions[name] = v;
+    }
+  } catch { /* keep empty */ }
+  return { entryVersion, pkgVersions };
+}
+
+/** @deepseek-ai/node-addon-system 平台包补齐（仿 ensureSharp）：
+ *  flock（会话日志加锁，恢复会话时必经）与 landlock-run（Linux 本地沙箱启动器）
+ *  的原生二进制按平台分装在 `@deepseek-ai/node-addon-system-<platform>-<arch>` 中，
+ *  由入口包 optionalDependencies 声明（带 `os`/`cpu` 字段）。Windows 打包机上 npm
+ *  会跳过全部 4 个平台包，导致 VSIX 在 Linux 上恢复会话时报
+ *  "Cannot find module '@deepseek-ai/node-addon-system-linux-x64/package.json'"。
+ *  版本以入口包 optionalDependencies 声明为准（勿硬编码，与 sharp/libvips 同理）。 */
+async function ensureNodeAddonSystem() {
+  const { entryVersion, pkgVersions } = readAddonSystemPlatforms();
+  if (!entryVersion) fail("cannot resolve @deepseek-ai/node-addon-system version from node_modules — run npm install first");
+  if (Object.keys(pkgVersions).length === 0) {
+    fail("@deepseek-ai/node-addon-system declares no platform packages — update prepare-natives.mjs");
+  }
+
+  for (const p of Object.keys(pkgVersions).sort()) {
+    await ensurePlatformPackage("@deepseek-ai", p, pkgVersions[p] || entryVersion);
+  }
+}
+
 async function ensureNodePty() {
   for (const plat of REQUIRED_PTY) {
     const dest = join(root, "node_modules", "node-pty", "prebuilds", plat, "pty.node");
@@ -300,12 +339,17 @@ function manifest() {
   log(`  - node-pty prebuilds: ${existsSync(join(root, "node_modules", "node-pty", "prebuilds")) ? readdirSync(join(root, "node_modules", "node-pty", "prebuilds")).join(", ") : "(none)"}`);
   log(`  - @vscode/ripgrep platform pkgs: ${REQUIRED_RIPGREP.filter((p) => existsSync(join(root, "node_modules", "@vscode", p, "package.json"))).length}/${REQUIRED_RIPGREP.length} present`);
   log(`  - @img/sharp linux pkgs: ${REQUIRED_SHARP.filter((p) => existsSync(join(root, "node_modules", "@img", p, "package.json"))).length}/${REQUIRED_SHARP.length} present (wasm32 fallback: ${existsSync(join(root, "node_modules", "@img", "sharp-wasm32", "package.json")) ? "OK" : "MISSING"})`);
+  const addonSys = Object.keys(readAddonSystemPlatforms().pkgVersions);
+  if (addonSys.length > 0) {
+    log(`  - @deepseek-ai/node-addon-system platform pkgs: ${addonSys.filter((p) => existsSync(join(root, "node_modules", "@deepseek-ai", p, "package.json"))).length}/${addonSys.length} present`);
+  }
 }
 
 try {
   await ensureKoffi();
   await ensureRipgrep();
   await ensureSharp();
+  await ensureNodeAddonSystem();
   await ensureNodePty();
   rmSync(TMP, { recursive: true, force: true });
   manifest();
