@@ -11,9 +11,12 @@ import * as path from "node:path";
 import * as fs from "node:fs";
 import * as readline from "node:readline";
 import type {
+  AskQuestionView,
   ExtensionFrame,
   HostFrame,
+  JobView,
   ProviderApplyItem,
+  QuestionAnswerItem,
   SessionEvent,
   SessionStats,
   SessionSummary,
@@ -130,6 +133,13 @@ export type HostEvent =
   | { type: "rotateRequest"; oldTitle?: string; sessionBytes?: number }
   | { type: "rotateWorking" }
   | { type: "sessionSize"; bytes: number }
+  | { type: "question"; id: number; questions: AskQuestionView[]; agentId?: string }
+  | { type: "questionGone"; id: number }
+  | { type: "planMode"; active: boolean; pending?: boolean; result?: string; error?: string }
+  | { type: "jobs"; jobs: JobView[]; error?: string }
+  | { type: "jobsChanged" }
+  | { type: "jobKilled"; ok: boolean; result?: string; error?: string }
+  | { type: "jobOutput"; ok: boolean; text?: string; error?: string }
   | { type: "exit"; code: number; error?: string }
   | { type: "log"; level: string; message: string };
 
@@ -444,6 +454,10 @@ export class AgentHost {
           sessionTitle: frame.sessionTitle,
           sessionBytes: frame.sessionBytes,
         });
+        // plan 模式状态查询：ready 是"某个会话成为当前会话"的统一时点，在此补拉一次
+        // 开关态，避免在宿主侧 7 个 ready 出口各写一遍（resume/fork/外部驱动的模式
+        // 变化另有 plan/mode 事件推送）。
+        this.requestPlanMode();
         break;
       }
       case "status": {
@@ -664,6 +678,34 @@ export class AgentHost {
       }
       case "modelAdapted": {
         this.emit({ type: "modelAdapted", provider: frame.provider, model: frame.model, from: frame.from, to: frame.to });
+        break;
+      }
+      case "question": {
+        this.emit({ type: "question", id: frame.id, questions: frame.questions, agentId: frame.agentId });
+        break;
+      }
+      case "questionGone": {
+        this.emit({ type: "questionGone", id: frame.id });
+        break;
+      }
+      case "planMode": {
+        this.emit({ type: "planMode", active: frame.active, pending: frame.pending, result: frame.result, error: frame.error });
+        break;
+      }
+      case "jobs": {
+        this.emit({ type: "jobs", jobs: frame.jobs, error: frame.error });
+        break;
+      }
+      case "jobsChanged": {
+        this.emit({ type: "jobsChanged" });
+        break;
+      }
+      case "jobKilled": {
+        this.emit({ type: "jobKilled", ok: frame.ok, result: frame.result, error: frame.error });
+        break;
+      }
+      case "jobOutput": {
+        this.emit({ type: "jobOutput", ok: frame.ok, text: frame.text, error: frame.error });
         break;
       }
       case "exit": {
@@ -995,6 +1037,48 @@ export class AgentHost {
   /** 触发一次手动上下文压缩（/compact）。 */
   compact(): void {
     this.send({ t: "compact", id: ++this.chatSeq });
+  }
+
+  /* ------------------------- 用户问答（user-questions） ------------------------- */
+
+  /**
+   * 回填用户对内核 `user-questions/request` 的回答。
+   *
+   * 宿主侧会校验答案形状（每题必须给出本题**自己的**选项标签；plan-review 的
+   * approve 标签由内核在提问时校验过），非法即 fail-closed（按 ASK_ABORTED 结束），
+   * 因此这里只做转发。`cancel` 仅由 plan-review 卡的"先讨论一下"使用。
+   */
+  resolveQuestion(id: number, outcome: "answer" | "cancel", answers?: QuestionAnswerItem[]): void {
+    this.send(outcome === "cancel" ? { t: "question:resolve", id, outcome } : { t: "question:resolve", id, outcome, answers });
+  }
+
+  /** 请求宿主上报 plan 模式状态（ready 后自动调用；UI 也可按需刷新）。 */
+  requestPlanMode(): void {
+    this.send({ t: "getPlanMode" });
+  }
+
+  /** 切换 plan 模式（内核 `ctx.planMode.set`；进出只在提示词段落与工具语义上生效）。 */
+  setPlanMode(active: boolean): void {
+    this.send({ t: "setPlanMode", active });
+  }
+
+  /* --------------------------- 后台作业（ctx.jobs） ---------------------------
+     三个请求都是**即发即忘**（无 promise 应答）——与 `listSessions` 同理，故不带
+     请求序号：没有相关性消费方时，编号属于死字段。 */
+
+  /** 列出当前会话可见的后台作业（该 agent 拥有的 + 无主的）。 */
+  listJobs(): void {
+    this.send({ t: "listJobs" });
+  }
+
+  /** 请求取消一个后台作业。 */
+  killJob(jobId: string): void {
+    this.send({ t: "jobKill", jobId });
+  }
+
+  /** 读取一个**已结束**作业的最终输出（运行中读取会占用模型的读取游标，宿主会拒绝）。 */
+  readJobOutput(jobId: string): void {
+    this.send({ t: "jobOutput", jobId });
   }
 
   /** 查询 DSH 提供商目录（已注册路由 + 可配置目录合并；配置面板 Provider ID 下拉用）。 */

@@ -48,6 +48,39 @@ export interface SessionSummary {
   model?: string;
 }
 
+/** 一个待用户回答的问题（内核 `user-questions/request` 的可序列化投影）。
+ *  形状对齐 `@deepseek-ai/dsh-user-questions` 的 `AskUserQuestionItem`：
+ *  答案按 `id` 回填 `selected`（选项标签，非位置）。 */
+export interface AskQuestionView {
+  id: string;
+  question: string;
+  /** plan-review 时是待评审的计划 markdown；通用问答时是补充说明。 */
+  detail?: string;
+  header?: string;
+  options?: { label: string; description?: string }[];
+  multiSelect?: boolean;
+  /** 呈现意图：`plan-review` 时 UI 应渲染为"计划评审"决定卡而非通用选项列表。 */
+  intent?: { kind: "plan-review"; approve: string };
+}
+
+/** 用户对单个问题的回答（回填给内核，`selected` 用选项标签原文）。 */
+export interface QuestionAnswerItem {
+  id: string;
+  selected: string[];
+  custom?: string;
+}
+
+/** 后台作业快照（内核 `ctx.jobs.list()` 的可序列化投影，已剔除 Agent/SessionId 等不可序列化字段）。 */
+export interface JobView {
+  id: string;
+  kind: string;
+  label: string;
+  status: "running" | "stopping" | "completed" | "killed" | "failed";
+  detail?: string;
+  startedAt: number;
+  finishedAt?: number;
+}
+
 /** Host -> Extension */
 export type HostFrame =
   | { t: "ready"; sessionId: string; cwd: string; provider: string; model: string; version: string; sessionTitle?: string; sessionBytes?: number }
@@ -83,6 +116,13 @@ export type HostFrame =
   | { t: "rotateRequest"; oldTitle?: string; sessionBytes?: number }
   | { t: "rotateWorking" }
   | { t: "hint"; text: string }
+  | { t: "question"; id: number; questions: AskQuestionView[]; agentId?: string }
+  | { t: "questionGone"; id: number }
+  | { t: "planMode"; active: boolean; pending?: boolean; result?: string; error?: string }
+  | { t: "jobs"; jobs: JobView[]; error?: string }
+  | { t: "jobsChanged" }
+  | { t: "jobKilled"; ok: boolean; result?: string; error?: string }
+  | { t: "jobOutput"; ok: boolean; text?: string; error?: string }
   | { t: "exit"; code: number; error?: string };
 
 /** Extension -> Host */
@@ -113,6 +153,12 @@ export type ExtensionFrame =
       providers: { id: string; name?: string; baseUrl?: string; protocol?: string; models?: { id: string; displayName?: string; contextWindow?: number | string; maxOutput?: number | string }[]; apiKey?: string }[];
     }
   | { t: "rotateConfirm"; ok: boolean }
+  | { t: "question:resolve"; id: number; outcome: "answer" | "cancel"; answers?: QuestionAnswerItem[] }
+  | { t: "setPlanMode"; active: boolean }
+  | { t: "getPlanMode" }
+  | { t: "listJobs" }
+  | { t: "jobKill"; jobId: string }
+  | { t: "jobOutput"; jobId: string }
   | { t: "shutdown" };
 
 /** 提供商配置同步项（配置面板 → 宿主 llm-pi-ai settings，热生效）。 */
@@ -164,7 +210,12 @@ export type WebviewMessage =
   | { t: "dshUpgrade" }
   | { t: "dshIgnore" }
   | { t: "dshDetails" }
-  | { t: "rotateConfirm"; ok: boolean };
+  | { t: "rotateConfirm"; ok: boolean }
+  | { t: "question:resolve"; id: number; outcome: "answer" | "cancel"; answers?: QuestionAnswerItem[] }
+  | { t: "setPlanMode"; active: boolean }
+  | { t: "jobsRefresh" }
+  | { t: "jobKill"; jobId: string }
+  | { t: "jobOutput"; jobId: string };
 
 /** Extension -> Webview 的消息。 */
 export type ExtensionToWebview =
@@ -204,4 +255,10 @@ export type ExtensionToWebview =
   | { t: "sessionRotated"; oldTitle?: string; newTitle?: string; sessionBytes?: number }
   | { t: "rotateRequest"; oldTitle?: string; sessionBytes?: number }
   | { t: "rotateWorking" }
-  | { t: "sessionSize"; bytes: number };
+  | { t: "sessionSize"; bytes: number }
+  | { t: "question"; id: number; questions: AskQuestionView[]; agentId?: string }
+  | { t: "questionResolved"; id: number }
+  | { t: "planMode"; active: boolean; pending?: boolean }
+  | { t: "jobs"; jobs: JobView[]; error?: string }
+  | { t: "jobsChanged" }
+  | { t: "jobOutput"; ok: boolean; text?: string; error?: string };

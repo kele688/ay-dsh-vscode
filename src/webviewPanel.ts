@@ -8,7 +8,7 @@
 import * as vscode from "vscode";
 import * as path from "node:path";
 import type { AgentHost, HostEvent } from "./host";
-import type { ExtensionToWebview, WebviewMessage } from "./protocol";
+import type { AskQuestionView, ExtensionToWebview, WebviewMessage } from "./protocol";
 
 export interface ChatViewDeps {
   extensionUri: vscode.Uri;
@@ -65,6 +65,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private hostState: "starting" | "ready" | "exited" | "not-started" = "not-started";
   /** 未决的审批请求（webview 未就绪/重建时缓存，就绪后补发，避免工具调用永久挂起）。 */
   private pendingApprovals = new Map<number, { toolName: string; reason?: string; callId?: string; agentId?: string }>();
+  /** 未决问答（webview 重建时补发；防止"问题丢失"导致模型工具调用永久挂起）。 */
+  private pendingQuestions = new Map<number, { questions: AskQuestionView[]; agentId?: string }>();
+  /** 最近一次 plan 模式状态（webview 重建时补发）。 */
+  private lastPlanMode: { active: boolean; pending?: boolean } | undefined;
   /** 待审批时显示的状态栏项（点击聚焦面板）。 */
   private approvalStatusItem: vscode.StatusBarItem | undefined;
   /** 提示信息状态栏项（webview 内 hint 图标 + hover 之外，同步到 VS Code 状态栏）。 */
@@ -125,8 +129,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       this.hostRestartTimer = undefined;
     }
     if (!host) {
-      // 宿主销毁：清空审批缓存与状态栏
+      // 宿主销毁：清空审批/问答缓存与状态栏（未决请求随宿主进程一并消失，
+      // 保留缓存会让 webview 重建后补发一个早已不存在的请求）
       this.pendingApprovals.clear();
+      this.pendingQuestions.clear();
+      this.lastPlanMode = undefined;
       this.refreshApprovalStatusBar();
       this.hintStatusItem?.hide();
     }
@@ -305,6 +312,27 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         case "compact":
           this.host?.compact();
           break;
+        case "question:resolve": {
+          // 不信任 webview：只接受当前确实未决的问题编号；cancel 仅用于 plan-review
+          // 卡的"先讨论一下"。答案内容由宿主侧按内核契约校验（非法即 fail-closed）。
+          if (!Number.isInteger(msg.id) || !this.pendingQuestions.has(msg.id)) break;
+          const outcome = msg.outcome === "cancel" ? "cancel" : "answer";
+          this.host?.resolveQuestion(msg.id, outcome, Array.isArray(msg.answers) ? msg.answers : undefined);
+          this.pendingQuestions.delete(msg.id);
+          break;
+        }
+        case "setPlanMode":
+          this.host?.setPlanMode(msg.active === true);
+          break;
+        case "jobsRefresh":
+          this.host?.listJobs();
+          break;
+        case "jobKill":
+          if (typeof msg.jobId === "string" && msg.jobId !== "") this.host?.killJob(msg.jobId);
+          break;
+        case "jobOutput":
+          if (typeof msg.jobId === "string" && msg.jobId !== "") this.host?.readJobOutput(msg.jobId);
+          break;
         case "ready": {
           // 视图就绪：立即补发状态/配置/未就绪 bootstrap（宿主未 ready 时
           // 也给出完整 UI 骨架：标题"新会话"、下拉"加载中…"、提示"正在启动"），
@@ -345,6 +373,20 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             this.push({ t: "approval", id, toolName: a.toolName, reason: a.reason, callId: a.callId, agentId: a.agentId });
           }
           this.refreshApprovalStatusBar();
+          // 补发未决问答（同样必须在 webview 重建后回到界面，否则模型的工具调用
+          // 只能等到宿主侧超时才 fail-closed —— 用户会白等）
+          for (const [id, q] of this.pendingQuestions) {
+            this.push({
+              t: "question",
+              id,
+              questions: q.questions,
+              ...(q.agentId !== undefined ? { agentId: q.agentId } : {}),
+            });
+          }
+          // 补发 plan 模式状态（bootstrap 可能早于 planMode 帧到达）
+          if (this.lastPlanMode) {
+            this.push({ t: "planMode", active: this.lastPlanMode.active, pending: this.lastPlanMode.pending });
+          }
           const queued = this.pendingTasks.splice(0);
           for (const task of queued) void this.sendChat(task);
           // 补发未决的输入框追加（Ctrl+K Ctrl+I 引用在视图就绪前触发也不丢失）
@@ -574,6 +616,48 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         this.pendingApprovals.delete(e.id);
         this.refreshApprovalStatusBar();
         this.push({ t: "approvalResolved", id: e.id });
+        break;
+      case "question":
+        // 内核 user-questions 请求（含 plan-review 计划评审）：缓存未决问题
+        // （webview 重建时补发），推送问答卡，并聚焦面板保证用户看得到
+        // ——与审批同理，问答是"阻塞模型工具调用"的挂起，不能被漏掉。
+        this.pendingQuestions.set(e.id, { questions: e.questions, agentId: e.agentId });
+        this.push({
+          t: "question",
+          id: e.id,
+          questions: e.questions,
+          ...(e.agentId !== undefined ? { agentId: e.agentId } : {}),
+        });
+        void vscode.commands.executeCommand("dshVscode.chatView.focus");
+        break;
+      case "questionGone":
+        this.pendingQuestions.delete(e.id);
+        this.push({ t: "questionResolved", id: e.id });
+        break;
+      case "planMode":
+        this.lastPlanMode = { active: e.active, pending: e.pending };
+        this.push({ t: "planMode", active: e.active, pending: e.pending });
+        if (e.error !== undefined) {
+          vscode.window.setStatusBarMessage(loc(`Plan 模式切换失败：${e.error}`, `Plan mode switch failed: ${e.error}`), 8000);
+        }
+        break;
+      case "jobs":
+        this.push({ t: "jobs", jobs: e.jobs, error: e.error });
+        break;
+      case "jobsChanged":
+        // 纯推送信号：前端按需重新拉取（列表不在两处各算一份）
+        this.push({ t: "jobsChanged" });
+        break;
+      case "jobKilled":
+        vscode.window.setStatusBarMessage(
+          e.ok
+            ? loc(`已请求取消作业（${e.result ?? "requested"}）`, `Job cancellation requested (${e.result ?? "requested"})`)
+            : loc(`取消作业失败：${e.error ?? "unknown"}`, `Failed to cancel job: ${e.error ?? "unknown"}`),
+          8000
+        );
+        break;
+      case "jobOutput":
+        this.push({ t: "jobOutput", ok: e.ok, text: e.text, error: e.error });
         break;
       case "sessions":
         this.push({ t: "sessions", list: e.list, error: e.error });
@@ -844,6 +928,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       workModeTitle: zh ? "工作模式：单 Agent 串行 / 多 Agent 并发" : "Work mode: single agent serial / multi-agent parallel",
       workModeSingle: zh ? "单 Agent 串行" : "Single Agent",
       workModeMulti: zh ? "多 Agent 并发" : "Multi-Agent",
+      planTitle: zh ? "Plan 模式：先出计划待你批准，再动手执行（再次点击退出）" : "Plan mode: design a plan for your approval before acting (click again to leave)",
+      planOn: "PLAN",
+      jobsTitle: zh ? "后台作业" : "Background Jobs",
+      jobsRefresh: zh ? "刷新" : "Refresh",
+      jobsClose: zh ? "关闭" : "Close",
     };
     const csp = [
       "default-src 'none'",
@@ -871,6 +960,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     <span id="sessionSize" class="session-size hidden" title=""></span>
     <span class="spacer"></span>
     <button id="btnExportFull" class="icon-btn disabled" title="${L.exportTitle}">📄</button>
+    <!-- 作业按钮用 ⏱ 而不是 ⚙：⚙ 已属于"配置"，两个相邻齿轮无法区分 -->
+    <button id="btnJobs" class="icon-btn" title="${L.jobsTitle}">⏱</button>
     <button id="btnHistory" class="icon-btn" title="${L.historyBtn}">🕘</button>
     <button id="btnWorkspace" class="icon-btn" title="${L.workspaceBtn}">📂</button>
     <button id="btnConfig" class="icon-btn" title="${L.configBtn}">⚙</button>
@@ -880,6 +971,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     <div class="topbar-row">
       <span id="contextPct" class="topbar-stat" title="">—</span>
       <button id="btnCompact" class="icon-btn small" title="${L.compactTitle}">🗜️</button>
+      <button id="btnPlan" class="icon-btn small plan-toggle" title="${L.planTitle}">${L.planOn}</button>
       <span class="spacer"></span>
       <span id="steps" class="token-stat" title="">🔄 0</span>
       <span id="tokensIn" class="token-stat">↗ 0</span>
@@ -896,6 +988,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     </div>
     <div id="historyList" class="history-list"></div>
   </section>
+  <!-- 后台作业面板：只读状态 + 取消 + （已结束作业的）输出。读取运行中作业的输出
+       会占用模型的读取游标，故运行中不提供输出入口。 -->
+  <section id="jobsPanel" class="history hidden">
+    <div class="history-header">
+      <span class="history-title">${L.jobsTitle}</span>
+      <span class="spacer"></span>
+      <button id="btnJobsRefresh" class="icon-btn small" title="${L.jobsRefresh}">⟳</button>
+      <button id="btnJobsClose" class="icon-btn small" title="${L.jobsClose}">✕</button>
+    </div>
+    <div id="jobsList" class="history-list"></div>
+  </section>
   <section id="configBanner" class="config-banner hidden"></section>
   <main id="messages">
     <div id="emptyState" class="empty-state"><span></span></div>
@@ -911,6 +1014,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         <button id="btnDeny" class="btn deny">${L.deny}</button>
         <button id="btnAllow" class="btn allow">${L.allow}</button>
       </div>
+    </div>
+  </div>
+  <!-- 问答 modal：内核 user-questions 请求（含 plan-review 计划评审）。
+       内容由 chat.js 动态渲染——选项数量、计划正文、反馈输入框都不固定，
+       不适合写死在 HTML 模板里；标题也随 intent 变化。 -->
+  <div id="question" class="approval-modal hidden">
+    <div class="approval-backdrop"></div>
+    <div class="approval-card question-card">
+      <div id="questionTitle" class="approval-title"></div>
+      <div id="questionBody" class="approval-body"></div>
     </div>
   </div>
   <!-- 会话轮转提示 modal：确认轮转（rotateRequest）或轮转完成提示（sessionRotated）共用 -->
