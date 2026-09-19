@@ -1088,3 +1088,121 @@ button.jump-down {
 button.jump-down:hover {
   opacity: 1;
 }
+
+/* ---------------- plan 模式开关 ---------------- */
+/* 顶栏小按钮：默认弱化，开启时高亮（表示"当前处于计划优先"状态）。
+   用 accent 变色 + 边框，避免新增颜色 token。 */
+.icon-btn.plan-toggle {
+  font-size: 9px;
+  letter-spacing: 0.5px;
+  padding: 0 5px;
+  opacity: 0.75;
+}
+.icon-btn.plan-toggle:hover { opacity: 1; }
+.icon-btn.plan-toggle.active {
+  background: var(--accent);
+  color: var(--accent-fg);
+  border-color: var(--accent);
+  opacity: 1;
+}
+.icon-btn.plan-toggle.pending { opacity: 0.5; }
+
+/* ---------------- 问答卡（内核 user-questions：通用问答 + plan-review） ---------------- */
+.question-card { max-height: 80vh; display: flex; flex-direction: column; }
+.question-card #questionBody { overflow-y: auto; }
+.question-item { margin-bottom: 10px; }
+.question-header { font-weight: 600; margin: 0 0 4px; }
+.question-text { margin: 0 0 6px; }
+/* 计划正文：可滚动的 markdown 区域（与助手消息同一套渲染结果） */
+.question-plan {
+  max-height: 46vh;
+  overflow-y: auto;
+  padding: 8px 10px;
+  margin-bottom: 10px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bubble-assistant);
+}
+.question-detail {
+  margin: 0 0 6px;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  white-space: pre-wrap;
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 12px;
+  max-height: 30vh;
+  overflow: auto;
+}
+.question-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  padding: 4px 2px;
+  cursor: pointer;
+}
+.question-option input { margin-top: 2px; }
+.question-other,
+.question-feedback {
+  width: 100%;
+  box-sizing: border-box;
+  margin-top: 6px;
+  padding: 4px 6px;
+  color: var(--fg);
+  background: var(--vscode-input-background, #3c3c3c);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  font-family: inherit;
+  resize: vertical;
+}
+.question-actions { flex-wrap: wrap; gap: 6px; }
+
+/* ---------------- 后台作业面板 ---------------- */
+.job-row {
+  padding: 6px 2px;
+  border-bottom: 1px solid var(--border);
+}
+.job-row:last-child { border-bottom: none; }
+.job-head { display: flex; align-items: center; gap: 6px; }
+.job-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+}
+.job-status {
+  flex: 0 0 auto;
+  font-size: 11px;
+  padding: 0 5px;
+  border-radius: 3px;
+  border: 1px solid var(--border);
+  color: var(--muted);
+}
+.job-status.job-running { color: var(--accent); border-color: var(--accent); }
+.job-status.job-completed { color: var(--success); border-color: var(--success); }
+.job-status.job-failed { color: var(--error); border-color: var(--error); }
+.job-status.job-stopping,
+.job-status.job-killed { color: var(--warn); border-color: var(--warn); }
+.job-meta {
+  margin-top: 2px;
+  font-size: 11px;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.job-output-block { margin: 6px 0; }
+.job-output-title { font-size: 11px; color: var(--muted); margin-bottom: 2px; }
+.job-output {
+  margin: 0;
+  padding: 6px 8px;
+  max-height: 30vh;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bubble-assistant);
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}

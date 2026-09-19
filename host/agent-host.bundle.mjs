@@ -85965,6 +85965,7 @@ function detectPersonaPrefixField() {
 }
 var DSH_PERSONA_PREFIX_SUPPORTED = detectPersonaPrefixField();
 function composePatches(env) {
+  const envValue = (name) => typeof env?.get === "function" ? env.get(name)?.value : env?.[name];
   const base = loadOverlayPatches(NAME2, bundlePatchFile("@deepseek-ai/dsh-base/cordis.patch.yml"));
   const headless = loadOverlayPatches(NAME2, bundlePatchFile("@deepseek-ai/dsh-headless/cordis.patch.yml"));
   const filteredHeadless = [];
@@ -86001,7 +86002,7 @@ function composePatches(env) {
     {
       id: "sandbox-policy",
       config: {
-        mode: env.DSH_PERMISSION_MODE ?? "workspace-write",
+        mode: envValue("DSH_PERMISSION_MODE") ?? "workspace-write",
         workspaceRoot: process.cwd()
       }
     },
@@ -86013,7 +86014,7 @@ function composePatches(env) {
         provider: "spawn",
         toolName: "subagent",
         backgroundMode: "continuable",
-        maxDepth: Number(env.DSH_SUBAGENT_MAX_DEPTH) || 3
+        maxDepth: Number(envValue("DSH_SUBAGENT_MAX_DEPTH")) || 3
       }
     },
     // 独立会话存储：插件会话与 dsh CLI / dsh web 等官方应用的会话完全隔离，
@@ -86030,9 +86031,9 @@ function composePatches(env) {
     {
       id: "compaction-basic",
       config: {
-        auto: env.DSH_COMPACTION_AUTO !== "false",
-        thresholdRatio: Number(env.DSH_COMPACTION_THRESHOLD_RATIO) || 0.8,
-        maxTokens: Number(env.DSH_COMPACTION_MAX_TOKENS) || 8192
+        auto: envValue("DSH_COMPACTION_AUTO") !== "false",
+        thresholdRatio: Number(envValue("DSH_COMPACTION_THRESHOLD_RATIO")) || 0.8,
+        maxTokens: Number(envValue("DSH_COMPACTION_MAX_TOKENS")) || 8192
       }
     },
     // 禁用的插件（对应依赖已从 VSIX 剔除，不加载即不 import）：
@@ -86046,7 +86047,7 @@ function composePatches(env) {
     { id: "session-telemetry-otel", disabled: true },
     { id: "typert-gateway", disabled: true }
   ];
-  if (env.DSH_ENABLE_GOAL_ROUNDS !== "1") {
+  if (envValue("DSH_ENABLE_GOAL_ROUNDS") !== "1") {
     overlay.push({ id: "goal-round-driver", disabled: true });
     overlay.push({ id: "tool-goal", disabled: true });
     overlay.push({ id: "command-goal", disabled: true });
@@ -86130,6 +86131,26 @@ async function createAgent(ctx, options, pump2, approvals) {
   await handle.agent.whenIdle();
   return { handle, agent: handle.agent, selection, resetStepBudget: attached.resetStepBudget };
 }
+function reconcilePermissionMode(ctx, session) {
+  try {
+    const presets = ctx.get("permissionPresets");
+    if (presets === void 0 || typeof presets.set !== "function") return;
+    const target = presets.defaultPreset;
+    if (typeof target !== "string" || target === "" || target === "custom") return;
+    const before = typeof presets.current === "function" ? presets.current(session) : void 0;
+    presets.set(session, target);
+    if (before !== target) {
+      log("info", `permission preset reconciled: ${before ?? "?"} \u2192 ${target} (from dshVscode.permissionMode)`);
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    log("warn", "permission preset reconcile failed", message);
+    post({
+      t: "hint",
+      text: L(`\u6743\u9650\u6863\u4F4D\u540C\u6B65\u5931\u8D25\uFF08\u8BBE\u7F6E\u503C\u672A\u751F\u6548\uFF09\uFF1A${message}`, `Failed to apply the configured permission mode: ${message}`)
+    });
+  }
+}
 async function resumeAgent(ctx, resumeSessionId, options, pump2, approvals) {
   const agents = ctx.get("agents");
   const defaultModel = ctx.get("agentDefaultModel");
@@ -86164,6 +86185,7 @@ async function resumeAgent(ctx, resumeSessionId, options, pump2, approvals) {
     });
     log("info", `session cwd ${sessionCwd} != workspace ${currentCwd}; injected cwd correction`);
   }
+  reconcilePermissionMode(ctx, handle.agent.session);
   const attached = attachAgent(ctx, handle, pump2);
   await handle.agent.whenIdle();
   return { handle, agent: handle.agent, selection, resetStepBudget: attached.resetStepBudget };
@@ -86325,19 +86347,41 @@ function attachAgent(ctx, handle, pump2) {
     return UI_LANG === "zh" ? `\u7EE9\u6548\u53C2\u8003\uFF1A\u4F60\u6700\u8FD1\u5B8C\u6210\u7684\u8F6E\u6B21\uFF1A${rows.join("\uFF1B")}\u3002\u9AD8\u6548\u6A21\u5F0F\u901A\u5E38\u5305\u62EC\uFF1A\u4E00\u6B65\u5185\u5E76\u53D1\u591A\u4E2A\u5DE5\u5177\u8C03\u7528\u3001\u51CF\u5C11\u91CD\u590D\u641C\u7D22\u4E0E\u5197\u4F59\u64CD\u4F5C\u3001\u5148\u89C4\u5212\u518D\u52A8\u624B\uFF08\u7B80\u8FF0\u8BA1\u5212\u4E0E\u9884\u4F30\u6B65\u6570\uFF09\u3002\u8BF7\u5EF6\u7EED\u9AD8\u6548\u6A21\u5F0F\uFF0C\u5728\u672C\u8F6E\u9884\u7B97\u5185\u4EE5\u6700\u5C11\u6B65\u6570\u5706\u6EE1\u5B8C\u6210\u4EFB\u52A1\u3002` : `Performance reference: recent rounds: ${rows.join("; ")}. Efficient patterns usually include: batching multiple tool calls in one step, avoiding repeated searches and redundant operations, and planning before acting (state your plan and estimated steps). Keep the efficient patterns and complete this round within budget in as few steps as possible.`;
   };
   let lastLoggedEffort;
+  let turnPerfRecorded = false;
+  const recordTurnPerf = () => {
+    if (turnPerfRecorded) return;
+    turnPerfRecorded = true;
+    if (!(stepLimit > 0 && stepCount > 0)) return;
+    perfQueue.push({ steps: stepCount, tools: toolCallCount, hitLimit: stepLimitHit });
+    if (perfQueue.length > PERF_KEEP) perfQueue.shift();
+    updateSessionMeta(agent.session.id, { [PERF_META_KEY]: [...perfQueue].slice(-PERF_KEEP) });
+  };
   const resetStepBudget = () => {
-    if (stepLimit > 0 && stepCount > 0) {
-      perfQueue.push({ steps: stepCount, tools: toolCallCount, hitLimit: stepLimitHit });
-      if (perfQueue.length > PERF_KEEP) perfQueue.shift();
-      updateSessionMeta(agent.session.id, { [PERF_META_KEY]: [...perfQueue].slice(-PERF_KEEP) });
-    }
+    recordTurnPerf();
     stepCount = 0;
     stepLimitHit = false;
     wrapUpInjected = false;
     roundGuideInjected = false;
     toolCallCount = 0;
     turnStartAt = Date.now();
+    turnPerfRecorded = false;
   };
+  agent.ctx.on("agent/turn-stopping", ({ turn }) => {
+    try {
+      recordTurnPerf();
+      const sid = agent.session.id;
+      const prev = getSessionMeta(sid).stats;
+      const base = prev && Number.isFinite(prev.lastSeq) ? prev : void 0;
+      const delta = sessionEventsSince(agent.session, base === void 0 ? 0 : base.lastSeq + 1).filter(
+        (e2) => e2.type !== "assistant/chunk" && e2.type !== "session/end-seed"
+      );
+      const stats = delta.length === 0 && base !== void 0 ? base : computeSessionStats(delta, base);
+      post({ t: "stats", stats });
+      if (DEBUG_ADAPT) log("info", `turn ${turn} stopped; final stats pushed (lastSeq=${stats.lastSeq ?? 0})`);
+    } catch (error) {
+      log("warn", "turn-stopping handling failed", error instanceof Error ? error.message : String(error));
+    }
+  });
   agent.ctx.on("session/event", (_session, event) => {
     if (event.type === "step/start") {
       stepCount++;
@@ -86345,6 +86389,9 @@ function attachAgent(ctx, handle, pump2) {
         stepLimitHit = true;
         post({ t: "stepLimit", maxSteps: stepLimit, steps: stepCount });
       }
+    }
+    if (event.type === "plan/mode") {
+      post({ t: "planMode", active: event.data?.active === true });
     }
     if (event.type === "session/title" && event.data && typeof event.data.title === "string" && event.data.title.trim() !== "") {
       try {
@@ -86715,6 +86762,102 @@ function installApprovalListener(ctx, approvals) {
     log("info", `approval #${id} resolved: ${outcome}`);
     return outcome;
   });
+}
+var QUESTION_TIMEOUT_MS = 6e5;
+function questionError(code, message) {
+  return Object.assign(new Error(message), { name: "UserQuestionError", code });
+}
+function questionView(q) {
+  const options = Array.isArray(q?.options) ? q.options.map((o) => ({
+    label: String(o?.label ?? ""),
+    ...typeof o?.description === "string" ? { description: o.description } : {}
+  })).filter((o) => o.label !== "") : void 0;
+  const intent = q?.intent && q.intent.kind === "plan-review" && typeof q.intent.approve === "string" ? { kind: "plan-review", approve: q.intent.approve } : void 0;
+  return {
+    id: String(q?.id ?? ""),
+    question: String(q?.question ?? ""),
+    ...typeof q?.detail === "string" ? { detail: q.detail } : {},
+    ...typeof q?.header === "string" ? { header: q.header } : {},
+    ...options !== void 0 && options.length > 0 ? { options } : {},
+    ...q?.multiSelect === true ? { multiSelect: true } : {},
+    ...intent !== void 0 ? { intent } : {}
+  };
+}
+function normalizeQuestionAnswers(questions, raw) {
+  const items = Array.isArray(raw) ? raw : [];
+  const out = [];
+  for (const q of questions) {
+    const hit = items.find((a) => a && String(a.id) === q.id);
+    if (hit === void 0) return void 0;
+    const allowed = new Set((q.options ?? []).map((o) => o.label));
+    const selected = (Array.isArray(hit.selected) ? hit.selected : []).map((s3) => String(s3)).filter((s3) => allowed.has(s3));
+    const custom = typeof hit.custom === "string" && hit.custom.trim() !== "" ? hit.custom : void 0;
+    if (selected.length === 0 && custom === void 0) return void 0;
+    if (q.multiSelect !== true && selected.length > 1) return void 0;
+    out.push({ id: q.id, selected, ...custom !== void 0 ? { custom } : {} });
+  }
+  return out;
+}
+function installQuestionListener(ctx, questions) {
+  ctx.on("user-questions/request", async (req) => {
+    const items = (Array.isArray(req?.questions) ? req.questions : []).map(questionView).filter((q) => q.id !== "" && q.question !== "");
+    if (items.length === 0) throw questionError("ASK_ABORTED", "no answerable question");
+    if (req?.signal?.aborted) throw questionError("ASK_ABORTED", "question aborted before it was asked");
+    const id = questions.nextId();
+    const agent = req?.agent;
+    const agentId = agent?.session?.id ? String(agent.session.id).slice(-8) : void 0;
+    log("info", `question #${id}: ${items.length} item(s)${items[0]?.intent ? ` intent=${items[0].intent.kind}` : ""}`);
+    const outcome = await new Promise((resolve5) => {
+      const entry = {};
+      entry.resolve = resolve5;
+      entry.settle = (value) => {
+        if (questions.pending.get(id) !== entry) return false;
+        questions.pending.delete(id);
+        clearTimeout(entry.timer);
+        resolve5(value);
+        return true;
+      };
+      questions.pending.set(id, entry);
+      entry.timer = setTimeout(() => {
+        if (!entry.settle({ kind: "cancel", code: "ASK_ABORTED", message: "the question timed out with no answer" })) return;
+        post({ t: "questionGone", id });
+        log("warn", `question #${id} timed out`);
+      }, QUESTION_TIMEOUT_MS);
+      if (req?.signal !== void 0) {
+        req.signal.addEventListener(
+          "abort",
+          () => {
+            if (!entry.settle({ kind: "cancel", code: "ASK_ABORTED", message: "the question was aborted (turn cancelled)" })) return;
+            post({ t: "questionGone", id });
+          },
+          { once: true }
+        );
+      }
+      post({ t: "question", id, questions: items, ...agentId !== void 0 ? { agentId } : {} });
+    });
+    if (outcome.kind === "cancel") {
+      log("info", `question #${id} cancelled (${outcome.code})`);
+      throw questionError(outcome.code, outcome.message);
+    }
+    const answers = normalizeQuestionAnswers(items, outcome.answers);
+    if (answers === void 0) {
+      log("warn", `question #${id} rejected: malformed or incomplete answer payload`);
+      throw questionError("ASK_ABORTED", "the answer did not cover every question with a valid option");
+    }
+    log("info", `question #${id} answered`);
+    return { answers };
+  });
+}
+function jobView(s3) {
+  return {
+    id: String(s3?.id ?? ""),
+    kind: String(s3?.kind ?? ""),
+    label: String(s3?.label ?? ""),
+    status: typeof s3?.status === "string" ? s3.status : "running",
+    ...typeof s3?.detail === "string" ? { detail: s3.detail } : {},
+    startedAt: Number(s3?.startedAt) || 0,
+    ...Number.isFinite(s3?.finishedAt) ? { finishedAt: Number(s3.finishedAt) } : {}
+  };
 }
 function migrateLegacySessions() {
   const newRoot = dshHomePath("sessions-ay-dsh");
@@ -87520,6 +87663,10 @@ async function main() {
     let n = 0;
     return () => ++n;
   })(), pending: /* @__PURE__ */ new Map() };
+  const questions = { nextId: /* @__PURE__ */ (() => {
+    let n = 0;
+    return () => ++n;
+  })(), pending: /* @__PURE__ */ new Map() };
   let ctx;
   let handle;
   let agent;
@@ -87660,6 +87807,24 @@ ${summary}` }] }
     }, 60 * 60 * 1e3);
     installApprovalListener(ctx, approvals);
     log("info", "approval listener installed (root scope, covers all agents)");
+    installQuestionListener(ctx, questions);
+    log("info", "user-questions answerer installed (root scope, covers all agents)");
+    try {
+      const jobs = ctx.get("jobs");
+      if (jobs !== void 0 && typeof jobs.onJobsChanged === "function") {
+        jobs.onJobsChanged(() => {
+          try {
+            post({ t: "jobsChanged" });
+          } catch {
+          }
+        });
+        log("info", "jobs change observer installed");
+      } else {
+        log("warn", "jobs service unavailable; the background-job panel stays empty");
+      }
+    } catch (error) {
+      log("warn", "jobs observer install failed", error instanceof Error ? error.message : String(error));
+    }
     ctx.on("agent/created", ({ agent: createdAgent }) => {
       try {
         const sid = createdAgent.session.id;
@@ -87750,6 +87915,20 @@ ${summary}` }] }
       void handleFrame(msg);
     }
   });
+  function postPlanMode(extra2) {
+    let active = false;
+    let pending;
+    try {
+      const planMode = ctx?.get?.("planMode");
+      if (planMode !== void 0 && typeof planMode.get === "function" && agent !== void 0) {
+        const state = planMode.get(agent);
+        active = state?.active === true;
+        pending = state?.pending === true ? true : void 0;
+      }
+    } catch {
+    }
+    post({ t: "planMode", active, ...pending !== void 0 ? { pending } : {}, ...extra2 ?? {} });
+  }
   async function handleFrame(msg) {
     try {
       switch (msg.t) {
@@ -87853,6 +88032,88 @@ ${meta.seedSummary}` }],
           approvals.pending.delete(msg.id);
           clearTimeout(entry.timer);
           entry.resolve(msg.approve === true ? "allowed-once" : "rejected");
+          break;
+        }
+        case "question:resolve": {
+          const entry = questions.pending.get(msg.id);
+          if (entry === void 0) break;
+          if (msg.outcome === "cancel") {
+            entry.settle({ kind: "cancel", code: "ASK_CANCELLED", message: "the user dismissed the question to speak instead" });
+          } else {
+            entry.settle({ kind: "answer", answers: msg.answers });
+          }
+          break;
+        }
+        case "getPlanMode": {
+          postPlanMode();
+          break;
+        }
+        case "setPlanMode": {
+          const planMode = ctx.get("planMode");
+          if (planMode === void 0) {
+            postPlanMode({ error: "plan mode service unavailable" });
+            break;
+          }
+          if (agent === void 0) {
+            postPlanMode({ error: "no active session yet" });
+            break;
+          }
+          try {
+            const result = planMode.set(agent, msg.active === true);
+            log("info", `plan mode set(${msg.active === true}) \u2192 ${result}`);
+            postPlanMode({ result });
+          } catch (error) {
+            log("warn", "plan mode switch failed", error instanceof Error ? error.message : String(error));
+            postPlanMode({ error: error instanceof Error ? error.message : String(error) });
+          }
+          break;
+        }
+        case "listJobs": {
+          try {
+            const jobs = ctx.get("jobs");
+            if (jobs === void 0) {
+              post({ t: "jobs", jobs: [], error: "jobs service unavailable" });
+              break;
+            }
+            post({ t: "jobs", jobs: jobs.list(agent).map(jobView) });
+          } catch (error) {
+            post({ t: "jobs", jobs: [], error: error instanceof Error ? error.message : String(error) });
+          }
+          break;
+        }
+        case "jobKill": {
+          try {
+            const jobs = ctx.get("jobs");
+            if (jobs === void 0) throw new Error("jobs service unavailable");
+            const result = jobs.kill(msg.jobId, agent, "cancelled from the VS Code panel");
+            log("info", `job ${msg.jobId} kill \u2192 ${result}`);
+            post({ t: "jobKilled", ok: true, result });
+          } catch (error) {
+            post({ t: "jobKilled", ok: false, error: error instanceof Error ? error.message : String(error) });
+          }
+          break;
+        }
+        case "jobOutput": {
+          try {
+            const jobs = ctx.get("jobs");
+            if (jobs === void 0) throw new Error("jobs service unavailable");
+            const snapshot = jobs.get(msg.jobId, agent);
+            if (snapshot.status === "running" || snapshot.status === "stopping") {
+              post({
+                t: "jobOutput",
+                ok: false,
+                error: L(
+                  "\u4F5C\u4E1A\u4ECD\u5728\u8FD0\u884C\uFF1A\u8F93\u51FA\u8BFB\u53D6\u4F1A\u5360\u7528\u6A21\u578B\u7684\u8BFB\u53D6\u6E38\u6807\uFF0C\u8BF7\u7B49\u5B83\u7ED3\u675F\u540E\u518D\u770B\u3002",
+                  "Job still running: reading output would consume the model's read cursor \u2014 wait until it settles."
+                )
+              });
+              break;
+            }
+            const read = jobs.read(msg.jobId, agent);
+            post({ t: "jobOutput", ok: true, text: read.text });
+          } catch (error) {
+            post({ t: "jobOutput", ok: false, error: error instanceof Error ? error.message : String(error) });
+          }
           break;
         }
         case "newSession": {

@@ -156,6 +156,18 @@ const DSH_PERSONA_PREFIX_SUPPORTED = detectPersonaPrefixField();
  * 3. 本扩展的 overlay：IDE persona、禁用 HMR。
  */
 function composePatches(env) {
+  // 分层环境快照只提供 `get(name)`（`@deepseek-ai/dsh-launch-environment` 的
+  // LaunchEnvironmentSnapshot），**不支持属性访问**：`env.DSH_XXX` 一律取到
+  // undefined。此前正是这么写的，于是下面每一项 overlay 配置都静默回落到默认值：
+  //   · permissionMode → sandbox 永远是 workspace-write。**选 `read-only` 会静默放宽**
+  //     （用户要更严，实际得到更松）；选 `danger-full-access` 时 sandbox 停在
+  //     workspace-write 而 approval 按 base 补丁的表达式变成 never，组合对不上任何
+  //     预设，permission-presets 构造期直接抛错 → **整个宿主起不来**。
+  //   · subagentMaxDepth / compaction（auto、thresholdRatio、maxTokens）/ enableGoalRounds
+  //     同样永不生效（"关闭自动压缩"之类的设置形同虚设）。
+  // 统一经 get() 取值；同时兼容"被传入普通对象"的调用方（本文件 main() 里的 env 就是
+  // `{...process.env}`）。
+  const envValue = (name) => (typeof env?.get === "function" ? env.get(name)?.value : env?.[name]);
   const base = loadOverlayPatches(NAME, bundlePatchFile("@deepseek-ai/dsh-base/cordis.patch.yml"));
   const headless = loadOverlayPatches(NAME, bundlePatchFile("@deepseek-ai/dsh-headless/cordis.patch.yml"));
 
@@ -228,7 +240,7 @@ function composePatches(env) {
     {
       id: "sandbox-policy",
       config: {
-        mode: env.DSH_PERMISSION_MODE ?? "workspace-write",
+        mode: envValue("DSH_PERMISSION_MODE") ?? "workspace-write",
         workspaceRoot: process.cwd(),
       },
     },
@@ -240,7 +252,7 @@ function composePatches(env) {
         provider: "spawn",
         toolName: "subagent",
         backgroundMode: "continuable",
-        maxDepth: Number(env.DSH_SUBAGENT_MAX_DEPTH) || 3,
+        maxDepth: Number(envValue("DSH_SUBAGENT_MAX_DEPTH")) || 3,
       },
     },
     // 独立会话存储：插件会话与 dsh CLI / dsh web 等官方应用的会话完全隔离，
@@ -257,9 +269,9 @@ function composePatches(env) {
     {
       id: "compaction-basic",
       config: {
-        auto: env.DSH_COMPACTION_AUTO !== "false",
-        thresholdRatio: Number(env.DSH_COMPACTION_THRESHOLD_RATIO) || 0.8,
-        maxTokens: Number(env.DSH_COMPACTION_MAX_TOKENS) || 8192,
+        auto: envValue("DSH_COMPACTION_AUTO") !== "false",
+        thresholdRatio: Number(envValue("DSH_COMPACTION_THRESHOLD_RATIO")) || 0.8,
+        maxTokens: Number(envValue("DSH_COMPACTION_MAX_TOKENS")) || 8192,
       },
     },
     // 禁用的插件（对应依赖已从 VSIX 剔除，不加载即不 import）：
@@ -287,7 +299,7 @@ function composePatches(env) {
   // env.DSH_ENABLE_GOAL_ROUNDS 置 "1"（或改为配置项）跳过下方禁用，并配套
   // 改造"预算按 agent turn 重置"（goal round 每轮独立预算，避免 0 步空转）。
   // 当前默认关闭——插件不需要无人值守模式，短期预计不启用。
-  if (env.DSH_ENABLE_GOAL_ROUNDS !== "1") {
+  if (envValue("DSH_ENABLE_GOAL_ROUNDS") !== "1") {
     overlay.push({ id: "goal-round-driver", disabled: true });
     overlay.push({ id: "tool-goal", disabled: true });
     overlay.push({ id: "command-goal", disabled: true });
@@ -403,6 +415,54 @@ async function createAgent(ctx, options, pump, approvals) {
 }
 
 /** 恢复一个持久化会话（继续历史对话）。 */
+/**
+ * 让 VS Code 的 `dshVscode.permissionMode` 设置**成为权威**：恢复会话时把该会话的
+ * 权限档位对齐到当前配置值。
+ *
+ * 为什么需要：内核把档位 pin 在**会话日志**里，解析顺序是「日志覆盖 > 部署默认」
+ * （`SandboxPolicyService.resolve()` = `overrideOf(session) ?? defaultMode`；
+ * `ApprovalService.effectivePolicy()` = `overrideOf(session) ?? config.policy`）。
+ * 于是"在设置里改档位 → 重启宿主"对**已存在/被恢复的会话无效**——它仍是当初 pin 下
+ * 的值，用户看到的是"设置没生效"。本函数在恢复后把配置值写回会话级旋钮，使
+ * 「改设置 → 重启 → 生效」成立（对内核对：会覆盖该会话自己记录的选择，这是 owner
+ * 明确接受的代价）。
+ *
+ * 实现走内核 `permissionPresets` 而非自己拼装：
+ *  - `defaultPreset` 由 composed 的 sandbox + approval（即 base 补丁从
+ *    `DSH_PERMISSION_MODE` 推出的那两个）解析而来，故它就是"配置值"的预设表达；
+ *  - `set()` 再把该预设的三个事实（`permission/preset` + `sandbox/mode` +
+ *    `approval/policy`）经各自**规范 setter** 写入日志。
+ *  这样无需在本文件复述 base 补丁里 "danger-full-access → never" 的映射（复述即漂移源）。
+ *
+ * 只在**确实不同**时产生写入：`set()` 内部逐旋钮比对，一致则零写入，故收敛后每次
+ * 重启都不会再往日志追加事件。
+ *
+ * 失败不阻断恢复：档位同步失败只是"设置未生效"，不能连带让人用不了会话；失败会写
+ * 日志并向 UI 提示。
+ */
+function reconcilePermissionMode(ctx, session) {
+  try {
+    const presets = ctx.get("permissionPresets");
+    // 内核未挂权限预设服务（组合变更 / 更早内核）→ 不干预，保持部署默认语义
+    if (presets === undefined || typeof presets.set !== "function") return;
+    const target = presets.defaultPreset;
+    // `custom` 是"派生出的不匹配任何预设"状态，不是可写入的目标；空值同理不写
+    if (typeof target !== "string" || target === "" || target === "custom") return;
+    const before = typeof presets.current === "function" ? presets.current(session) : undefined;
+    presets.set(session, target);
+    if (before !== target) {
+      log("info", `permission preset reconciled: ${before ?? "?"} → ${target} (from dshVscode.permissionMode)`);
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    log("warn", "permission preset reconcile failed", message);
+    post({
+      t: "hint",
+      text: L(`权限档位同步失败（设置值未生效）：${message}`, `Failed to apply the configured permission mode: ${message}`),
+    });
+  }
+}
+
 async function resumeAgent(ctx, resumeSessionId, options, pump, approvals) {
   const agents = ctx.get("agents");
   const defaultModel = ctx.get("agentDefaultModel");
@@ -449,6 +509,11 @@ async function resumeAgent(ctx, resumeSessionId, options, pump, approvals) {
     });
     log("info", `session cwd ${sessionCwd} != workspace ${currentCwd}; injected cwd correction`);
   }
+
+  // 权限档位对齐：让 VS Code 的 permissionMode 设置**成为权威**（见函数注释）。
+  // 只在恢复路径调用（restorePreview / resumeSession 共用本函数）；
+  // viewSession 是只读浏览、绝不写盘，故不在那里调用。
+  reconcilePermissionMode(ctx, handle.agent.session);
 
   const attached = attachAgent(ctx, handle, pump);
   await handle.agent.whenIdle();
@@ -901,28 +966,79 @@ function attachAgent(ctx, handle, pump) {
   /** 上次打印过的实际思考级别（仅在变化时打印，避免每步刷屏）。 */
   let lastLoggedEffort;
 
+  /** 本轮绩效是否已记录（幂等：同一轮只记一次，由 recordTurnPerf 置位）。 */
+  let turnPerfRecorded = false;
+
+  /**
+   * 记录本轮绩效到会话 meta（幂等）。
+   *
+   * 调用时点有两个，取先到者：
+   *  1. 内核 `agent/turn-stopping`（**真实轮末**，权威时点，见下方监听器）；
+   *  2. `resetStepBudget`（用户下一条消息到达时）——旧内核无该扩展点时的兜底。
+   *
+   * 为什么要在轮末记：原实现只在"下一条用户消息到达"时补记上一轮，于是**用户发出
+   * 最后一条消息后不再发言、或直接关窗时，该轮绩效永久丢失**；跨会话延续的"效率
+   * 人设"因此总缺最新一轮。改为轮末落盘后，绩效记忆不再依赖"下一轮是否发生"。
+   */
+  const recordTurnPerf = () => {
+    if (turnPerfRecorded) return;
+    turnPerfRecorded = true;
+    // **stepCount > 0 才记录**（0 步空轮——首条消息前的重置——不算完成一轮）
+    if (!(stepLimit > 0 && stepCount > 0)) return;
+    perfQueue.push({ steps: stepCount, tools: toolCallCount, hitLimit: stepLimitHit });
+    if (perfQueue.length > PERF_KEEP) perfQueue.shift();
+    // 杠杆3：每轮结束落盘到 session-meta，跨重启/跨会话延续绩效参考。
+    // 清理纪律：内存 perfQueue 已截断到 PERF_KEEP；落盘前再强制
+    // slice(-PERF_KEEP) 防御（坏数据/未来 bug 不污染 meta）；会话删除时
+    // removeSessionMeta 整体清除 meta[sid]（含 perf），无孤儿条目。
+    // 因此 perf 不随对话次数增长（每会话恒 ≤5 条），meta 条目数只随
+    // 会话数线性（每会话一条，属正常元数据，删除即清）。
+    updateSessionMeta(agent.session.id, { [PERF_META_KEY]: [...perfQueue].slice(-PERF_KEEP) });
+  };
+
   /** 新一轮用户消息开始时调用：重置本轮步数预算（stepLimit 是单轮上限）。 */
   const resetStepBudget = () => {
-    // 先记录上一轮绩效（无状态激励的宿主代理记忆）：清零前读旧值入队；
-    // **stepCount > 0 才记录**（0 步空轮——首条消息前的重置——不算完成一轮）
-    if (stepLimit > 0 && stepCount > 0) {
-      perfQueue.push({ steps: stepCount, tools: toolCallCount, hitLimit: stepLimitHit });
-      if (perfQueue.length > PERF_KEEP) perfQueue.shift();
-      // 杠杆3：每轮结束落盘到 session-meta，跨重启/跨会话延续绩效参考。
-      // 清理纪律：内存 perfQueue 已截断到 PERF_KEEP；落盘前再强制
-      // slice(-PERF_KEEP) 防御（坏数据/未来 bug 不污染 meta）；会话删除时
-      // removeSessionMeta 整体清除 meta[sid]（含 perf），无孤儿条目。
-      // 因此 perf 不随对话次数增长（每会话恒 ≤5 条），meta 条目数只随
-      // 会话数线性（每会话一条，属正常元数据，删除即清）。
-      updateSessionMeta(agent.session.id, { [PERF_META_KEY]: [...perfQueue].slice(-PERF_KEEP) });
-    }
+    // 兜底记录上一轮绩效（内核 turn-stopping 已在真实轮末记过 → 此处为幂等 no-op；
+    // 旧内核无该扩展点时，这里保持原有行为）
+    recordTurnPerf();
     stepCount = 0;
     stepLimitHit = false;
     wrapUpInjected = false;
     roundGuideInjected = false;
     toolCallCount = 0;
     turnStartAt = Date.now();
+    turnPerfRecorded = false; // 新轮开始：允许下一轮轮末再记
   };
+
+  /**
+   * 轮末收尾（内核 `agent/turn-stopping`，serial、无 next()）：一轮真正结束的
+   * 权威时点。做两件现有机制做不到的事：
+   *
+   *  1. **本轮绩效落盘**（见 recordTurnPerf）：原实现只在"下一条用户消息到达"时补记，
+   *     用户不再发言即永久丢掉该轮绩效；
+   *  2. **推一次最终统计**：`session/flush` 是持久化检查点，可能落在最后一个
+   *     assistant/message 之前，于是顶栏 token/步数要等下一轮才准。轮末按增量
+   *     补算（与 flush 监听器同一套 `sessionEventsSince` + `computeSessionStats`，
+   *     单遍、不整表拷贝）后推给 UI，数字随轮结束即刻到位。
+   *
+   * 纯观察，不改变轮末决策：内核该事件是"正在结束一轮"的通知，此处不做拦截。
+   */
+  agent.ctx.on("agent/turn-stopping", ({ turn }) => {
+    try {
+      recordTurnPerf();
+      const sid = agent.session.id;
+      const prev = getSessionMeta(sid).stats;
+      const base = prev && Number.isFinite(prev.lastSeq) ? prev : undefined;
+      const delta = sessionEventsSince(agent.session, base === undefined ? 0 : base.lastSeq + 1).filter(
+        (e) => e.type !== "assistant/chunk" && e.type !== "session/end-seed"
+      );
+      const stats = delta.length === 0 && base !== undefined ? base : computeSessionStats(delta, base);
+      post({ t: "stats", stats });
+      if (DEBUG_ADAPT) log("info", `turn ${turn} stopped; final stats pushed (lastSeq=${stats.lastSeq ?? 0})`);
+    } catch (error) {
+      log("warn", "turn-stopping handling failed", error instanceof Error ? error.message : String(error));
+    }
+  });
 
   // 会话事件 → 扩展（scope-filtered：仅本 agent 的会话）
   agent.ctx.on("session/event", (_session, event) => {
@@ -935,6 +1051,12 @@ function attachAgent(ctx, handle, pump) {
         // step 控制相关日志只保留"注入系统提示"一条（见 assemble 钩子），此处不再打印
         post({ t: "stepLimit", maxSteps: stepLimit, steps: stepCount });
       }
+    }
+    // plan 模式变更同步：内核 plan-mode 追加 `plan/mode` 事件（log-only 全量替换）
+    // 时，把开关态推给 UI。这样 resume / fork / 外部驱动造成的模式变化也会被反映，
+    // 而不只依赖 setPlanMode 帧的应答。
+    if (event.type === "plan/mode") {
+      post({ t: "planMode", active: event.data?.active === true });
     }
     // 内核标题同步：DSH 生成/更新会话标题（首条消息 fallback 截断或 LLM 总结
     // provider，source=fallback/provider）时，同步写插件 meta.title——会话列表
@@ -1501,6 +1623,161 @@ function installApprovalListener(ctx, approvals) {
     log("info", `approval #${id} resolved: ${outcome}`);
     return outcome;
   });
+}
+
+/* ------------------------------------------------------------------ */
+/* 用户问答（内核 user-questions 通道）                                  */
+/* ------------------------------------------------------------------ */
+
+/** 问答超时兜底：无人应答即 fail-closed，绝不让模型的工具调用永久挂起。
+ *  10 分钟——计划评审可能不短（用户要读完一份计划），但必须有兜底。 */
+const QUESTION_TIMEOUT_MS = 600000;
+
+/** 内核错误"走线形状"：`UserQuestionService.ask()` 的 restoreUserQuestionError
+ *  会把携带 name/message/code 的普通对象**还原成真正的 UserQuestionError**。
+ *  本宿主与内核同进程，采用同一形状即可表达 ASK_CANCELLED / ASK_ABORTED，
+ *  无需为一个错误类新增内核包依赖，也与跨进程应答者的契约一致。 */
+function questionError(code, message) {
+  return Object.assign(new Error(message), { name: "UserQuestionError", code });
+}
+
+/** 内核 AskUserQuestionItem → 可序列化视图（丢弃 Agent/函数引用，保留呈现所需字段）。 */
+function questionView(q) {
+  const options = Array.isArray(q?.options)
+    ? q.options
+        .map((o) => ({
+          label: String(o?.label ?? ""),
+          ...(typeof o?.description === "string" ? { description: o.description } : {}),
+        }))
+        .filter((o) => o.label !== "")
+    : undefined;
+  const intent =
+    q?.intent && q.intent.kind === "plan-review" && typeof q.intent.approve === "string"
+      ? { kind: "plan-review", approve: q.intent.approve }
+      : undefined;
+  return {
+    id: String(q?.id ?? ""),
+    question: String(q?.question ?? ""),
+    ...(typeof q?.detail === "string" ? { detail: q.detail } : {}),
+    ...(typeof q?.header === "string" ? { header: q.header } : {}),
+    ...(options !== undefined && options.length > 0 ? { options } : {}),
+    ...(q?.multiSelect === true ? { multiSelect: true } : {}),
+    ...(intent !== undefined ? { intent } : {}),
+  };
+}
+
+/** 校验并归一化回填答案：只接受本题**自己的**选项标签（防伪造未提供的选项）。
+ *  任一项不合法即整批拒绝（返回 undefined）——不猜测用户意图，交上层 fail-closed。 */
+function normalizeQuestionAnswers(questions, raw) {
+  const items = Array.isArray(raw) ? raw : [];
+  const out = [];
+  for (const q of questions) {
+    const hit = items.find((a) => a && String(a.id) === q.id);
+    if (hit === undefined) return undefined; // 有题未答
+    const allowed = new Set((q.options ?? []).map((o) => o.label));
+    const selected = (Array.isArray(hit.selected) ? hit.selected : [])
+      .map((s) => String(s))
+      .filter((s) => allowed.has(s));
+    const custom = typeof hit.custom === "string" && hit.custom.trim() !== "" ? hit.custom : undefined;
+    if (selected.length === 0 && custom === undefined) return undefined; // 空回答
+    if (q.multiSelect !== true && selected.length > 1) return undefined; // 单选却多选
+    out.push({ id: q.id, selected, ...(custom !== undefined ? { custom } : {}) });
+  }
+  return out;
+}
+
+/**
+ * 挂载 user-questions 应答器（根 ctx 一次）。
+ *
+ * 内核 `ctx.userQuestions.ask()` 在 **agent 作用域**上派发 `user-questions/request`
+ * 瀑布：返回 `AskUserQuestionAnswer` 即认领，调 `next()` 即委派；无应答者抛
+ * `NO_PROVIDER`（fail-closed）。与审批监听同理**必须挂根 ctx**——dsh-scope 的
+ * 作用域事件向上流动，根 ctx 的无标签监听器才能收到全部 agent 的请求。
+ *
+ * 为什么必须有它：`exit_plan_mode` 的计划评审**正是经此通道**打开
+ * （intent.kind === 'plan-review'）；内核明载"无 user-questions 通道则
+ * exit_plan_mode 必然 fail-closed"（plan-mode README），所以这不仅是通用问答，
+ * 更是 plan 模式能否跑通的前提。
+ *
+ * 失败语义（全部 fail-closed，绝不悬挂）：
+ *  - 前端明确取消（用户想先插话）→ ASK_CANCELLED（内核据此与"评审失败"区分开）；
+ *  - 超时 / turn 取消（signal abort）→ ASK_ABORTED；
+ *  - 回填答案不合法 → ASK_ABORTED。
+ */
+function installQuestionListener(ctx, questions) {
+  ctx.on("user-questions/request", async (req) => {
+    const items = (Array.isArray(req?.questions) ? req.questions : [])
+      .map(questionView)
+      .filter((q) => q.id !== "" && q.question !== "");
+    if (items.length === 0) throw questionError("ASK_ABORTED", "no answerable question");
+    if (req?.signal?.aborted) throw questionError("ASK_ABORTED", "question aborted before it was asked");
+
+    const id = questions.nextId();
+    const agent = req?.agent;
+    const agentId = agent?.session?.id ? String(agent.session.id).slice(-8) : undefined;
+    log("info", `question #${id}: ${items.length} item(s)${items[0]?.intent ? ` intent=${items[0].intent.kind}` : ""}`);
+
+    const outcome = await new Promise((resolve) => {
+      const entry = {};
+      entry.resolve = resolve;
+      /** 结单；返回 true 表示本次调用是胜出者（重复结单/超时后再 abort 均返回 false）。 */
+      entry.settle = (value) => {
+        if (questions.pending.get(id) !== entry) return false;
+        questions.pending.delete(id);
+        clearTimeout(entry.timer);
+        resolve(value);
+        return true;
+      };
+      // 先登记再发帧（与审批监听器同序；两者之间无 await，故不存在"应答早于登记"的窗口）
+      questions.pending.set(id, entry);
+      entry.timer = setTimeout(() => {
+        if (!entry.settle({ kind: "cancel", code: "ASK_ABORTED", message: "the question timed out with no answer" })) return;
+        post({ t: "questionGone", id });
+        log("warn", `question #${id} timed out`);
+      }, QUESTION_TIMEOUT_MS);
+      if (req?.signal !== undefined) {
+        req.signal.addEventListener(
+          "abort",
+          () => {
+            if (!entry.settle({ kind: "cancel", code: "ASK_ABORTED", message: "the question was aborted (turn cancelled)" })) return;
+            post({ t: "questionGone", id });
+          },
+          { once: true }
+        );
+      }
+      post({ t: "question", id, questions: items, ...(agentId !== undefined ? { agentId } : {}) });
+    });
+
+    if (outcome.kind === "cancel") {
+      log("info", `question #${id} cancelled (${outcome.code})`);
+      throw questionError(outcome.code, outcome.message);
+    }
+    const answers = normalizeQuestionAnswers(items, outcome.answers);
+    if (answers === undefined) {
+      log("warn", `question #${id} rejected: malformed or incomplete answer payload`);
+      throw questionError("ASK_ABORTED", "the answer did not cover every question with a valid option");
+    }
+    log("info", `question #${id} answered`);
+    return { answers };
+  });
+}
+
+/* ------------------------------------------------------------------ */
+/* 后台作业（内核 ctx.jobs）                                            */
+/* ------------------------------------------------------------------ */
+
+/** 内核 JobSnapshot → 可序列化视图（剔除 ownerSession 等不可序列化/仅供内部关联的字段）。
+ *  用途仅限"状态可观测"；输出读取有独立语义（见 main 的 jobOutput 分支）。 */
+function jobView(s) {
+  return {
+    id: String(s?.id ?? ""),
+    kind: String(s?.kind ?? ""),
+    label: String(s?.label ?? ""),
+    status: typeof s?.status === "string" ? s.status : "running",
+    ...(typeof s?.detail === "string" ? { detail: s.detail } : {}),
+    startedAt: Number(s?.startedAt) || 0,
+    ...(Number.isFinite(s?.finishedAt) ? { finishedAt: Number(s.finishedAt) } : {}),
+  };
 }
 
 /* ------------------------------------------------------------------ */
@@ -2612,6 +2889,8 @@ async function main() {
     () => (agent === undefined || agent.session === undefined ? undefined : sessionFileSize(String(agent.session.id)))
   );
   const approvals = { nextId: (() => { let n = 0; return () => ++n; })(), pending: new Map() };
+  /** 待答问题（内核 user-questions 通道）：id → { resolve, settle, timer }。 */
+  const questions = { nextId: (() => { let n = 0; return () => ++n; })(), pending: new Map() };
 
   let ctx;
   let handle;
@@ -2790,6 +3069,31 @@ async function main() {
     installApprovalListener(ctx, approvals);
     log("info", "approval listener installed (root scope, covers all agents)");
 
+    // 全局问答监听（根 ctx，一次）：同样覆盖主 agent 与所有 subagent。
+    // 没有它时，exit_plan_mode 的计划评审会因无应答者而 fail-closed（plan 模式走不通）。
+    installQuestionListener(ctx, questions);
+    log("info", "user-questions answerer installed (root scope, covers all agents)");
+
+    // 后台作业变化通知：注册在**根 ctx**（未限定作用域）→ 可见全部 owner 的作业，
+    // 前端据此按需刷新作业列表（纯推送信号，不携带作业内容，避免列表在两处各算一份）。
+    try {
+      const jobs = ctx.get("jobs");
+      if (jobs !== undefined && typeof jobs.onJobsChanged === "function") {
+        jobs.onJobsChanged(() => {
+          try {
+            post({ t: "jobsChanged" });
+          } catch {
+            /* 管道已关闭：忽略 */
+          }
+        });
+        log("info", "jobs change observer installed");
+      } else {
+        log("warn", "jobs service unavailable; the background-job panel stays empty");
+      }
+    } catch (error) {
+      log("warn", "jobs observer install failed", error instanceof Error ? error.message : String(error));
+    }
+
     // 子代理会话标题：`agent/created`（内核 announce，覆盖所有 agent）时，
     // 对**子代理会话**（裸 UUID，非主代理前缀）写静态标题 `newsession_<时间戳>`
     // ——与会话管理一致（主代理 chat 惰性创建时已写 newsession_；子代理无用户
@@ -2910,6 +3214,27 @@ async function main() {
       void handleFrame(msg);
     }
   });
+
+  /**
+   * 上报当前 agent 的 plan 模式状态（内核 `ctx.planMode.get()`）。
+   * 无 agent / 服务不可用 / 旧内核无该服务时一律报 inactive —— 前端据此显示开关态，
+   * 不因此报错（plan 模式是可选能力，缺失不影响其余功能）。
+   */
+  function postPlanMode(extra) {
+    let active = false;
+    let pending;
+    try {
+      const planMode = ctx?.get?.("planMode");
+      if (planMode !== undefined && typeof planMode.get === "function" && agent !== undefined) {
+        const state = planMode.get(agent);
+        active = state?.active === true;
+        pending = state?.pending === true ? true : undefined;
+      }
+    } catch {
+      /* 服务不可用 → 视为未启用 */
+    }
+    post({ t: "planMode", active, ...(pending !== undefined ? { pending } : {}), ...(extra ?? {}) });
+  }
 
   async function handleFrame(msg) {
     try {
@@ -3052,6 +3377,98 @@ async function main() {
             approvals.pending.delete(msg.id);
             clearTimeout(entry.timer);
             entry.resolve(msg.approve === true ? "allowed-once" : "rejected");
+            break;
+          }
+          case "question:resolve": {
+            // 前端回填：outcome=answer 携带 answers；outcome=cancel 表示用户想先插话
+            // （仅 plan-review 卡提供）。校验在 installQuestionListener 内完成（非法即
+            // fail-closed），此处只负责把结果交给等待中的 settle。
+            const entry = questions.pending.get(msg.id);
+            if (entry === undefined) break;
+            if (msg.outcome === "cancel") {
+              entry.settle({ kind: "cancel", code: "ASK_CANCELLED", message: "the user dismissed the question to speak instead" });
+            } else {
+              entry.settle({ kind: "answer", answers: msg.answers });
+            }
+            break;
+          }
+          case "getPlanMode": {
+            postPlanMode();
+            break;
+          }
+          case "setPlanMode": {
+            const planMode = ctx.get("planMode");
+            if (planMode === undefined) {
+              postPlanMode({ error: "plan mode service unavailable" });
+              break;
+            }
+            if (agent === undefined) {
+              postPlanMode({ error: "no active session yet" });
+              break;
+            }
+            try {
+              const result = planMode.set(agent, msg.active === true);
+              log("info", `plan mode set(${msg.active === true}) → ${result}`);
+              postPlanMode({ result });
+            } catch (error) {
+              log("warn", "plan mode switch failed", error instanceof Error ? error.message : String(error));
+              postPlanMode({ error: error instanceof Error ? error.message : String(error) });
+            }
+            break;
+          }
+          case "listJobs": {
+            try {
+              const jobs = ctx.get("jobs");
+              if (jobs === undefined) {
+                post({ t: "jobs", jobs: [], error: "jobs service unavailable" });
+                break;
+              }
+              // list(caller) 返回"该 caller 拥有的 + 无主的"作业；内核无"列举全部 owner"
+              // 的 API，故子代理拥有的作业不会出现在此列表（已知边界）。
+              post({ t: "jobs", jobs: jobs.list(agent).map(jobView) });
+            } catch (error) {
+              post({ t: "jobs", jobs: [], error: error instanceof Error ? error.message : String(error) });
+            }
+            break;
+          }
+          case "jobKill": {
+            try {
+              const jobs = ctx.get("jobs");
+              if (jobs === undefined) throw new Error("jobs service unavailable");
+              const result = jobs.kill(msg.jobId, agent, "cancelled from the VS Code panel");
+              log("info", `job ${msg.jobId} kill → ${result}`);
+              post({ t: "jobKilled", ok: true, result });
+              // 无需再补发 jobsChanged：根 ctx 的 onJobsChanged 观察者已覆盖
+              // "每次会改变 list() 结果的提交"（含 stopping 转移与结算）。
+            } catch (error) {
+              post({ t: "jobKilled", ok: false, error: error instanceof Error ? error.message : String(error) });
+            }
+            break;
+          }
+          case "jobOutput": {
+            try {
+              const jobs = ctx.get("jobs");
+              if (jobs === undefined) throw new Error("jobs service unavailable");
+              const snapshot = jobs.get(msg.jobId, agent);
+              // 读取语义（内核 JobRead）：**流式**作业的 read 会消费增量游标——若面板
+              // 提前读走，模型随后的 job_output 就拿不到那段输出。故运行中只报状态，
+              // 终态读取（幂等、不消耗）才允许。
+              if (snapshot.status === "running" || snapshot.status === "stopping") {
+                post({
+                  t: "jobOutput",
+                  ok: false,
+                  error: L(
+                    "作业仍在运行：输出读取会占用模型的读取游标，请等它结束后再看。",
+                    "Job still running: reading output would consume the model's read cursor — wait until it settles."
+                  ),
+                });
+                break;
+              }
+              const read = jobs.read(msg.jobId, agent);
+              post({ t: "jobOutput", ok: true, text: read.text });
+            } catch (error) {
+              post({ t: "jobOutput", ok: false, error: error instanceof Error ? error.message : String(error) });
+            }
             break;
           }
           case "newSession": {

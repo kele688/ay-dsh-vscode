@@ -41,6 +41,15 @@
   const tokensCacheEl = $("tokensCache");
   const tokensOutEl = $("tokensOut");
   const btnCompact = $("btnCompact");
+  const btnPlan = $("btnPlan");
+  const btnJobs = $("btnJobs");
+  const jobsPanelEl = $("jobsPanel");
+  const jobsListEl = $("jobsList");
+  const btnJobsRefresh = $("btnJobsRefresh");
+  const btnJobsClose = $("btnJobsClose");
+  const questionEl = $("question");
+  const questionTitleEl = $("questionTitle");
+  const questionBodyEl = $("questionBody");
   const selProvider = $("selProvider");
   const selModel = $("selModel");
   const selEffort = $("selEffort");
@@ -66,6 +75,12 @@
     historyMore: null, // {hasMore, nextSeq} 分页状态
     historyLoadingMore: false, // 正在加载更早历史（防重入）
     streamText: "", // 当前流式气泡的累积纯文本（供节流 markdown 渲染使用）
+    questions: new Map(), // 未决问答：id -> {questions, agentId}（多请求按队列逐个处理）
+    pendingQuestionId: null,
+    planModeActive: false, // plan 模式开关态（宿主 planMode 帧同步）
+    jobs: [], // 后台作业快照（宿主 jobs 帧）
+    jobsOpen: false,
+    jobOutputs: [], // 已读取的作业输出（最多保留最近 3 条；列表刷新时据此重建 DOM）
   };
 
   // 代码块复制：codeId -> 代码文本（渲染时登记，点击复制按钮时读取）
@@ -178,6 +193,34 @@
       imageTooLarge: (mb) => `这张图片超过单张 ${mb}MB 的上限了——先压缩一下，或换一张小一点的就好`,
       fileUnsupported: (name) => `“${name || "文件"}”似乎还不是我支持的图片格式（PNG / JPG / WebP / GIF）——换成其中一种就好`,
       closeLightbox: "关闭",
+      // 问答（内核 user-questions；含 plan-review 计划评审）
+      questionTitle: "需要你的回答",
+      questionPlanTitle: "计划评审",
+      questionOther: "其它（可输入自定义回答）",
+      questionSubmit: "提交",
+      questionApprove: "批准",
+      questionKeep: "继续规划",
+      questionDiscuss: "先讨论一下",
+      questionFeedback: "可补充你的修改意见（可选）",
+      questionAgent: (id) => `🧩 来自子任务 …${id}`,
+      questionQueue: (n) => `⏳ 还有 ${n} 个待回答请求（逐个处理）`,
+      // plan 模式开关
+      planOn: "已进入 Plan 模式（先规划、待批准再执行）",
+      planOff: "已退出 Plan 模式",
+      planPending: "Plan 模式切换将在下一步生效",
+      planUnavailable: "当前会话尚不可用，无法切换 Plan 模式",
+      // 后台作业
+      jobsEmpty: "当前没有后台作业。",
+      jobsKill: "取消",
+      jobsOutput: "输出",
+      jobsRunning: "运行中",
+      jobsStopping: "停止中",
+      jobsCompleted: "已完成",
+      jobsKilled: "已取消",
+      jobsFailed: "失败",
+      jobsOutputLoading: "正在读取输出…",
+      jobsOutputTitle: "作业输出",
+      jobsKillHint: "已请求取消该作业",
     },
     en: {
       goalRoundChip: (n, m) => `↻ Goal auto-continuation (round ${n}/${m}, system directive)`,
@@ -279,6 +322,34 @@
       imageTooLarge: (mb) => `This image exceeds the ${mb}MB per-image limit — compress it, or pick a smaller one`,
       fileUnsupported: (name) => `“${name || "File"}” doesn't look like a supported image type (PNG / JPG / WebP / GIF) — try one of those`,
       closeLightbox: "Close",
+      // Questions (kernel user-questions; includes the plan-review decision)
+      questionTitle: "Your Answer Is Needed",
+      questionPlanTitle: "Plan Review",
+      questionOther: "Other (type a custom answer)",
+      questionSubmit: "Submit",
+      questionApprove: "Approve",
+      questionKeep: "Keep planning",
+      questionDiscuss: "Chat about it",
+      questionFeedback: "Add your feedback (optional)",
+      questionAgent: (id) => `🧩 from subtask …${id}`,
+      questionQueue: (n) => `⏳ ${n} pending question(s) — handled one by one`,
+      // Plan mode toggle
+      planOn: "Plan mode on (plan first, execute after approval)",
+      planOff: "Plan mode off",
+      planPending: "The plan-mode switch applies from the next step",
+      planUnavailable: "No active session yet — cannot switch plan mode",
+      // Background jobs
+      jobsEmpty: "No background jobs.",
+      jobsKill: "Cancel",
+      jobsOutput: "Output",
+      jobsRunning: "running",
+      jobsStopping: "stopping",
+      jobsCompleted: "completed",
+      jobsKilled: "killed",
+      jobsFailed: "failed",
+      jobsOutputLoading: "Reading output…",
+      jobsOutputTitle: "Job output",
+      jobsKillHint: "Cancellation requested",
     },
   };
 
@@ -1190,6 +1261,262 @@
     }
   });
 
+  /* ---------------- 问答（内核 user-questions：通用问答 + plan-review 计划评审） ----------------
+     为什么前端要处理它：内核 `exit_plan_mode` 的计划评审**只能**经 user-questions
+     通道送达，无通道即 fail-closed；审批通道（approval/request）帮不上忙。 */
+
+  function showQuestion(id, questions, agentId) {
+    state.questions.set(id, { questions: Array.isArray(questions) ? questions : [], agentId });
+    renderQuestionModal();
+  }
+
+  /** 关闭指定问答；若关闭的是当前显示的，自动展示下一个未决请求。 */
+  function hideQuestion(id) {
+    state.questions.delete(id);
+    if (state.pendingQuestionId === id) renderQuestionModal();
+  }
+
+  /** 渲染 modal：显示最新一个未决问答（plan-review 走专用呈现，其余走通用选项列表）。 */
+  function renderQuestionModal() {
+    if (!questionEl) return;
+    const pending = [...state.questions.entries()];
+    if (pending.length === 0) {
+      questionEl.classList.add("hidden");
+      state.pendingQuestionId = null;
+      return;
+    }
+    const [id, entry] = pending[pending.length - 1];
+    state.pendingQuestionId = id;
+    const items = entry.questions;
+    const first = items[0] || {};
+    const isPlanReview = !!(first.intent && first.intent.kind === "plan-review");
+    questionTitleEl.textContent = isPlanReview ? t("questionPlanTitle") : first.header || t("questionTitle");
+    questionBodyEl.innerHTML = "";
+    if (pending.length > 1) {
+      questionBodyEl.appendChild(el("p", "approval-queue", t("questionQueue", pending.length)));
+    }
+    if (entry.agentId) {
+      questionBodyEl.appendChild(el("p", "approval-agent", t("questionAgent", entry.agentId)));
+    }
+    if (isPlanReview) renderPlanReview(id, first);
+    else renderGenericQuestion(id, items);
+    questionEl.classList.remove("hidden");
+    scrollToBottom();
+  }
+
+  /** 把一个问题的答案按内核契约发回（`selected` 必须是**提问方自己的选项标签**）。 */
+  function postAnswers(id, answers) {
+    vscode.postMessage({ t: "question:resolve", id, outcome: "answer", answers });
+    hideQuestion(id);
+  }
+
+  /** plan-review 决定卡：计划正文 + 批准 / 继续规划（可附意见）/ 先讨论一下。 */
+  function renderPlanReview(id, q) {
+    const planEl = el("div", "question-plan");
+    // 计划正文走与助手消息同一套"先转义后格式化"渲染（模型输出不可信）
+    planEl.innerHTML = renderMarkdown(String(q.detail || ""));
+    questionBodyEl.appendChild(planEl);
+
+    const feedback = el("textarea", "question-feedback");
+    feedback.rows = 3;
+    feedback.placeholder = t("questionFeedback");
+    questionBodyEl.appendChild(feedback);
+
+    const opts = Array.isArray(q.options) ? q.options : [];
+    // approve 标签由提问方命名，且内核在提问时已校验它确实属于本题选项——
+    // 因此这里不做"猜标签"的兜底（硬编码英文标签只会在内核改文案时静默错位）。
+    const approveLabel = q.intent && typeof q.intent.approve === "string" ? q.intent.approve : "";
+    // 其余选项即"继续规划"；若提问方只给了 approve 一个选项，则不渲染该按钮
+    // （而不是塞一个内核不认识的标签，那只会让整批答案 fail-closed）
+    const keepLabel = (opts.find((o) => o.label !== approveLabel) || {}).label;
+
+    const actions = el("div", "approval-actions question-actions");
+    const btnDiscuss = el("button", "btn deny", t("questionDiscuss"));
+    // 讨论：取消本次评审（内核把"用户想插话"与"评审失败"区分开：ASK_CANCELLED）
+    btnDiscuss.addEventListener("click", () => {
+      vscode.postMessage({ t: "question:resolve", id, outcome: "cancel" });
+      hideQuestion(id);
+    });
+    actions.appendChild(btnDiscuss);
+    if (keepLabel !== undefined) {
+      const btnKeep = el("button", "btn deny", t("questionKeep"));
+      btnKeep.addEventListener("click", () => {
+        const custom = feedback.value.trim();
+        postAnswers(id, [{ id: q.id, selected: [keepLabel], ...(custom ? { custom } : {}) }]);
+      });
+      actions.appendChild(btnKeep);
+    }
+    if (approveLabel !== "") {
+      const btnApprove = el("button", "btn allow", t("questionApprove"));
+      btnApprove.addEventListener("click", () => postAnswers(id, [{ id: q.id, selected: [approveLabel] }]));
+      actions.appendChild(btnApprove);
+    }
+    questionBodyEl.appendChild(actions);
+  }
+
+  /** 通用问答卡：单选 / 多选 + 自定义回答（内核未提供选项时只留自定义）。 */
+  function renderGenericQuestion(id, items) {
+    const rows = [];
+    for (const q of items) {
+      const row = el("div", "question-item");
+      if (q.header) row.appendChild(el("p", "question-header", q.header));
+      row.appendChild(el("p", "question-text", q.question));
+      if (q.detail) {
+        const detail = el("pre", "question-detail", q.detail);
+        row.appendChild(detail);
+      }
+      const selected = new Set();
+      const options = Array.isArray(q.options) ? q.options : [];
+      for (const o of options) {
+        const label = el("label", "question-option");
+        const input = document.createElement("input");
+        input.type = q.multiSelect ? "checkbox" : "radio";
+        input.name = `q_${id}_${q.id}`;
+        input.value = o.label;
+        input.addEventListener("change", () => {
+          if (!q.multiSelect) {
+            selected.clear();
+            selected.add(o.label);
+          } else if (input.checked) selected.add(o.label);
+          else selected.delete(o.label);
+        });
+        label.appendChild(input);
+        const text = el("span", "", o.label);
+        if (o.description) text.title = o.description;
+        label.appendChild(text);
+        row.appendChild(label);
+      }
+      const other = el("input", "question-other");
+      other.type = "text";
+      other.placeholder = t("questionOther");
+      row.appendChild(other);
+      rows.push({ q, selected, other });
+      questionBodyEl.appendChild(row);
+    }
+    const actions = el("div", "approval-actions question-actions");
+    const btnSubmit = el("button", "btn allow", t("questionSubmit"));
+    btnSubmit.addEventListener("click", () => {
+      const answers = [];
+      for (const { q, selected, other } of rows) {
+        const custom = other.value.trim();
+        const picked = [...selected];
+        // 内核要求"有选项就须选中至少一个，或有自定义文本"；否则整批 fail-closed。
+        // 多选超限不可能发生（单选在 change 里已 clear），故不作为分支。
+        if (picked.length === 0 && custom === "") {
+          setHint(t("questionOther"));
+          return;
+        }
+        answers.push({ id: q.id, selected: picked, ...(custom ? { custom } : {}) });
+      }
+      postAnswers(id, answers);
+    });
+    actions.appendChild(btnSubmit);
+    questionBodyEl.appendChild(actions);
+  }
+
+  /* ---------------- plan 模式开关（内核 ctx.planMode） ---------------- */
+
+  function renderPlanMode(msg) {
+    state.planModeActive = msg.active === true;
+    if (!btnPlan) return;
+    btnPlan.classList.toggle("active", state.planModeActive);
+    btnPlan.classList.toggle("pending", msg.pending === true);
+    if (msg.error) setHint(t("planUnavailable"));
+    else if (msg.pending) setHint(t("planPending"));
+    else setHint(state.planModeActive ? t("planOn") : t("planOff"));
+  }
+
+  btnPlan?.addEventListener("click", () => {
+    vscode.postMessage({ t: "setPlanMode", active: !state.planModeActive });
+  });
+
+  /* ---------------- 后台作业面板（内核 ctx.jobs） ----------------
+     只做"状态可观测 + 取消 + 已结束作业的输出"：运行中读取输出会占用模型的读取
+     游标，宿主侧已拒绝，因此界面只在终态提供输出入口。 */
+
+  const JOB_STATUS_KEY = {
+    running: "jobsRunning",
+    stopping: "jobsStopping",
+    completed: "jobsCompleted",
+    killed: "jobsKilled",
+    failed: "jobsFailed",
+  };
+
+  function renderJobs(list) {
+    state.jobs = Array.isArray(list) ? list : [];
+    if (!jobsListEl) return;
+    jobsListEl.innerHTML = "";
+    // 已读取过的作业输出：刷新列表会清空 DOM，故从 state 重建（否则任何作业状态
+    // 变化触发的刷新都会把用户刚打开的输出抹掉）
+    for (const item of state.jobOutputs) {
+      jobsListEl.appendChild(jobOutputBlock(item.text));
+    }
+    if (state.jobs.length === 0) {
+      if (state.jobOutputs.length === 0) jobsListEl.appendChild(el("div", "history-empty", t("jobsEmpty")));
+      return;
+    }
+    for (const job of state.jobs) {
+      const row = el("div", "job-row");
+      const head = el("div", "job-head");
+      head.appendChild(el("span", `job-status job-${job.status}`, t(JOB_STATUS_KEY[job.status] || "jobsRunning")));
+      head.appendChild(el("span", "job-label", job.label || job.id));
+      head.appendChild(el("span", "spacer"));
+      const btnOut = el("button", "icon-btn small", t("jobsOutput"));
+      btnOut.title = t("jobsOutputTitle");
+      // 终态才可读（幂等、不消耗游标）；运行中读取会被宿主拒绝
+      if (job.status === "running" || job.status === "stopping") btnOut.classList.add("disabled");
+      btnOut.addEventListener("click", () => {
+        if (btnOut.classList.contains("disabled")) return;
+        setHint(t("jobsOutputLoading"));
+        vscode.postMessage({ t: "jobOutput", jobId: job.id });
+      });
+      const btnKill = el("button", "icon-btn small", t("jobsKill"));
+      if (job.status !== "running" && job.status !== "stopping") btnKill.classList.add("disabled");
+      btnKill.addEventListener("click", () => {
+        if (btnKill.classList.contains("disabled")) return;
+        vscode.postMessage({ t: "jobKill", jobId: job.id });
+        setHint(t("jobsKillHint"));
+      });
+      head.append(btnOut, btnKill);
+      row.appendChild(head);
+      const meta = `${job.kind || ""} · ${job.id}${job.detail ? ` · ${job.detail}` : ""}`;
+      row.appendChild(el("div", "job-meta", meta));
+      jobsListEl.appendChild(row);
+    }
+  }
+
+  function toggleJobs(open) {
+    if (!jobsPanelEl) return;
+    state.jobsOpen = open;
+    jobsPanelEl.classList.toggle("hidden", !open);
+    if (open) {
+      // 两个面板都是覆盖层且同 z-index：互斥，避免"作业盖住历史、关掉作业又露出历史"
+      historyPanel?.classList.add("hidden");
+      vscode.postMessage({ t: "jobsRefresh" });
+    }
+  }
+
+  /** 构造一个作业输出块（渲染与重建共用）。 */
+  function jobOutputBlock(text) {
+    const block = el("div", "job-output-block");
+    block.appendChild(el("div", "job-output-title", t("jobsOutputTitle")));
+    block.appendChild(el("pre", "job-output", String(text ?? "")));
+    return block;
+  }
+
+  /** 记录一个已结束作业的最终输出并立即显示（列表刷新时由 renderJobs 重建）。 */
+  function showJobOutput(text) {
+    // 只保留最近若干条，避免长时间开着面板无限累积
+    state.jobOutputs.unshift({ text });
+    if (state.jobOutputs.length > 3) state.jobOutputs.length = 3;
+    if (!jobsListEl) return;
+    jobsListEl.insertBefore(jobOutputBlock(text), jobsListEl.firstChild);
+  }
+
+  btnJobs?.addEventListener("click", () => toggleJobs(!state.jobsOpen));
+  btnJobsRefresh?.addEventListener("click", () => vscode.postMessage({ t: "jobsRefresh" }));
+  btnJobsClose?.addEventListener("click", () => toggleJobs(false));
+
   /* ---------------- 会话重命名（触发行下方就近内联输入条） ---------------- */
   let renameSessionId = null;
   let renameInlineEl = null;
@@ -1406,6 +1733,8 @@
   function openHistory() {
     confirmDeleteId = null;
     closeRenameInline();
+    // 作业面板同为空覆盖层：互斥关闭（见 toggleJobs 的同款理由）
+    toggleJobs(false);
     historyPanel.classList.remove("hidden");
     historyList.innerHTML = "";
     historyList.appendChild(el("div", "history-empty", t("loading")));
@@ -1835,6 +2164,27 @@
       case "approvalResolved":
         // 只关闭对应 id 的审批（多 agent 并发时不会误关其他请求）
         hideApproval(msg.id);
+        break;
+      case "question":
+        showQuestion(msg.id, msg.questions, msg.agentId);
+        break;
+      case "questionResolved":
+        hideQuestion(msg.id);
+        break;
+      case "planMode":
+        renderPlanMode(msg);
+        break;
+      case "jobs":
+        renderJobs(msg.jobs);
+        if (msg.error) setHint(msg.error, 8000);
+        break;
+      case "jobsChanged":
+        // 纯推送信号：面板开着才回拉，避免无谓往返
+        if (state.jobsOpen) vscode.postMessage({ t: "jobsRefresh" });
+        break;
+      case "jobOutput":
+        if (msg.ok) showJobOutput(msg.text);
+        else setHint(msg.error || "", 8000);
         break;
       case "status":
         setStatus(msg.status);
