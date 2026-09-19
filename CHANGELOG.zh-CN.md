@@ -1,5 +1,14 @@
 # 更新日志
 
+## [0.5.6] - 2026-09-19
+
+- 问答/计划/作业界面
+- 分层环境读取修复
+- Linux/macOS 原生打包补齐
+- feat: add question/plan/jobs surfaces and fix layered env reads
+- fix: bundle node-addon-system platform packages for Linux/macOS
+- fix: bundle node-addon-system platform packages for Linux/macOS
+
 ## [0.5.5] - 2026-09-13
 
 - 安全与正确性加固

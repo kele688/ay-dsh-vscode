@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.5.6] - 2026-09-19
+
+- Question/plan/jobs surfaces
+- layered env read fix
+- Linux/macOS native bundling
+- feat: add question/plan/jobs surfaces and fix layered env reads
+- fix: bundle node-addon-system platform packages for Linux/macOS
+- fix: bundle node-addon-system platform packages for Linux/macOS
+
 ## [0.5.5] - 2026-09-13
 
 - Security and correctness hardening
