@@ -41,7 +41,7 @@ function envFlag(name) {
 }
 
 const NAME = "dsh-vscode-host";
-const CORE_VERSION = "0.5.6";
+const CORE_VERSION = "0.5.7";
 /** 插件会话 id 前缀（也是会话隔离的标识）。 */
 const SESSION_PREFIX = "dsh-vscode-";
 
@@ -846,6 +846,34 @@ function stepGuideText(limit, steps, tools, elapsed) {
   return `[Step guide] STEPS_USED=${steps} / STEPS_REMAIN=${remaining} / TOOLS_USED=${tools} / ELAPSED_SEC=${elapsed}`;
 }
 
+/**
+ * `[本步指引]` 的注入点（步号从 1 起）：第 1 步、预算 1/2、预算 3/4、最后 3 步。
+ *
+ * 为什么不再每步注入：该文本逐字符固定、只有数字变化，每步一条会在长会话里堆积
+ * 大量**近重复消息**（默认预算 100 步 → 单轮最多近百条）。上下文的这种自相似性会
+ * 抬高模型延续重复模式的倾向，是退化（如连续输出 `Go.`）的诱因之一；而关键节点
+ * 注入同样能传达剩余预算（信息不丢），且显著降低自相似度与 token 成本。
+ *
+ * @param limit - 本轮步数预算（>0）。
+ * @returns 需要注入的步号集合（各点可能重叠，Set 已去重；limit 很小时自然退化为少数几步）。
+ */
+function stepGuidePoints(limit) {
+  return new Set(
+    [1, Math.ceil(limit / 2), Math.ceil((limit * 3) / 4), limit - 2, limit - 1, limit].filter(
+      (point) => point >= 1
+    )
+  );
+}
+
+/**
+ * 即将开始的这一步（步号 = 已完成的步数 + 1）是否需要注入 `[本步指引]`。
+ * @param limit - 本轮步数预算。
+ * @param stepNumber - 即将开始的步号（1 起）。
+ */
+function shouldInjectStepGuide(limit, stepNumber) {
+  return limit > 0 && stepNumber >= 1 && stepGuidePoints(limit).has(stepNumber);
+}
+
 /** 工具拦截拒绝文案（tools/pre-execute deny reason，与 UI 语言一致）。 */
 function stepLimitDenyReason(count, limit) {
   return UI_LANG === "zh"
@@ -919,8 +947,37 @@ function attachAgent(ctx, handle, pump) {
   // 环境变量直读：非数字或缺失时回退 100；合法值原样保留（0 = 不限制）。
   const maxSteps = Number(process.env.DSH_MAX_STEPS);
   const stepLimit = Number.isFinite(maxSteps) ? maxSteps : 100;
+  /** 达限后仍不收尾的容忍次数：步数再推进、或工具再被拒，达到该值即强制终止本轮。 */
+  const LIMIT_GRACE_ATTEMPTS = 3;
   let stepCount = 0;
   let stepLimitHit = false;
+  /** 达限后被拒绝的工具调用次数（tools/pre-execute 计数）。 */
+  let limitDeniedCount = 0;
+  /** 本轮是否已因"达限仍不收尾"而强制终止（防止重复终止与重复提示）。 */
+  let limitAborted = false;
+  /**
+   * 达限后仍未收尾 → 强制终止本轮对话（`agent.cancel`）。
+   * 软性收尾（提示词 + 工具拦截）已给出容忍次数；模型仍不停止时，继续空转只烧 token
+   * 不产出，硬终止是必要兜底。会话与历史不受影响，用户可直接继续下一轮；cause 用
+   * `hook`（宿主钩子触发），不冒用 `user`。
+   */
+  const abortTurnAfterLimit = (detail) => {
+    if (limitAborted) return;
+    limitAborted = true;
+    log("warn", `turn force-aborted after step limit: ${detail} (${stepCount}/${stepLimit})`);
+    post({
+      t: "hint",
+      text: L(
+        `已达步数上限（${stepLimit} 步）后模型仍未收尾（${detail}），已强制终止本轮；结果可能不完整，可直接继续下一轮。`,
+        `The step limit (${stepLimit}) was reached and the model still would not wrap up (${detail}); the turn was force-stopped. Results may be partial — just continue in the next turn.`
+      ),
+    });
+    try {
+      agent.cancel({ kind: "hook", reason: `step limit reached and the turn would not wrap up: ${detail}` });
+    } catch (error) {
+      log("warn", "force abort failed", error instanceof Error ? error.message : String(error));
+    }
+  };
   /** 消息层收尾指令是否已注入（每轮最多注入一次，避免刷屏）。 */
   let wrapUpInjected = false;
   /** 每轮首步 [本轮指引] 是否已注入（每轮一次，pre-step 末尾消息；不进系统提示）。 */
@@ -1003,6 +1060,8 @@ function attachAgent(ctx, handle, pump) {
     recordTurnPerf();
     stepCount = 0;
     stepLimitHit = false;
+    limitDeniedCount = 0;
+    limitAborted = false;
     wrapUpInjected = false;
     roundGuideInjected = false;
     toolCallCount = 0;
@@ -1044,12 +1103,15 @@ function attachAgent(ctx, handle, pump) {
   agent.ctx.on("session/event", (_session, event) => {
     if (event.type === "step/start") {
       stepCount++;
-      // 达到上限：不硬截停（agent.cancel 会生硬打断模型），只通报一次，
-      // 由 assemble 钩子注入的收尾提示引导模型自然结束。
+      // 达到上限：先软性收尾（通报 + 收尾提示注入，由 assemble/pre-step 引导自然结束）
       if (!stepLimitHit && stepLimit > 0 && stepCount >= stepLimit) {
         stepLimitHit = true;
         // step 控制相关日志只保留"注入系统提示"一条（见 assemble 钩子），此处不再打印
         post({ t: "stepLimit", maxSteps: stepLimit, steps: stepCount });
+      }
+      // 达限后步数仍继续推进（模型不调工具、只在思考里空转）超过容忍次数 → 强制终止本轮
+      if (stepLimit > 0 && stepLimitHit && stepCount >= stepLimit + LIMIT_GRACE_ATTEMPTS) {
+        abortTurnAfterLimit(`${stepCount - stepLimit} steps past the limit`);
       }
     }
     // plan 模式变更同步：内核 plan-mode 追加 `plan/mode` 事件（log-only 全量替换）
@@ -1180,12 +1242,15 @@ function attachAgent(ctx, handle, pump) {
   // **末尾**（历史区），前缀稳定命中 KV 缓存；消息会写入会话历史（模型全程
   // 可见），前端据前缀**过滤不显示**（见 chat.js isSystemDirective）。
   //  - [本轮指引]：每轮首步一次（总预算 + 效率引导 + 绩效参考）；
-  //  - [本步指引]：每步一次（动态剩余预算/工具次数/耗时，尽快完成）；
-  //  - [达限警示]：达限后一次（收尾指令 + 数字直拼收尾报告首行）。
+  //  - [本步指引]：**关键节点注入**——第 1 步 / 预算 1/2 / 3/4 / 最后 3 步（动态剩余预算/
+  //    工具次数/耗时）。不每步注入的原因：该文本逐字符固定、仅数字变化，每步一条会在长
+  //    会话里堆出大量近重复消息，抬高上下文自相似度（重复模式诱因），故按需注入；
+  //  - [达限警示]：达限后一次（收尾指令 + 数字直拼收尾报告首行）；若在容忍次数内仍不收尾
+  //    （步数再推进、或工具调用再被拒 ≥ LIMIT_GRACE_ATTEMPTS）→ 强制终止本轮。
   // 注意：agent/request 瀑布改 messages 无效（dsh-agent-loop buildRequest 只
   // 消费 provider/model/effort 等配置字段，request.messages 由外部组装）——
   // 消息层注入只能走 agent/pre-step 的 decision.messages（探针已实证可行）。
-  agent.ctx.on("agent/pre-step", async (_payload, next) => {
+  agent.ctx.on("agent/pre-step", async (payload, next) => {
     const decision = await next();
     if (decision.kind !== "enter") return decision;
     let messages = decision.messages ?? [];
@@ -1213,8 +1278,15 @@ function attachAgent(ctx, handle, pump) {
       }
       add(roundGuideText(perfNote()));
     }
-    // 每步：注入 [本步指引]（动态剩余，尽快完成）
-    if (stepLimit > 0) {
+    // 关键节点注入 [本步指引]（第 1 步 / 预算 1/2 / 3/4 / 最后 3 步）：不再每步注入，
+    // 避免在长会话里堆积"仅数字变化"的近重复消息（抬高上下文自相似度、诱发重复模式）。
+    // 步号直接用内核 pre-step 的 payload.step：**1 起**，首步即 1
+    // （agent-loop/src/agent.ts:288 `const step = phase.step + 1` → :289 传入该 payload，
+    //  :302 以同一 step 号 append step/start）。旧内核若缺该字段则回退 stepCount + 1
+    //  ——pre-step 早于 step/start，故首步时 stepCount 仍为 0，两种路径都得到 step=1。
+    const proposedStep =
+      Number.isFinite(payload?.step) && payload.step >= 1 ? payload.step : stepCount + 1;
+    if (shouldInjectStepGuide(stepLimit, proposedStep)) {
       add(stepGuideText(stepLimit, stepCount, toolCallCount, elapsedSec()));
     }
     return changed ? { ...decision, messages } : decision;
@@ -1250,6 +1322,11 @@ function attachAgent(ctx, handle, pump) {
       }
     }
     if (stepLimit > 0 && stepLimitHit && gate.kind === "allow") {
+      // 达限后仍尝试执行工具：拒绝并计数；累计达到容忍次数即强制终止本轮
+      limitDeniedCount += 1;
+      if (limitDeniedCount >= LIMIT_GRACE_ATTEMPTS) {
+        abortTurnAfterLimit(`${limitDeniedCount} tool calls attempted past the limit`);
+      }
       return {
         kind: "deny",
         reason: stepLimitDenyReason(stepCount, stepLimit),
@@ -2895,6 +2972,8 @@ async function main() {
   let ctx;
   let handle;
   let agent;
+/** 新会话（agent 尚未创建，惰性创建）时用户选定的 plan 模式；首条消息创建 agent 后应用。null = 未选择。 */
+let pendingPlanMode = null;
   /** 当前 agent 的可变模型选择引用（installModelSelection 使用；setModel 热切换）。 */
   let selection = null;
   /** 当前 agent 的"重置本轮思考步数预算"回调（chat 入口在每条用户消息前调用）。 */
@@ -3229,6 +3308,10 @@ async function main() {
         const state = planMode.get(agent);
         active = state?.active === true;
         pending = state?.pending === true ? true : undefined;
+      } else if (pendingPlanMode !== null) {
+        // 新会话尚未创建 agent：汇报"已选定 + 待首条消息生效"，而不是误导性的 inactive
+        active = pendingPlanMode;
+        pending = true;
       }
     } catch {
       /* 服务不可用 → 视为未启用 */
@@ -3273,6 +3356,19 @@ async function main() {
               resetStepBudget = created.resetStepBudget;
               // 新会话接管会话锁（统一写锁：其他实例试图恢复本会话时将被拒绝）。
               acquireSessionLock(agent.session.id);
+              // 新会话期间用户选定的 plan 模式：会话真正创建后立即应用（首条消息即处于该模式）
+              if (pendingPlanMode !== null) {
+                const wanted = pendingPlanMode;
+                pendingPlanMode = null;
+                try {
+                  const planMode = ctx.get("planMode");
+                  if (planMode !== undefined && typeof planMode.set === "function") {
+                    log("info", `plan mode deferred selection applied(${wanted}) → ${planMode.set(agent, wanted)}`);
+                  }
+                } catch (error) {
+                  log("warn", "deferred plan mode apply failed", error instanceof Error ? error.message : String(error));
+                }
+              }
               // 会话已真实创建：立即生成**静态临时标题**写入 meta（标题是静态
               // 记录，此后仅由用户重命名覆盖）。列表直接读 meta，无需内核折叠
               // 会话日志推导标题——历史列表因此秒开，与会话内容大小无关。
@@ -3403,7 +3499,11 @@ async function main() {
               break;
             }
             if (agent === undefined) {
-              postPlanMode({ error: "no active session yet" });
+              // 新会话尚未创建 agent（惰性创建，见 newSession/chat 注释）：先记录用户选择，
+              // 首条消息创建 agent 后立即应用——此前直接报错会让"新建会话"完全无法切换 plan。
+              pendingPlanMode = msg.active === true;
+              log("info", `plan mode deferred(${pendingPlanMode}) until the session is created`);
+              postPlanMode({ result: "deferred" });
               break;
             }
             try {
@@ -3473,6 +3573,7 @@ async function main() {
           }
           case "newSession": {
             pendingSessionId = null; // 用户主动新建：作废轮转预建的下一会话 id
+            pendingPlanMode = null; // 新会话从默认模式开始（用户点 PLAN 会重新记录）
             clearOwnLock(); // 释放旧会话锁（即将不再持有任何会话）
             if (handle !== undefined) {
               await handle.dispose();

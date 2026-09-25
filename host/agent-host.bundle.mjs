@@ -85902,7 +85902,7 @@ function envFlag(name) {
   return String(process.env[name] ?? "0") !== "0";
 }
 var NAME2 = "dsh-vscode-host";
-var CORE_VERSION = "0.5.6";
+var CORE_VERSION = "0.5.7";
 var SESSION_PREFIX = "dsh-vscode-";
 var workMode = "single";
 var dshProviders = [];
@@ -86307,6 +86307,16 @@ function stepGuideText(limit3, steps, tools, elapsed) {
   }
   return `[Step guide] STEPS_USED=${steps} / STEPS_REMAIN=${remaining} / TOOLS_USED=${tools} / ELAPSED_SEC=${elapsed}`;
 }
+function stepGuidePoints(limit3) {
+  return new Set(
+    [1, Math.ceil(limit3 / 2), Math.ceil(limit3 * 3 / 4), limit3 - 2, limit3 - 1, limit3].filter(
+      (point) => point >= 1
+    )
+  );
+}
+function shouldInjectStepGuide(limit3, stepNumber) {
+  return limit3 > 0 && stepNumber >= 1 && stepGuidePoints(limit3).has(stepNumber);
+}
 function stepLimitDenyReason(count, limit3) {
   return UI_LANG === "zh" ? `\u5DE5\u5177\u8C03\u7528\u5DF2\u7981\u7528\u2014\u2014\u672C\u8F6E\u5DF2\u8FBE\u601D\u8003\u6B65\u6570\u4E0A\u9650\uFF08${count}/${limit3}\uFF09\u3002\u8BF7\u7ACB\u5373\u505C\u6B62\u5DE5\u4F5C\u5E76\u7ED9\u51FA\u6700\u7EC8\u7B54\u590D\u3002` : `Tool calls are disabled \u2014 this turn reached its step limit (${count}/${limit3}). Stop working and deliver your final summary now.`;
 }
@@ -86321,8 +86331,28 @@ function attachAgent(ctx, handle, pump2) {
   pump2.sizeProvider = () => agent === void 0 || agent.session === void 0 ? void 0 : sessionFileSize(String(agent.session.id));
   const maxSteps = Number(process.env.DSH_MAX_STEPS);
   const stepLimit = Number.isFinite(maxSteps) ? maxSteps : 100;
+  const LIMIT_GRACE_ATTEMPTS = 3;
   let stepCount = 0;
   let stepLimitHit = false;
+  let limitDeniedCount = 0;
+  let limitAborted = false;
+  const abortTurnAfterLimit = (detail) => {
+    if (limitAborted) return;
+    limitAborted = true;
+    log("warn", `turn force-aborted after step limit: ${detail} (${stepCount}/${stepLimit})`);
+    post({
+      t: "hint",
+      text: L(
+        `\u5DF2\u8FBE\u6B65\u6570\u4E0A\u9650\uFF08${stepLimit} \u6B65\uFF09\u540E\u6A21\u578B\u4ECD\u672A\u6536\u5C3E\uFF08${detail}\uFF09\uFF0C\u5DF2\u5F3A\u5236\u7EC8\u6B62\u672C\u8F6E\uFF1B\u7ED3\u679C\u53EF\u80FD\u4E0D\u5B8C\u6574\uFF0C\u53EF\u76F4\u63A5\u7EE7\u7EED\u4E0B\u4E00\u8F6E\u3002`,
+        `The step limit (${stepLimit}) was reached and the model still would not wrap up (${detail}); the turn was force-stopped. Results may be partial \u2014 just continue in the next turn.`
+      )
+    });
+    try {
+      agent.cancel({ kind: "hook", reason: `step limit reached and the turn would not wrap up: ${detail}` });
+    } catch (error) {
+      log("warn", "force abort failed", error instanceof Error ? error.message : String(error));
+    }
+  };
   let wrapUpInjected = false;
   let roundGuideInjected = false;
   let toolCallCount = 0;
@@ -86360,6 +86390,8 @@ function attachAgent(ctx, handle, pump2) {
     recordTurnPerf();
     stepCount = 0;
     stepLimitHit = false;
+    limitDeniedCount = 0;
+    limitAborted = false;
     wrapUpInjected = false;
     roundGuideInjected = false;
     toolCallCount = 0;
@@ -86388,6 +86420,9 @@ function attachAgent(ctx, handle, pump2) {
       if (!stepLimitHit && stepLimit > 0 && stepCount >= stepLimit) {
         stepLimitHit = true;
         post({ t: "stepLimit", maxSteps: stepLimit, steps: stepCount });
+      }
+      if (stepLimit > 0 && stepLimitHit && stepCount >= stepLimit + LIMIT_GRACE_ATTEMPTS) {
+        abortTurnAfterLimit(`${stepCount - stepLimit} steps past the limit`);
       }
     }
     if (event.type === "plan/mode") {
@@ -86456,7 +86491,7 @@ function attachAgent(ctx, handle, pump2) {
     sections.push(wrapUpReportSection());
     return { ...assembled, sections };
   });
-  agent.ctx.on("agent/pre-step", async (_payload, next) => {
+  agent.ctx.on("agent/pre-step", async (payload, next) => {
     const decision = await next();
     if (decision.kind !== "enter") return decision;
     let messages = decision.messages ?? [];
@@ -86478,7 +86513,8 @@ ${reiterationText}`);
       }
       add(roundGuideText(perfNote()));
     }
-    if (stepLimit > 0) {
+    const proposedStep = Number.isFinite(payload?.step) && payload.step >= 1 ? payload.step : stepCount + 1;
+    if (shouldInjectStepGuide(stepLimit, proposedStep)) {
       add(stepGuideText(stepLimit, stepCount, toolCallCount, elapsedSec()));
     }
     return changed ? { ...decision, messages } : decision;
@@ -86501,6 +86537,10 @@ ${reiterationText}`);
       }
     }
     if (stepLimit > 0 && stepLimitHit && gate.kind === "allow") {
+      limitDeniedCount += 1;
+      if (limitDeniedCount >= LIMIT_GRACE_ATTEMPTS) {
+        abortTurnAfterLimit(`${limitDeniedCount} tool calls attempted past the limit`);
+      }
       return {
         kind: "deny",
         reason: stepLimitDenyReason(stepCount, stepLimit)
@@ -87670,6 +87710,7 @@ async function main() {
   let ctx;
   let handle;
   let agent;
+  let pendingPlanMode = null;
   let selection = null;
   let resetStepBudget = null;
   let shuttingDown = false;
@@ -87924,6 +87965,9 @@ ${summary}` }] }
         const state = planMode.get(agent);
         active = state?.active === true;
         pending = state?.pending === true ? true : void 0;
+      } else if (pendingPlanMode !== null) {
+        active = pendingPlanMode;
+        pending = true;
       }
     } catch {
     }
@@ -87950,6 +87994,18 @@ ${summary}` }] }
             selection = created.selection;
             resetStepBudget = created.resetStepBudget;
             acquireSessionLock(agent.session.id);
+            if (pendingPlanMode !== null) {
+              const wanted = pendingPlanMode;
+              pendingPlanMode = null;
+              try {
+                const planMode = ctx.get("planMode");
+                if (planMode !== void 0 && typeof planMode.set === "function") {
+                  log("info", `plan mode deferred selection applied(${wanted}) \u2192 ${planMode.set(agent, wanted)}`);
+                }
+              } catch (error) {
+                log("warn", "deferred plan mode apply failed", error instanceof Error ? error.message : String(error));
+              }
+            }
             if (!getSessionMeta(agent.session.id).title) {
               updateSessionMeta(agent.session.id, { title: genTempTitle(text) });
             }
@@ -88055,7 +88111,9 @@ ${meta.seedSummary}` }],
             break;
           }
           if (agent === void 0) {
-            postPlanMode({ error: "no active session yet" });
+            pendingPlanMode = msg.active === true;
+            log("info", `plan mode deferred(${pendingPlanMode}) until the session is created`);
+            postPlanMode({ result: "deferred" });
             break;
           }
           try {
@@ -88118,6 +88176,7 @@ ${meta.seedSummary}` }],
         }
         case "newSession": {
           pendingSessionId = null;
+          pendingPlanMode = null;
           clearOwnLock();
           if (handle !== void 0) {
             await handle.dispose();

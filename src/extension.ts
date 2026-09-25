@@ -627,26 +627,63 @@ function openDshDetails(version: string): void {
 
 
 /**
- * 跨平台打包修复：vsce 在 Windows 上打 VSIX（zip）不保留 Unix 可执行权限位，
- * 远端 Linux/macOS（remote-ssh / remote-wsl）解压后，打包的
- * `@vscode/ripgrep-<plat>/bin/rg` 无执行权限 → grep/glob 工具 spawn 失败
- * （EACCES / "ripgrep launch failed"）。激活时对平台包 rg 补 chmod +x。
- * （Windows 无 exec 位概念，跳过；失败不影响扩展启动，仅 grep/glob 下次仍失败。）
+ * 安装后原生程序执行位修复（**只在确实缺执行位时动作**）。
+ *
+ * 背景（已查证）：`@vscode/vsce` 打包 VSIX 时把每个条目硬编码为 `mode: 0o100644`
+ * （`node_modules/@vscode/vsce/package.js:404`），且 VSIX **没有安装期钩子**，因此
+ * 远端 Linux/macOS 上被打包的原生可执行文件安装后可能缺 x 位：
+ *   · @vscode/ripgrep-<plat>/bin/rg                 → grep/glob spawn 失败（EACCES）
+ *   · @deepseek-ai/node-addon-system-linux-<arch>/bin/landlock-run
+ *                                                    → Landlock 沙箱探测失败（SANDBOX_UNAVAILABLE）
+ *   · node-pty/prebuilds/<plat>-<arch>/spawn-helper  → 终端/子进程 spawn 失败
+ *
+ * **触发时机（按需，不做多余的事）**：仅当上述目标**当前缺 x 位**时才 chmod。
+ * 每次激活做一次（十几条 lstat 级检查），已可执行则零写入。因此：
+ *   · 同一次安装后再次启动：没有任何写操作与提示；
+ *   · 升级但 native 包未变（文件已可执行）：不动作；
+ *   · **只有新增原生可执行文件时**才需要往下表加一行（极少发生）。
+ *
+ * 安全边界：本表随代码编译进 `dist/extension.js`（= 打包时确定、安装后不可更改，
+ * 改它等同于改扩展代码）；只认这 3 类路径且必须位于 `<extensionPath>/node_modules/`
+ * 内；`lstat` 拒绝符号链接与非普通文件；只补 `0755`（不动其它权限位）；无网络、
+ * 无子进程、不申请提权。
  */
-function fixPackagedRipgrepExec(extensionPath: string): void {
+const NATIVE_EXECUTABLES: readonly { dir: string; pkg: RegExp; file: string }[] = [
+  { dir: "@vscode", pkg: /^ripgrep-(linux|darwin)-/, file: "bin/rg" },
+  { dir: "@deepseek-ai", pkg: /^node-addon-system-linux-/, file: "bin/landlock-run" },
+  { dir: "node-pty/prebuilds", pkg: /^(linux|darwin)-/, file: "spawn-helper" },
+];
+
+/** 恢复原生程序执行位（同步、幂等；只在缺 x 位时写）。 */
+function restoreNativeExecBits(extensionPath: string): void {
   if (process.platform !== "linux" && process.platform !== "darwin") return;
-  try {
-    const scoped = path.join(extensionPath, "node_modules", "@vscode");
-    if (!fs.existsSync(scoped)) return;
-    for (const entry of fs.readdirSync(scoped)) {
-      if (!/^ripgrep-(linux|darwin)-/.test(entry)) continue;
-      const rg = path.join(scoped, entry, "bin", "rg");
-      if (fs.existsSync(rg)) {
-        fs.chmodSync(rg, 0o755);
+  let fixed = 0;
+  for (const spec of NATIVE_EXECUTABLES) {
+    const base = path.join(extensionPath, "node_modules", spec.dir);
+    let entries: string[];
+    try {
+      entries = fs.readdirSync(base);
+    } catch {
+      continue; // 未安装该平台包：跳过
+    }
+    for (const entry of entries) {
+      if (!spec.pkg.test(entry)) continue;
+      const target = path.join(base, entry, spec.file);
+      try {
+        const stat = fs.lstatSync(target);
+        if (!stat.isFile()) continue; // 符号链接/非普通文件：拒绝
+        if ((stat.mode & 0o111) !== 0) continue; // 已可执行：无需动作
+        fs.chmodSync(target, 0o755);
+        fixed += 1;
+      } catch {
+        continue; // 该平台包不含此文件（如 linux 下无 spawn-helper）：跳过
       }
     }
-  } catch {
-    // 修复失败不阻塞扩展启动（grep/glob 调用点有独立错误处理）
+  }
+  if (fixed > 0) {
+    void vscode.window.showInformationMessage(
+      `DSH：已恢复 ${fixed} 个原生程序的可执行权限（沙箱/搜索/终端所需）。`
+    );
   }
 }
 
@@ -688,8 +725,9 @@ function normalizeDshProviders(context: vscode.ExtensionContext): void {
 }
 
 export function activate(context: vscode.ExtensionContext): void {
-  // 远端平台：恢复打包 ripgrep 的可执行权限（见 fixPackagedRipgrepExec 注释）
-  fixPackagedRipgrepExec(context.extensionPath);
+  // 远端平台：若打包导致原生程序缺执行位（vsce 不保留 Unix 权限位），此处同步恢复。
+  // 同步执行保证之后任何宿主 spawn（会做沙箱后端探测）都在权限就绪之后。
+  restoreNativeExecBits(context.extensionPath);
   // 配置真源形式对齐（幂等）：补齐历史 dshProviders 的字段形状，保证修正后的
   // 读取/下发逻辑对既有配置平滑生效——只补字段，不删任何提供商、模型或参数。
   normalizeDshProviders(context);

@@ -68,7 +68,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   /** 未决问答（webview 重建时补发；防止"问题丢失"导致模型工具调用永久挂起）。 */
   private pendingQuestions = new Map<number, { questions: AskQuestionView[]; agentId?: string }>();
   /** 最近一次 plan 模式状态（webview 重建时补发）。 */
-  private lastPlanMode: { active: boolean; pending?: boolean } | undefined;
+  private lastPlanMode: { active: boolean; pending?: boolean; result?: string; error?: string } | undefined;
   /** 待审批时显示的状态栏项（点击聚焦面板）。 */
   private approvalStatusItem: vscode.StatusBarItem | undefined;
   /** 提示信息状态栏项（webview 内 hint 图标 + hover 之外，同步到 VS Code 状态栏）。 */
@@ -385,7 +385,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           }
           // 补发 plan 模式状态（bootstrap 可能早于 planMode 帧到达）
           if (this.lastPlanMode) {
-            this.push({ t: "planMode", active: this.lastPlanMode.active, pending: this.lastPlanMode.pending });
+            this.push({ t: "planMode", active: this.lastPlanMode.active, pending: this.lastPlanMode.pending, result: this.lastPlanMode.result, error: this.lastPlanMode.error });
           }
           const queued = this.pendingTasks.splice(0);
           for (const task of queued) void this.sendChat(task);
@@ -635,7 +635,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         this.push({ t: "questionResolved", id: e.id });
         break;
       case "planMode":
-        this.lastPlanMode = { active: e.active, pending: e.pending };
+        this.lastPlanMode = { active: e.active, pending: e.pending, result: e.result, error: e.error };
         this.push({ t: "planMode", active: e.active, pending: e.pending });
         if (e.error !== undefined) {
           vscode.window.setStatusBarMessage(loc(`Plan 模式切换失败：${e.error}`, `Plan mode switch failed: ${e.error}`), 8000);
