@@ -258,7 +258,7 @@ export type ExtensionToWebview =
   | { t: "sessionSize"; bytes: number }
   | { t: "question"; id: number; questions: AskQuestionView[]; agentId?: string }
   | { t: "questionResolved"; id: number }
-  | { t: "planMode"; active: boolean; pending?: boolean }
+  | { t: "planMode"; active: boolean; pending?: boolean; result?: string; error?: string }
   | { t: "jobs"; jobs: JobView[]; error?: string }
   | { t: "jobsChanged" }
   | { t: "jobOutput"; ok: boolean; text?: string; error?: string };

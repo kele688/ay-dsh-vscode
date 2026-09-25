@@ -1617,33 +1617,51 @@
     return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
   }
 
-  /** 轻量 markdown 渲染（release note 用）：代码块/标题/列表/粗体/行内代码/链接/换行。 */
+  /** GitHub release note 预处理：清掉导航锚点与生成器 HTML（只读框里没有链接语义）。 */
+  function normalizeReleaseNotes(text) {
+    let src = String(text).replace(/\r\n/g, "\n");
+    // 1) 双语锚点导航行（`[中文](#cn-x) | [English](#en-x)`）整行删除
+    src = src.replace(
+      /^[ \t]*\[[^\]]+\]\(#[^)]*\)(?:[ \t]*\|[ \t]*\[[^\]]+\]\(#[^)]*\))*[ \t]*$/gm,
+      ""
+    );
+    // 2) GitHub 生成的 HTML 标题 → markdown 标题（去属性，保留文字）
+    src = src.replace(
+      /<h([1-6])\b[^>]*>([\s\S]*?)<\/h\1>/gi,
+      (_, level, inner) => `\n${"#".repeat(Number(level))} ${String(inner).replace(/<[^>]+>/g, "").trim()}\n`
+    );
+    // 3) 结构标签 → 等价 markdown/换行；其余标签（含 <img> 徽章、<details> 等）一律剥离
+    src = src.replace(/<br\s*\/?>/gi, "\n").replace(/<li\b[^>]*>/gi, "\n- ").replace(/<[^>]+>/g, "");
+    // 4) HTML 实体解码（在剥标签之后做，且 &amp; 最后，避免随后 escapeHtml 造成二次转义）
+    src = src
+      .replace(/&nbsp;/g, " ")
+      .replace(/&lt;/g, "<")
+      .replace(/&gt;/g, ">")
+      .replace(/&quot;/g, '"')
+      .replace(/&#39;/g, "'")
+      .replace(/&amp;/g, "&");
+    return src.replace(/\n{3,}/g, "\n\n");
+  }
+
+  /** 轻量 markdown 渲染（只读预览框用）：代码块/标题/列表/粗体/行内代码/换行。
+   *  **本渲染器不产生任何可点击链接**：`[label](url)` 只保留 label，裸 URL 保持纯文本。
+   *  这些框展示的是外部发布说明摘录与用户本地文件，统一按纯文本呈现才自洽——此前只转
+   *  `https?://` 形式的链接、把 `#锚点` 链接留成 `[中文](#cn-…)` 原文、并原样显示 GitHub
+   *  的 `<h3 id=…>`，属"半处理"。对话消息的渲染见 chat.js（那里链接可点是有意义的，
+   *  两者有意不同）。 */
   function renderMarkdown(text) {
-    const lines = String(text).replace(/\r\n/g, "\n").split("\n");
+    const lines = normalizeReleaseNotes(text).split("\n");
     const out = [];
     let inCode = false;
     let codeBuf = [];
     const inline = (s) => {
-      // 先转义后格式化（与 chat.js 同款，防 HTML 注入）。链接单独在【原始】文本上识别：
-      // href 经严格字符集校验（http(s)、不含引号/空白/尖括号/括号）后原样插入，
-      // 标签文本另行转义——避免"先转义再拼 href"导致 &quot; 二次解码逃出属性。
-      const links = [];
-      let body = String(s).replace(
-        /\[([^\]]+)\]\((https?:\/\/[^\s"'<>()]+)\)/g,
-        (_, label, href) => {
-          links.push({ label, href: href.replace(/&/g, "&amp;") });
-          return `\u0000L${links.length - 1}\u0000`;
-        }
-      );
+      // 先转义后格式化（防 HTML 注入）；链接语法统一降级为纯文本标签
+      let body = String(s).replace(/\[([^\]]+)\]\([^)]*\)/g, "$1");
       body = escapeHtml(body);
-      body = body
+      return body
         .replace(/`([^`]+)`/g, "<code>$1</code>")
         .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
         .replace(/\*([^*]+)\*/g, "<em>$1</em>");
-      return body.replace(/\u0000L(\d+)\u0000/g, (_, id) => {
-        const l = links[Number(id)];
-        return `<a href="${l.href}" rel="noopener noreferrer">${escapeHtml(l.label)}</a>`;
-      });
     };
     for (const line of lines) {
       if (/^```/.test(line)) {

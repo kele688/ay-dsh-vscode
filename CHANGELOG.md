@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.7] - 2026-09-25
+
+- Restore exec bits of packaged native tools on demand (fixes sandbox, search and terminal on remote Linux and macOS)
+- Clean up release-note rendering (no leftover anchors or HTML, no clickable links)
+- Make plan mode usable in a brand-new session and keep error/result on the planMode frame
+- Inject the step guide only at key points and force-stop a turn that will not wrap up after the step limit
+
 ## [0.5.6] - 2026-09-19
 
 - Question/plan/jobs surfaces
