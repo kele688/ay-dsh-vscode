@@ -101,7 +101,7 @@ export type HostFrame =
   | { t: "sessionTitleSynced"; id: string; title: string }
   | { t: "sessionDeleted"; id: string; ok: boolean; error?: string }
   | { t: "sessionExported"; id: string; ok: boolean; path?: string; error?: string }
-  | { t: "modelInfo"; providers: { id: string; name: string }[]; models: string[]; providerModels?: Record<string, { id: string; name: string }[]>; current: { provider: string; model: string; reasoningEffort?: string } }
+  | { t: "modelInfo"; providers: { id: string; name: string }[]; models: string[]; providerModels?: Record<string, { id: string; name: string; inputModalities?: string[] }[]>; current: { provider: string; model: string; reasoningEffort?: string } }
   | { t: "modelChanged"; provider: string; model: string; reasoningEffort?: string }
   | { t: "workModeChanged"; mode: "single" | "multi" }
   | { t: "compactDone"; id: number; ok: boolean; text?: string; error?: string }
@@ -150,7 +150,11 @@ export type ExtensionFrame =
   | {
       t: "providersApply";
       id: number;
-      providers: { id: string; name?: string; baseUrl?: string; protocol?: string; models?: { id: string; displayName?: string; contextWindow?: number | string; maxOutput?: number | string }[]; apiKey?: string }[];
+      providers: { id: string; name?: string; baseUrl?: string; protocol?: string; models?: { id: string; displayName?: string; contextWindow?: number | string; maxOutput?: number | string; inputModalities?: string[] }[]; apiKey?: string }[];
+      /** 本次同步中**已被用户从配置真源删除**的提供商 id。宿主据此清除其孤儿凭据 ref。
+       *  不放进 providers —— 那个列表是"对话面板可选项 + llm-pi-ai providers"的真源，
+       *  放进去会让已删除的提供商复活。 */
+      removedIds?: string[];
     }
   | { t: "rotateConfirm"; ok: boolean }
   | { t: "question:resolve"; id: number; outcome: "answer" | "cancel"; answers?: QuestionAnswerItem[] }
@@ -167,7 +171,7 @@ export interface ProviderApplyItem {
   name?: string;
   baseUrl?: string;
   protocol?: string;
-  models?: { id: string; displayName?: string; contextWindow?: number | string; maxOutput?: number | string }[];
+  models?: { id: string; displayName?: string; contextWindow?: number | string; maxOutput?: number | string; inputModalities?: string[] }[];
   apiKey?: string;
 }
 
@@ -237,7 +241,7 @@ export type ExtensionToWebview =
   | { t: "setModel"; model: string }
   | { t: "stats"; stats: SessionStats }
   | { t: "appendInput"; text: string }
-  | { t: "modelInfo"; providers: { id: string; name: string }[]; models: string[]; providerModels?: Record<string, { id: string; name: string }[]>; current: { provider: string; model: string; reasoningEffort?: string; supportedEfforts?: string[]; defaultEffort?: string } }
+  | { t: "modelInfo"; providers: { id: string; name: string }[]; models: string[]; providerModels?: Record<string, { id: string; name: string; inputModalities?: string[] }[]>; current: { provider: string; model: string; reasoningEffort?: string; supportedEfforts?: string[]; defaultEffort?: string } }
   | { t: "modelChanged"; provider: string; model: string; reasoningEffort?: string; error?: string }
   | { t: "workModeChanged"; mode: "single" | "multi" }
   | { t: "compactDone"; ok: boolean; text?: string; error?: string }

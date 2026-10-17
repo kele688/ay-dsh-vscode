@@ -88818,6 +88818,16 @@ ${meta.seedSummary}` }],
             const settings = ctx.get("settings");
             const credentials = ctx.get("credentials");
             const section = { providers: {} };
+            const removedIds = Array.isArray(msg.removedIds) ? msg.removedIds : [];
+            for (const removedId of removedIds) {
+              if (typeof removedId !== "string" || removedId === "") continue;
+              try {
+                const orphanRef = `dshVscode_${removedId.replace(/[^A-Za-z0-9_]/g, "_")}`;
+                if (credentials) await credentials.unset(credentialRef(orphanRef));
+              } catch (error) {
+                log("warn", `providersApply: \u6E05\u9664\u5DF2\u5220\u9664\u63D0\u4F9B\u5546 ${removedId} \u7684\u5B64\u513F\u51ED\u636E\u5931\u8D25`, error instanceof Error ? error.message : String(error));
+              }
+            }
             const parseTokens = (v) => {
               if (typeof v === "number") return Number.isFinite(v) && v > 0 ? Math.round(v) : void 0;
               const m2 = String(v ?? "").trim().match(/^(\d+(?:\.\d+)?)\s*([KkMm]?)$/);
@@ -88845,6 +88855,10 @@ ${meta.seedSummary}` }],
                     if (ctxWin !== void 0) out.contextWindow = ctxWin;
                     const maxTok = parseTokens(m2.maxOutput);
                     if (maxTok !== void 0) out.maxTokens = maxTok;
+                    if (Array.isArray(m2.inputModalities) && m2.inputModalities.length > 0) {
+                      const mods = m2.inputModalities.filter((x2) => typeof x2 === "string" && x2 !== "");
+                      if (mods.length > 0) out.input = mods;
+                    }
                   }
                   return out;
                 }).filter(Boolean);
@@ -88852,8 +88866,11 @@ ${meta.seedSummary}` }],
               if (typeof p.apiKey === "string" && p.apiKey !== "") {
                 profile.apiKeyEnv = ref;
                 if (credentials) await credentials.set(credentialRef(ref), p.apiKey);
+              } else if (p.apiKey === "") {
+                if (credentials) await credentials.unset(credentialRef(ref));
               } else if (credentials) {
-                await credentials.unset(credentialRef(ref));
+                const existing = await credentials.resolve(credentialRef(ref));
+                if (existing && existing.value) profile.apiKeyEnv = ref;
               }
               section.providers[p.id] = profile;
             }

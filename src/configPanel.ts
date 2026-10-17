@@ -35,6 +35,7 @@ import * as vscode from "vscode";
 import { existsSync, readFileSync, writeFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import type { ProviderApplyItem } from "./protocol";
+import { PROVIDERS_KEY, collectProviderApplyItems, providerSecretKey } from "./providerKeys";
 import type { UpgradeVersionInfo } from "./upgradeCenter";
 
 /** 配置命名空间（与 extension.ts 的 CONFIG_NS 一致）。 */
@@ -78,8 +79,9 @@ const DEFAULT_PROVIDERS: ProviderInfo[] = [
   { id: "deepseek-official", name: "DeepSeek (Official)", type: "deepseek-official", baseUrl: "https://api.deepseek.com", models: [] },
   { id: "ollama", name: "Ollama (local)", type: "ollama", baseUrl: "http://localhost:11434/v1", models: [] },
 ];
-const PROVIDERS_KEY = "dshProviders";
-const providerSecretKey = (id: string): string => `dshVscode.provider.${id}.apiKey`;
+/* PROVIDERS_KEY 与 providerSecretKey 已上移到 providerKeys.ts：
+ * 宿主就绪重同步与面板保存必须共用同一份"读密钥"实现，否则同一条
+ * 下发路径会再次退化成"无密钥下发"（小米 MiMo 全系列无法认证的根因）。 */
 
 export interface ConfigPanelDeps {
   /** 读取当前生效配置（API Key 不含密钥库，面板侧自行合并判断）。 */
@@ -123,7 +125,7 @@ export interface ConfigPanelDeps {
   /** 当前可见的工具集（配置页"审批规则"工具名建议；来自内核 ctx.tools.schemas）。 */
   queryToolCatalog: () => Promise<{ name: string; description?: string; fields?: string[] }[]>;
   /** 把整套提供商配置同步进 DSH（llm-pi-ai settings + credentials，热生效）。 */
-  applyProviders: (providers: ProviderApplyItem[]) => Promise<string | undefined>;
+  applyProviders: (providers: ProviderApplyItem[], removedIds?: string[]) => Promise<string | undefined>;
   /** 模型发现（catalog 提供商免网络返回模型+元数据；未知提供商探活端点）。
    *  带 `model` 时为**按需单模型查询**：只取该模型的默认容量参数（配置页仅在打开
    *  "尚未配置过"的模型编辑窗口时使用）；列表查询不带容量、保持轻量。 */
@@ -232,23 +234,18 @@ export function openConfigPanel(context: vscode.ExtensionContext, deps: ConfigPa
 
   /** 把当前提供商列表（含已存密钥）全量同步进 DSH（llm-pi-ai settings + credentials，热生效）。
    *  失败不阻塞面板：宿主侧记录错误，下次保存会再次尝试。 */
-  const syncProvidersToHost = async (): Promise<void> => {
+  /** @param removedIds - 本次被删除的提供商 id；宿主据此清除其孤儿凭据（H3）。 */
+  const syncProvidersToHost = async (removedIds?: string[]): Promise<void> => {
     try {
-      const items: ProviderApplyItem[] = await Promise.all(
-        loadProviders().map(async (p) => {
-          let apiKey: string | undefined;
-          try {
-            apiKey = (await context.secrets.get(providerSecretKey(p.id))) ?? undefined;
-          } catch {
-            apiKey = undefined;
-          }
-          return { id: p.id, name: p.name, baseUrl: p.baseUrl, protocol: p.protocol, models: p.models, apiKey };
-        })
-      );
-      await deps.applyProviders(items);
+      // 密钥由共享实现从 SecretStorage 补齐（与宿主就绪重同步同源）；
+      // 读取失败不再静默：collectProviderApplyItems 会告警后按"未携带密钥"下发。
+      const items = await collectProviderApplyItems(context, loadProviders);
+      const err = await deps.applyProviders(items, removedIds);
+      if (err) console.warn(`[ay-dsh] 提供商配置同步失败：${err}`);
       deps.onProvidersSynced();
-    } catch {
-      // 同步失败不阻塞面板
+    } catch (error) {
+      // 同步失败不阻塞面板；但必须留痕，否则配置链路断掉时无从排查。
+      console.warn(`[ay-dsh] 提供商配置同步异常：${error instanceof Error ? error.message : String(error)}`);
     }
   };
 
@@ -480,12 +477,23 @@ export function openConfigPanel(context: vscode.ExtensionContext, deps: ConfigPa
         const selectedModels = Array.isArray(p.models)
           ? p.models.filter((m) => (typeof m === "string" && m !== "") || (m && typeof m.id === "string" && m.id !== ""))
           : [];
-        const clean: ProviderInfo = { ...p, name: p.name.trim(), baseUrl: (p.baseUrl ?? "").trim(), models: selectedModels };
+        // 显式挑字段：绝不把前端可能回传的 apiKey 明文写进 globalState
+        // （配置真源只存"是否已配置"的结果，密钥本体只进 SecretStorage）。
+        const clean: ProviderInfo = {
+          id: p.id,
+          name: p.name.trim(),
+          type: p.type,
+          baseUrl: (p.baseUrl ?? "").trim(),
+          protocol: p.protocol,
+          models: selectedModels,
+        };
         if (idx >= 0) list[idx] = clean;
         else list.push(clean);
         saveProviders(list);
-        if (typeof msg.apiKey === "string" && msg.apiKey !== "") {
-          await context.secrets.store(providerSecretKey(p.id), msg.apiKey);
+        // 密钥去除首尾空白后再存：内核 assertUsableApiKey 会拒绝含空白的密钥。
+        // 空串=本次未填写（保留原密钥），避免"编辑提供商时清空密钥"的既有语义被改变。
+        if (typeof msg.apiKey === "string" && msg.apiKey.trim() !== "") {
+          await context.secrets.store(providerSecretKey(p.id), msg.apiKey.trim());
         }
         await sendConfig();
         void syncProvidersToHost();
@@ -496,7 +504,11 @@ export function openConfigPanel(context: vscode.ExtensionContext, deps: ConfigPa
         saveProviders(loadProviders().filter((x) => x.id !== msg.id));
         await context.secrets.delete(providerSecretKey(msg.id));
         await sendConfig();
-        void syncProvidersToHost();
+        // 必须显式告知宿主"这个 id 已删除"：仅把它移出下发列表的话，宿主永远不会碰
+        // 它的凭据 ref（credentials 是独立于配置真源的存储），孤儿会一直残留 —— 之后
+        // 重建同 id 并留空保存时，宿主的兜底逻辑会查到残留凭据并写回 apiKeyEnv，
+        // 表现为"留空却恢复了旧 Key"。
+        void syncProvidersToHost([msg.id]);
         break;
       }
       case "queryProviders": {

@@ -14,6 +14,7 @@ import * as fs from "node:fs";
 import { AgentHost, getOutputChannel, resolveNode, hostLoaderArgs } from "./host";
 import { ChatViewProvider } from "./webviewPanel";
 import { openConfigPanel, type ProviderInfo } from "./configPanel";
+import { PROVIDERS_KEY, collectProviderApplyItems } from "./providerKeys";
 import { bundledDshVersion, startDshUpdateChecker, LAST_CHECK_KEY } from "./dshUpdater";
 import { DshRuntimeManager } from "./dshRuntime";
 import { UpgradeCenter } from "./upgradeCenter";
@@ -518,7 +519,7 @@ function openSettings(context: vscode.ExtensionContext): void {
     // （apiKey 走 DEEPSEEK_API_KEY 环境变量），不写入 llm-pi-ai.providers——过滤掉，
     // 避免无效写入与路由干扰；其余提供商原样同步。
     // 宿主不可用时静默失败（返回错误信息，不影响面板本身）。
-    applyProviders: async (providers): Promise<string | undefined> => {
+    applyProviders: async (providers, removedIds): Promise<string | undefined> => {
       // 全量下发 dshProviders（配置真源，**含**官方路由 deepseek-official）：宿主需要
       // 完整配置作为"对话面板可选项"的真源；是否写入 llm-pi-ai 由宿主内部决定
       // （官方路由是 llm-deepseek 路由，跳过 pi-ai 写入）。
@@ -527,7 +528,7 @@ function openSettings(context: vscode.ExtensionContext): void {
       try {
         const h = await ensureHost(context);
         if (h) {
-          const err = await h.applyProviders(list);
+          const err = await h.applyProviders(list, removedIds);
           // 只有"官方路由 API Key **实际变化**"才需要重启宿主（该密钥以进程环境变量注入）；
           // 其余同步一律热生效。此前以"列表含 deepseek-official"为条件（恒真），
           // 导致每次配置同步都重启宿主（缓存反复清空、思考级别反复查询——已修）。
@@ -781,10 +782,17 @@ export function activate(context: vscode.ExtensionContext): void {
         syncedProviderHost = readyHost;
         void (async () => {
           try {
-            const list = context.globalState.get<Parameters<typeof readyHost.applyProviders>[0]>("dshProviders") ?? [];
-            await readyHost.applyProviders(list);
-          } catch {
-            /* 同步失败不影响宿主使用；下次保存配置时会再次同步 */
+            // 必须**带密钥**下发：globalState 只存"是否已配置密钥"的结果，密钥本体在
+            // SecretStorage。原样下发会让宿主收到 apiKey === undefined，从而既不写
+            // llm-pi-ai.providers.<id>.apiKeyEnv、又反过来删除已存凭据 —— 这正是
+            // "面板已配好密钥却始终 No API key for provider" 的根因。
+            const stored = context.globalState.get<ProviderInfo[]>(PROVIDERS_KEY) ?? [];
+            const list = await collectProviderApplyItems(context, () => stored);
+            const err = await readyHost.applyProviders(list);
+            if (err) console.warn(`[ay-dsh] 宿主就绪后同步提供商配置失败：${err}`);
+          } catch (error) {
+            // 失败不影响宿主使用（下次保存配置会再次同步），但必须留痕，不再静默。
+            console.warn(`[ay-dsh] 宿主就绪后同步提供商配置异常：${error instanceof Error ? error.message : String(error)}`);
           }
         })();
       }

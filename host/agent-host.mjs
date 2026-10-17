@@ -4368,6 +4368,21 @@ let pendingPlanMode = null;
               const settings = ctx.get("settings");
               const credentials = ctx.get("credentials");
               const section = { providers: {} };
+              // H3：清理"已被用户删除的提供商"的孤儿凭据。credentials 是独立存储，
+              // 仅把 id 移出 providers 列表不会动到它；不主动清就会残留，之后重建同 id、
+              // 留空保存时，下面 undefined 分支会查到这条残留凭据并写回 apiKeyEnv，
+              // 表现为"留空却恢复了旧 Key"。ref 清洗规则与写入侧完全一致（同一表达式）。
+              // 单条失败不让它毁掉整次同步：那会让 provider 配置整体不再更新（更严重）。
+              const removedIds = Array.isArray(msg.removedIds) ? msg.removedIds : [];
+              for (const removedId of removedIds) {
+                if (typeof removedId !== "string" || removedId === "") continue;
+                try {
+                  const orphanRef = `dshVscode_${removedId.replace(/[^A-Za-z0-9_]/g, "_")}`;
+                  if (credentials) await credentials.unset(credentialRef(orphanRef));
+                } catch (error) {
+                  log("warn", `providersApply: 清除已删除提供商 ${removedId} 的孤儿凭据失败`, error instanceof Error ? error.message : String(error));
+                }
+              }
               const parseTokens = (v) => {
                 if (typeof v === "number") return Number.isFinite(v) && v > 0 ? Math.round(v) : undefined;
                 const m = String(v ?? "").trim().match(/^(\d+(?:\.\d+)?)\s*([KkMm]?)$/);
@@ -4403,16 +4418,36 @@ let pendingPlanMode = null;
                         if (ctxWin !== undefined) out.contextWindow = ctxWin;
                         const maxTok = parseTokens(m.maxOutput);
                         if (maxTok !== undefined) out.maxTokens = maxTok;
+                        // 模态：内核 model profile 的字段名是 **input**（pi-ai 以
+                        // model.input.includes("image") 决定是否接受图片），前端下发用的
+                        // 是 inputModalities。不透传的话，勾了"文本+图片"也只是对话框放行，
+                        // 发送时图片仍会被静默剔除（[tool/image omitted]）。
+                        if (Array.isArray(m.inputModalities) && m.inputModalities.length > 0) {
+                          const mods = m.inputModalities.filter((x) => typeof x === "string" && x !== "");
+                          if (mods.length > 0) out.input = mods;
+                        }
                       }
                       return out;
                     })
                     .filter(Boolean);
                 }
+                // 三态区分，绝不把"本次未携带密钥"当成"清除密钥"：
+                //   · 非空字符串 = 本次带了密钥 → 写 apiKeyEnv 并落库；
+                //   · 空字符串   = 显式清除     → 落库删除，且不写 apiKeyEnv（回落 pi-ai 官方环境发现）；
+                //   · undefined  = 本次未携带   → 凭据与 apiKeyEnv 一律保持原样。
+                // 旧实现把 undefined 与 "" 一并 unset，于是每次宿主就绪重同步都会抹掉
+                // 面板刚保存的密钥，且不写 apiKeyEnv，表现为所有自定义提供商必然
+                // "PI_AI_ERROR: No API key for provider: <id>"。
                 if (typeof p.apiKey === "string" && p.apiKey !== "") {
                   profile.apiKeyEnv = ref;
                   if (credentials) await credentials.set(credentialRef(ref), p.apiKey);
+                } else if (p.apiKey === "") {
+                  if (credentials) await credentials.unset(credentialRef(ref));
                 } else if (credentials) {
-                  await credentials.unset(credentialRef(ref));
+                  // 仅当该 ref 确实存有凭据时才写上 apiKeyEnv：否则会屏蔽 pi-ai 自身的
+                  // 环境变量发现，并让内核抛 MISSING_CREDENTIAL（比"未配置"更难排查）。
+                  const existing = await credentials.resolve(credentialRef(ref));
+                  if (existing && existing.value) profile.apiKeyEnv = ref;
                 }
                 section.providers[p.id] = profile;
               }

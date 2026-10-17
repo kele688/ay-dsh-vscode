@@ -121,7 +121,7 @@ export type HostEvent =
       type: "modelInfo";
       providers: { id: string; name: string }[];
       models: string[];
-      providerModels?: Record<string, { id: string; name: string }[]>;
+      providerModels?: Record<string, { id: string; name: string; inputModalities?: string[] }[]>;
       current: { provider: string; model: string; reasoningEffort?: string; supportedEfforts?: string[]; defaultEffort?: string };
     }
   | { type: "modelChanged"; provider: string; model: string; reasoningEffort?: string; error?: string }
@@ -1097,11 +1097,11 @@ export class AgentHost {
    * 把整套提供商配置同步进 DSH（写入 llm-pi-ai settings + credentials，热生效）。
    * 返回 undefined 表示成功，否则为错误信息；宿主未就绪时 8s 超时视为失败。
    */
-  applyProviders(providers: ProviderApplyItem[]): Promise<string | undefined> {
+  applyProviders(providers: ProviderApplyItem[], removedIds?: string[]): Promise<string | undefined> {
     return new Promise((resolve) => {
       const id = ++this.llmSeq;
       this.pendingProviderApply.set(id, { resolve });
-      this.send({ t: "providersApply", id, providers });
+      this.send({ t: "providersApply", id, providers, ...(removedIds && removedIds.length > 0 ? { removedIds } : {}) });
       setTimeout(() => {
         if (this.pendingProviderApply.delete(id)) resolve("timeout");
       }, 8000);
