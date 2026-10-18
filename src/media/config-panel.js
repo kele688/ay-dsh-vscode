@@ -491,10 +491,12 @@
 
   const cwdEl = $("cfgCwd");
 
-  /** 知名供应商的公开 API 地址（选择供应商/「默认」按钮使用；DSH 目录不提供 baseUrl）。 */
+  /** 知名供应商的公开 API 地址（选择供应商/「默认」按钮使用；DSH 目录不提供 baseUrl）。
+   *  注意 `deepseek-official` 走的是内核 llm-deepseek 的 **Messages** 协议端点
+   *  （`https://api.deepseek.com/anthropic`），与 OpenAI 兼容的 `deepseek` 条目不是同一个地址。 */
   const PROVIDER_DEFAULT_BASEURL = {
     deepseek: "https://api.deepseek.com",
-    "deepseek-official": "https://api.deepseek.com",
+    "deepseek-official": "https://api.deepseek.com/anthropic",
     ollama: "http://localhost:11434/v1",
     openai: "https://api.openai.com/v1",
     anthropic: "https://api.anthropic.com",
@@ -992,9 +994,19 @@
       let models;
       let providerId;
       if (isCustom) {
+        // **必须带 inputModalities**：自定义模式下 meModal 是可编辑的（用户能选
+        // "文本+图片"），漏掉这个字段就会让模态配置在保存时静默丢失——
+        // 表现为"配置并保存了多模态，对话面板粘贴图片仍提示模型不支持图片"。
+        // （知名模式的 chosenModels 分支一直带该字段，故两者表现不一致。）
         models = customModels.map((id) => {
           const meta = currentModelMeta.get(id);
-          return { id, displayName: meta?.displayName, contextWindow: meta?.contextWindow, maxOutput: meta?.maxOutput };
+          return {
+            id,
+            displayName: meta?.displayName,
+            contextWindow: meta?.contextWindow,
+            maxOutput: meta?.maxOutput,
+            inputModalities: Array.isArray(meta?.inputModalities) ? meta.inputModalities : undefined,
+          };
         });
         providerId = editingProviderId || $("pfProviderId").value.trim() || name.toLowerCase().replace(/[^a-z0-9-]/g, "-");
       } else {
@@ -1483,16 +1495,21 @@
           if (toggle) toggle.textContent = `▾ ${L.configureModels}`;
           return;
         }
-        // 查询到的元数据入暂存：编辑弹框默认值优先用模型自身值（查不到才用 256K/32K 兜底）
+        // 查询到的元数据入暂存：编辑弹框默认值优先用模型自身值（查不到才用 256K/32K 兜底）。
+        // **已存/用户已编辑的值优先**：自定义路由（如 xiaomi-new）的目录里查不到模态，
+        // 发现结果必须只补空缺、绝不把用户已配置的 inputModalities 冲成 undefined ——
+        // 否则"先设模态、再点获取模型"会让多模态配置静默丢失，对话面板随后按纯文本
+        // 拒绝粘贴图片（"当前模型不支持图片"）。
         for (const raw of msg.models) {
           const m = typeof raw === "string" ? { id: raw } : raw || {};
           if (!m.id) continue;
+          const prev = currentModelMeta.get(m.id);
           currentModelMeta.set(m.id, {
             id: m.id,
             displayName: m.name,
             contextWindow: fmtTokenSize(m.contextWindow),
             maxOutput: fmtTokenSize(m.maxTokens),
-            inputModalities: Array.isArray(m.inputModalities) ? m.inputModalities : undefined,
+            inputModalities: Array.isArray(m.inputModalities) ? m.inputModalities : prev?.inputModalities,
           });
         }
         const preselect = new Set(

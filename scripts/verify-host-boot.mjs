@@ -18,16 +18,28 @@
  */
 import { spawn } from "node:child_process";
 import { mkdirSync, rmSync } from "node:fs";
-import { join, dirname } from "node:path";
+import { join, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const smokeHome = join(root, ".smoke-home");
 const legacyHome = join(smokeHome, "legacy");
+// --keep-home：保留隔离 home 供诊断（宿主日志 dsh-host.log 落在其中）。
+// 默认仍清理，避免残留污染下一次冒烟。
+const keepHome = process.argv.includes("--keep-home");
+// --dump-stderr：成功后也完整打印宿主 stderr（宿主 log() 全部走 stderr），
+// 用于核对启动期关键日志（如 "settings service available"）；默认只保留尾部供失败诊断。
+const dumpStderr = process.argv.includes("--dump-stderr");
+const stderrAll = [];
 rmSync(smokeHome, { recursive: true, force: true });
 mkdirSync(legacyHome, { recursive: true });
 
-const hostScript = join(root, "host", "agent-host.mjs");
+// --entry=<相对路径>：指定要冒烟的宿主入口。默认源文件；发布前应显式跑
+// `--entry=host/agent-host.bundle.mjs`，因为扩展运行时优先加载 bundle。
+const entryArg = process.argv.find((a) => a.startsWith("--entry="));
+const hostScript = entryArg
+  ? resolve(root, entryArg.slice("--entry=".length))
+  : join(root, "host", "agent-host.mjs");
 const child = spawn(process.execPath, [hostScript], {
   cwd: root,
   env: {
@@ -49,7 +61,7 @@ let closed = false;
 const timeout = setTimeout(() => {
   console.error("✗ smoke test TIMEOUT — host did not emit `ready` within 90 s");
   child.kill();
-  rmSync(smokeHome, { recursive: true, force: true }); // 超时路径也要清理临时 home
+  if (!keepHome) rmSync(smokeHome, { recursive: true, force: true }); // 超时路径也清理临时 home
   process.exit(1);
 }, 90000);
 
@@ -81,14 +93,21 @@ child.stdout.on("data", (chunk) => {
 child.stderr.setEncoding("utf8");
 child.stderr.on("data", (d) => {
   stderrTail = (stderrTail + String(d)).slice(-2000);
+  if (dumpStderr) stderrAll.push(String(d));
 });
 
 child.on("close", (code) => {
   if (closed) return;
   closed = true;
   clearTimeout(timeout);
-  rmSync(smokeHome, { recursive: true, force: true });
+  if (keepHome) console.log(`· kept isolated home: ${smokeHome}`);
+  else rmSync(smokeHome, { recursive: true, force: true });
   if (sawReady) {
+    if (dumpStderr && stderrAll.length > 0) {
+      console.log("--- host stderr (full) ---");
+      console.log(stderrAll.join(""));
+      console.log("--- end host stderr ---");
+    }
     console.log(`✓ host exited cleanly (code ${code})`);
     process.exit(code === 0 ? 0 : 1);
   }

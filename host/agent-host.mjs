@@ -41,12 +41,27 @@ function envFlag(name) {
 }
 
 const NAME = "dsh-vscode-host";
-const CORE_VERSION = "0.5.7";
+const CORE_VERSION = "0.6.0";
 /** 插件会话 id 前缀（也是会话隔离的标识）。 */
 const SESSION_PREFIX = "dsh-vscode-";
 
 /** 当前工作模式（模块级：createAgent 的 attachAgent 需要读取；setWorkMode 更新）。 */
 let workMode = "single";
+
+/** 宿主侧"当前默认模型选择"（进程内内存，跨会话复用）。
+ *
+ *  为什么不用内核的 `agentDefaultModel.saveSelection()`：0.2.x 的 saveSelection 把选择
+ *  写进 **config-editor → profile 补丁层**（`<DSH_HOME>/profiles/<name>/cordis.patch.yml`），
+ *  而本宿主自己组装补丁树、不经 profile 启动器，这条路在这里必然失败（缺 profile 清单时
+ *  报 `failed to read profile manifest … ENOENT`；补上清单后报
+ *  `cannot get required service "loader" in inactive context`）。更糟的是失败会连带
+ *  settings / jobs / agent projection 的 fiber 一起失效 —— 现场表现就是"切模型报错，
+ *  随后整个插件不可用"。
+ *  选择的权威记录本来就在扩展侧（dshProviders 的已选模型）与会话 meta 里，
+ *  这里只需一份进程内记录，供新建/恢复 agent 时做兜底默认值。 */
+let defaultSelection;
+/** 读取上面的进程内默认选择（未切换过模型时 undefined，调用方回退内核默认）。 */
+const hostDefaultSelection = () => defaultSelection;
 
 /** dshProviders（配置真源，与插件 globalState 的持久化键同名）：配置页保存的
  *  "已接入提供商 + 已选中模型"清单（含自定义提供商；也含官方路由 deepseek-official）。
@@ -284,6 +299,17 @@ function composePatches(env) {
     // namespace）写入后即可路由。deepseek 仍由 llm-deepseek 适配器独占路由。
     { id: "session-telemetry-otel", disabled: true },
     { id: "typert-gateway", disabled: true },
+    // 0.2.x 新增的**独立**遥测行（base 补丁注释明载"config 无法禁用该行；由 launcher
+    // patch disabled"）。插件自己组装 patch、不经 launcher ⇒ 必须在此显式禁用，
+    // 否则新版遥测默认挂载。旧行 session-telemetry-otel 与它并存，故两者都禁。
+    { id: "otel", disabled: true },
+    // tool-ralph 决策（owner，2026-10）：**跟随上游消除，不装配**。
+    //   0.1.5：base 启用（subagentProvider=spawn, maxRounds=64）；
+    //   0.2.0：base 改为 disabled:true；0.2.1：**移出 base**（包仅在 packages/experimental）。
+    // 理由：ralph 是"前台 fresh-agent 长跑循环"（一次调用可起数十个子代理、阻塞到结束），
+    // 与插件"人工在环、单轮预算、达限即总结等待指令"的定位正面冲突（同 goal 三件套）。
+    // 若将来确实需要无人值守长跑，在此追加一行即可恢复：
+    //   { id: "tool-ralph", name: "@deepseek-ai/dsh-tool-ralph", config: { subagentProvider: "spawn", maxRounds: 64 } }
   ];
 
   // G1（2026-09 owner 定）：默认排除 DSH 内核的 goal 自动续跑机制。
@@ -303,6 +329,60 @@ function composePatches(env) {
     overlay.push({ id: "goal-round-driver", disabled: true });
     overlay.push({ id: "tool-goal", disabled: true });
     overlay.push({ id: "command-goal", disabled: true });
+  }
+
+  // ── 默认思考级别（0.2.x 必修）─────────────────────────────────────────
+  // 0.2.x 把 settings 迁移到 profile 补丁层后，内核不再从 settings.yaml 读取
+  // `agent-default-model`。若不显式注入，`selection.reasoningEffort` 恒为 undefined：
+  //   · 日志「模型选择 → x」不带「（思考级别=…）」括号（取值来源本身为空）；
+  //   · agent/request 不带任何思考参数 ⇒ 一律走模型默认；
+  //   · 「AI 实际思考级别: （未指定）」恒定。
+  // 注意：overlay 是**整行替换 config 语义**，必须给全 provider/model/reasoningEffort
+  // （漏写 provider 会清空默认路由，回到"无 provider"的坏状态）。
+  // 会话内切换仍由前端 setModel 覆盖，并记入会话 meta 供恢复历史时还原。
+  const effortDefault = envValue("DSH_REASONING_EFFORT");
+  if (effortDefault) {
+    overlay.push({
+      id: "agent-default-model",
+      config: {
+        provider: "deepseek-official",
+        model: envValue("DSH_VSCODE_MODEL") || "deepseek-flash",
+        reasoningEffort: effortDefault,
+      },
+    });
+  }
+
+  // ── MCP 服务器（0.2.x 能力）：按用户配置动态装配 ──────────────────────
+  // 配置源：$DSH_HOME/mcp-servers.json，形如
+  //   { "servers": [ { "serverName": "fs", "transport": "stdio",
+  //                    "command": "npx", "args": ["-y","@modelcontextprotocol/server-filesystem","/path"] } ] }
+  // 每台服务器一行 mcp-client 实例（该插件是 namespace plugin：一个实例连一台服务器，
+  // 工具名 `mcp__<serverName>__<rawName>`）。
+  // 容错：文件缺失/JSON 非法/单条配置非法 ⇒ 跳过并 warn，**绝不影响宿主启动**。
+  try {
+    const mcpConfigPath = dshHomePath("mcp-servers.json");
+    if (existsSync(mcpConfigPath)) {
+      const parsed = JSON.parse(readFileSync(mcpConfigPath, "utf8"));
+      const servers = Array.isArray(parsed?.servers) ? parsed.servers : [];
+      for (const server of servers) {
+        if (!server || typeof server !== "object") continue;
+        const serverName = typeof server.serverName === "string" ? server.serverName.trim() : "";
+        const transport = server.transport;
+        if (!serverName || (transport !== "stdio" && transport !== "streamable-http")) {
+          log("warn", "mcp-servers.json: skipped an entry without usable serverName/transport");
+          continue;
+        }
+        // 行 id 需唯一且不与其他行冲突；serverName 已由内核校验为 [A-Za-z0-9_-]{1,32}。
+        overlay.push({
+          id: `mcp-client-${serverName}`,
+          name: "@deepseek-ai/dsh-mcp-client",
+          config: { ...server },
+        });
+        log("info", `mcp server assembled: ${serverName} (${transport})`);
+      }
+    }
+  } catch (error) {
+    log("warn", "mcp-servers.json ignored", error instanceof Error ? error.message : String(error));
   }
 
   return [...base, ...filteredHeadless, ...overlay];
@@ -326,6 +406,60 @@ async function currentSessionTitle(ctx, agent) {
 }
 
 /**
+ * 裸包名（`@deepseek-ai/dsh-*` 等内核插件行）的解析锚点 = 插件安装根 `<ext>/`
+ * （闭包 node_modules 所在目录；本文件位于 `<ext>/host/`）。
+ *
+ * 0.2.x 起 `boot()` 默认按"配置项目拥有插件集"处理：include 的 baseUrl 被设成
+ * **配置文件所在目录**（`<DSH_HOME>/profiles/dsh-vscode/`），裸包名从那里解析。
+ * 该 profile 目录没有 node_modules ⇒ 每个内核行 import 都报
+ * `ERR_MODULE_NOT_FOUND`（0.2.1-rc.2 实测 86 行全失败，其中 agent-loop 属 required，
+ * 启动审计直接拒绝宿主：`1 required plugin did not activate`）。
+ * 0.1.5 之所以正常，是因为旧版 include 用环境解析（相对 loader 自身 → 落在 VSIX 的
+ * node_modules 里），profile 目录只当作配置位置。
+ *
+ * 本插件的插件集**由 VSIX 拥有**（不通过 pnpm 装进 profile），因此必须显式传入
+ * bareModuleBaseUrl（app-boot 文档：`use it when the host, rather than the
+ * configuration project, owns the complete plugin set`）。
+ *
+ * 运行时升级（`DSH_RUNTIME_NODE_MODULES` + host/runtime-redirector）不受影响：
+ * 该 resolve 钩子把 `@deepseek-ai/*` 重定向到用户采纳的闭包，生效于默认解析之前，
+ * 与锚点无关。也不要改用"往 profile 里投影 node_modules"的方案——那会引入第二份内核。
+ */
+const HOST_INSTALL_BASE_URL = new URL("../", import.meta.url).href;
+
+/**
+ * 内核来源留痕 + 解析自检（升级期第一现场证据）。
+ *
+ * 0.2.x 的"解析基准"（裸包名从配置文件目录解析，还是从宿主安装根解析）是升级时最
+ * 容易静默错位的一环：错位后 86 行内核插件全部 import 失败，而每个报错只说"找不到
+ * 某个包"，从栈里看不出**用的是哪份 node_modules**。这里把实际解析到的 base 补丁
+ * 路径写进日志，并对照两个合法来源（VSIX 安装根 / 用户采纳的运行时闭包）告警。
+ * 同时它也是本插件对 app-boot 契约的前向哨兵：锚点语义由**实际加载的**
+ * dsh-app-boot 提供（运行时升级时它来自闭包），将来契约若再变，这里先叫。
+ */
+function reportKernelSource() {
+  let file;
+  try {
+    file = bundlePatchFile("@deepseek-ai/dsh-base/cordis.patch.yml");
+  } catch (error) {
+    log("warn", "kernel source probe failed", error instanceof Error ? error.message : String(error));
+    return;
+  }
+  const lower = file.toLowerCase();
+  const fromExt = lower.startsWith(fileURLToPath(new URL("../", import.meta.url)).toLowerCase());
+  const runtime = (process.env.DSH_RUNTIME_NODE_MODULES || "").replace(/[\\/]+$/, "");
+  const fromRuntime = runtime !== "" && lower.startsWith(runtime.toLowerCase());
+  const label = fromRuntime ? "adopted runtime closure" : fromExt ? "bundled (VSIX)" : "unexpected location";
+  log("info", `kernel source: ${label} — ${file}`);
+  if (!fromExt && !fromRuntime) {
+    log(
+      "warn",
+      "kernel resolved outside the plugin and the adopted runtime: kernel rows will fail to import (boot() anchor not honoured by this dsh-app-boot build?)"
+    );
+  }
+}
+
+/**
  * 创建一条 DSH 树：boot() 装载 loader，挂载 base+headless 插件栈。
  * 返回根上下文；调用方负责 ctx.fiber.dispose()。
  */
@@ -340,11 +474,37 @@ async function bootTree() {
   writeFileSync(rootConfig, "# dsh-vscode root — empty entry list; composed from bundle patches\n[]\n");
 
   const environment = loadLayeredEnv(NAME);
+  reportKernelSource();
   const patches = composePatches(environment);
+
+  // ── 0.2.x 一号必修：提供 profileContext ────────────────────────────────
+  // base 补丁把 settings / config-editor / plugin-manager / hmr 几行都写成
+  //   disabled: !!js "!ctx.get('profileContext')"
+  // 且 settings 服务硬依赖（packages/settings/settings/src/index.ts:224
+  //   static inject = ['configEditor','profileContext']）。
+  // 插件自己 boot()（不经 CLI 的 profile 启动器）⇒ 必须自行 provide，否则这些行
+  // 全部不挂载（0.2.x 的 profile 契约未满足，配置/插件管理相关能力整体缺失）。
+  // 注意：provider 配置**不再**经 settings 写入（见 applyPiAiProviders 的说明：
+  // config-editor 需要 profile 清单且在其上下文里解析不到 loader）。
+  // 字段语义对齐 apps/cli/src/profile-boot.ts:314-325 与
+  // packages/boot/app-boot/src/profile-context.ts:15-30。
+  const profileContext = {
+    name: "dsh-vscode",
+    dir: profileDir,
+    patchPath: join(profileDir, "cordis.patch.yml"),
+    // 本插件不通过 pnpm 安装 profile 插件（闭包随 VSIX 打包），该字段仅作诊断定位。
+    installAnchor: process.cwd(),
+    cwd: process.cwd(),
+    home,
+    startedBundles: ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-headless"],
+    overlays: [],
+    telemetryDisabledEnv: process.env.DSH_TELEMETRY_DISABLED,
+  };
 
   const ctx = await boot(NAME, rootConfig, patches, (hostCtx) => {
     hostCtx.provide(DSH_LAUNCH_ENVIRONMENT_KEY, environment);
-  });
+    hostCtx.provide("profileContext", profileContext);
+  }, HOST_INSTALL_BASE_URL);
   return ctx;
 }
 
@@ -393,7 +553,7 @@ async function createAgent(ctx, options, pump, approvals) {
     throw new Error("dsh-vscode-host: core services unavailable (agents/agentDefaultModel)");
   }
 
-  const base = defaultModel.currentSelection();
+  const base = hostDefaultSelection() ?? defaultModel.currentSelection();
   const provider = options.provider ?? base.provider;
   const model = options.model ?? base.model;
   const selection = { provider, model, reasoningEffort: base.reasoningEffort };
@@ -469,7 +629,7 @@ async function resumeAgent(ctx, resumeSessionId, options, pump, approvals) {
   if (agents === undefined || defaultModel === undefined) {
     throw new Error("dsh-vscode-host: core services unavailable (agents/agentDefaultModel)");
   }
-  const base = defaultModel.currentSelection();
+  const base = hostDefaultSelection() ?? defaultModel.currentSelection();
   const provider = options.provider ?? base.provider;
   const model = options.model ?? base.model;
   // 恢复历史会话时可按 meta 还原当时的思考级别（options.reasoningEffort）
@@ -2241,7 +2401,7 @@ async function summarizeUserMessages(ctx, agent, texts, signal) {
   const messages = [
     createUserMessage({
       content: [{ type: "text", text: instruction + joined }],
-      source: { kind: "plugin", plugin: "dsh-vscode-host" },
+      source: { kind: "user" },
     }),
   ];
   try {
@@ -2316,7 +2476,7 @@ async function maybeLearnFromTurn(ctx, agent, userText) {
   const messages = [
     createUserMessage({
       content: [{ type: "text", text: instruction + input }],
-      source: { kind: "plugin", plugin: "dsh-vscode-host" },
+      source: { kind: "user" },
     }),
   ];
   try {
@@ -2958,6 +3118,86 @@ async function exportSession(ctx, sessionId) {
 /* 主入口                                                              */
 /* ------------------------------------------------------------------ */
 
+/**
+ * 把提供商配置写进活树的 `llm-pi-ai` 行（`config.providers`）。
+ *
+ * 为什么不用 `settings.replace("llm-pi-ai", …)`（0.1.5 的写法）：0.2.x 的 settings 把
+ * 写入委托给 config-editor，而 `ConfigEditor.edit()` 在写前用 `this.ownerContext.loader`
+ * 取行列表（dsh-config-editor:31；同时还会 `readProfilePatches()` 读 profile 清单）。
+ * 本宿主**自己组装**补丁树（base + 裁剪版 headless + overlay），不经 profile 启动器：
+ *   · profile 目录没有 package.json（不是 pnpm 管理的 profile）⇒
+ *     `readProfileManifest` 抛 `dsh: failed to read profile manifest …: ENOENT`；
+ *   · 即便补上清单，config-editor 的上下文仍解析不到 loader ⇒ 抛
+ *     `cannot get required service "loader" in inactive context`，
+ *     且该异常会连带 settings / jobs 的 fiber 一起失效（随后日志出现
+ *     `jobs service unavailable`）。
+ * 直接改 Loader 行配置与 config-editor 的落点**等价**（它最终也是
+ * `entry.update` + `reconcileProfilePatches`），但只依赖 `loader` 服务。
+ * 持久化不靠 profile 补丁层：配置真源是扩展侧 globalState 的 dshProviders，
+ * 宿主每次 ready 都会把整份提供商清单重新下发（见 extension.ts onHostReady）。
+ * @param ctx 根上下文。
+ * @param providers `{ [providerId]: profile }`（字段名与 llm-pi-ai 的 providers 一致）。
+ * @throws 当 llm-pi-ai 行未挂载或 Loader 服务缺失（调用方记录为 providersApply 失败）。
+ */
+async function applyPiAiProviders(ctx, providers) {
+  const loader = ctx.get("loader");
+  if (loader === undefined) throw new Error("loader service unavailable");
+  const entry = [...loader.entries()].find((row) => row.options.id === "llm-pi-ai");
+  if (entry === undefined) throw new Error('entry "llm-pi-ai" is not mounted');
+  const config = { ...(entry.options.config ?? {}), providers };
+  await entry.update({ ...entry.options, config });
+  await loader.await();
+}
+
+/**
+ * 把面板里的**官方路由**（`deepseek-official`）配置写进 `llm-deepseek` 行
+ * （0.2.x 该行挂的是 `@deepseek-ai/dsh-llm-deepseek-api-key`）。
+ *
+ * 为什么要这么写（统一"一个 provider 一条 profile"的标准）：
+ *   · 面板对所有 provider 是同一套字段与同一个密钥库键（`dshVscode.provider.<id>.apiKey`），
+ *     差别只应体现在**宿主把它写到哪一行**，而不是另开一条环境变量通道；
+ *   · 0.2.x 官方适配器的 Config 本就带 `apiKeyEnv`（credential-ref，默认 `DEEPSEEK_API_KEY`）
+ *     与 `baseURL`，`resolveApiKey()` 每次请求都 `credentials.resolve(ref)` ⇒ 与 pi-ai
+ *     提供商同一条凭据链路，热生效（无需重启宿主）；
+ *   · 端点回到 per-provider 字段：面板留空 = 内核默认 `https://api.deepseek.com/anthropic`
+ *     （Messages 协议）。0.1.5 时代那个全局 baseUrl 是 OpenAI 兼容语义，0.2.x 下会把请求
+ *     打到 `/v1/messages` 而 404，故已整体移除。
+ * @param ctx 根上下文。
+ * @param profile 面板里 deepseek-official 的 profile；`apiKey` 三态与 providersApply 一致
+ *   （字符串=设置、空串=显式清除、undefined=本次未携带，保持原样）。
+ * @throws 当 `llm-deepseek` 行未挂载或 Loader 服务缺失（调用方记录为 providersApply 失败）。
+ */
+async function applyOfficialDeepSeekRoute(ctx, profile) {
+  const loader = ctx.get("loader");
+  if (loader === undefined) throw new Error("loader service unavailable");
+  const entry = [...loader.entries()].find((row) => row.options.id === "llm-deepseek");
+  if (entry === undefined) throw new Error('entry "llm-deepseek" is not mounted');
+  const credentials = ctx.get("credentials");
+  const current = entry.options.config ?? {};
+  // 凭据 ref 与 pi-ai 提供商同一套清洗规则（provider id 里的 - 会变成 _）。
+  const ref = `dshVscode_${"deepseek-official".replace(/[^A-Za-z0-9_]/g, "_")}`;
+  const config = { ...current };
+  if (typeof profile.apiKey === "string" && profile.apiKey !== "") {
+    if (credentials) await credentials.set(credentialRef(ref), profile.apiKey);
+    config.apiKeyEnv = ref;
+  } else if (profile.apiKey === "") {
+    if (credentials) await credentials.unset(credentialRef(ref));
+    // 面板密钥被清空 → 回到默认 ref（DEEPSEEK_API_KEY）：凭据库/环境变量仍可兜底
+    delete config.apiKeyEnv;
+  }
+  if (typeof profile.baseUrl === "string") {
+    const trimmed = profile.baseUrl.trim();
+    if (trimmed !== "") config.baseURL = trimmed;
+    else delete config.baseURL; // 留空 = 内核默认端点
+  }
+  // 配置没变就不写：providersApply 每次宿主就绪都会整份重发，避免无谓的 provider 重注册。
+  const changed = config.apiKeyEnv !== current.apiKeyEnv || config.baseURL !== current.baseURL;
+  if (changed) {
+    await entry.update({ ...entry.options, config });
+    await loader.await();
+  }
+}
+
 async function main() {
   const env = { ...process.env };
   // 轮转检测**不挂在写日志/事件 flush 上**（恢复会话重放也会 flush 造成误触发，
@@ -3153,19 +3393,33 @@ let pendingPlanMode = null;
     installQuestionListener(ctx, questions);
     log("info", "user-questions answerer installed (root scope, covers all agents)");
 
+    // 0.2.x 健康度留痕：settings 行被 profileContext 门控，缺失说明 profileContext
+    // 没提供到位（config-editor / plugin-manager / hmr 会一并缺失）。provider 配置
+    // 已改走 llm-pi-ai 行（applyPiAiProviders），不再依赖 settings ⇒ 这里只是诊断。
+    if (ctx.get("settings") === undefined) {
+      log("warn", "settings service unavailable — profileContext missing? (config-editor / plugin-manager rows are gated by it)");
+    } else {
+      log("info", "settings service available");
+    }
+
     // 后台作业变化通知：注册在**根 ctx**（未限定作用域）→ 可见全部 owner 的作业，
     // 前端据此按需刷新作业列表（纯推送信号，不携带作业内容，避免列表在两处各算一份）。
     try {
       const jobs = ctx.get("jobs");
-      if (jobs !== undefined && typeof jobs.onJobsChanged === "function") {
-        jobs.onJobsChanged(() => {
+      // 0.2.x：`onJobsChanged` 已从 JobRegistry 移除，改为
+      // `events.subscribe(filter, listener)`（filter: {owner} | {owners:'all'|'scope'}）。
+      // 监听器是 effect 作用域的（返回 disposer）⇒ 用 ctx.effect 挂卸载，
+      // 避免根 ctx 存活期间累积订阅。
+      if (jobs !== undefined && jobs.events !== undefined && typeof jobs.events.subscribe === "function") {
+        const dispose = jobs.events.subscribe({ owners: "all" }, () => {
           try {
             post({ t: "jobsChanged" });
           } catch {
             /* 管道已关闭：忽略 */
           }
         });
-        log("info", "jobs change observer installed");
+        if (typeof dispose === "function") ctx.effect(() => () => dispose());
+        log("info", "jobs change observer installed (events.subscribe owners=all)");
       } else {
         log("warn", "jobs service unavailable; the background-job panel stays empty");
       }
@@ -3336,10 +3590,10 @@ let pendingPlanMode = null;
             // 惰性创建：用户发出第一条消息时才创建会话（绝不预先创建空会话）
             // 注意：此处**不**写会话 meta——lazy session 策略下，未持久化的
             // 会话不视为有效会话，提前记录会产生孤儿 meta 条目（会话从未
-            // 落盘时无法随删除清理）。新会话的模型选择已通过 setModel 的
-            // defaultModel.saveSelection 持久化为全局默认，createAgent 即用该
-            // 默认创建；对话中途切换模型则由 setModel/setWorkMode 的
-            // `agent !== undefined` 分支记录 meta（此时会话已真实存在）。
+            // 落盘时无法随删除清理）。新会话的模型选择由 setModel 记进宿主的
+            // 进程内默认选择（defaultSelection），createAgent 用它创建；对话中途
+            // 切换模型则由 setModel/setWorkMode 的 `agent !== undefined` 分支记录
+            // meta（此时会话已真实存在）。
             if (agent === undefined) {
               // 恢复预览已由 restorePreview 立即 resumeAgent（不等发消息），
               // 此处仅剩"新会话"的惰性创建（用户发第一条消息才建）。
@@ -3525,7 +3779,8 @@ let pendingPlanMode = null;
               }
               // list(caller) 返回"该 caller 拥有的 + 无主的"作业；内核无"列举全部 owner"
               // 的 API，故子代理拥有的作业不会出现在此列表（已知边界）。
-              post({ t: "jobs", jobs: jobs.list(agent).map(jobView) });
+              // 0.2.x：caller 由 Agent 改为 **SessionId**。
+              post({ t: "jobs", jobs: jobs.list(agent.session.id).map(jobView) });
             } catch (error) {
               post({ t: "jobs", jobs: [], error: error instanceof Error ? error.message : String(error) });
             }
@@ -3535,10 +3790,10 @@ let pendingPlanMode = null;
             try {
               const jobs = ctx.get("jobs");
               if (jobs === undefined) throw new Error("jobs service unavailable");
-              const result = jobs.kill(msg.jobId, agent, "cancelled from the VS Code panel");
+              const result = jobs.kill(msg.jobId, agent.session.id, "cancelled from the VS Code panel");
               log("info", `job ${msg.jobId} kill → ${result}`);
               post({ t: "jobKilled", ok: true, result });
-              // 无需再补发 jobsChanged：根 ctx 的 onJobsChanged 观察者已覆盖
+              // 无需再补发 jobsChanged：根 ctx 的 events.subscribe 观察者已覆盖
               // "每次会改变 list() 结果的提交"（含 stopping 转移与结算）。
             } catch (error) {
               post({ t: "jobKilled", ok: false, error: error instanceof Error ? error.message : String(error) });
@@ -3549,7 +3804,7 @@ let pendingPlanMode = null;
             try {
               const jobs = ctx.get("jobs");
               if (jobs === undefined) throw new Error("jobs service unavailable");
-              const snapshot = jobs.get(msg.jobId, agent);
+              const snapshot = jobs.get(msg.jobId, agent.session.id);
               // 读取语义（内核 JobRead）：**流式**作业的 read 会消费增量游标——若面板
               // 提前读走，模型随后的 job_output 就拿不到那段输出。故运行中只报状态，
               // 终态读取（幂等、不消耗）才允许。
@@ -3564,7 +3819,7 @@ let pendingPlanMode = null;
                 });
                 break;
               }
-              const read = jobs.read(msg.jobId, agent);
+              const read = jobs.read(msg.jobId, agent.session.id);
               post({ t: "jobOutput", ok: true, text: read.text });
             } catch (error) {
               post({ t: "jobOutput", ok: false, error: error instanceof Error ? error.message : String(error) });
@@ -4017,8 +4272,11 @@ let pendingPlanMode = null;
               const reasoningEffort =
                 normalizeEffort(typeof msg.reasoningEffort === "string" ? msg.reasoningEffort : "") ?? baseEffort;
               const next = { provider, model, reasoningEffort };
-              // 持久化默认选择（影响之后新建的 agent）
-              await defaultModel.saveSelection(next);
+              // 记录为宿主侧默认选择（内存）：新建/恢复 agent 时兜底用。
+              // **不写内核 settings**：saveSelection 走 config-editor → profile 补丁层，
+              // 在本宿主的自组装树里必然失败，且失败会连带打挂 settings/jobs/agent 投影
+              // （见 defaultSelection 的说明）。选择已由扩展侧与会话 meta 持久化。
+              defaultSelection = next;
               // 热切换当前 agent 的选择引用（installModelSelection 每次请求读取该对象）
               if (selection !== null) {
                 selection.provider = provider;
@@ -4365,9 +4623,23 @@ let pendingPlanMode = null;
                     ? p.models.map((m) => (typeof m === "string" ? { id: m } : { ...m })).filter((m) => m && m.id)
                     : [],
                 }));
-              const settings = ctx.get("settings");
               const credentials = ctx.get("credentials");
               const section = { providers: {} };
+              // H3：清理"已被用户删除的提供商"的孤儿凭据。credentials 是独立存储，
+              // 仅把 id 移出 providers 列表不会动到它；不主动清就会残留，之后重建同 id、
+              // 留空保存时，下面 undefined 分支会查到这条残留凭据并写回 apiKeyEnv，
+              // 表现为"留空却恢复了旧 Key"。ref 清洗规则与写入侧完全一致（同一表达式）。
+              // 单条失败不让它毁掉整次同步：那会让 provider 配置整体不再更新（更严重）。
+              const removedIds = Array.isArray(msg.removedIds) ? msg.removedIds : [];
+              for (const removedId of removedIds) {
+                if (typeof removedId !== "string" || removedId === "") continue;
+                try {
+                  const orphanRef = `dshVscode_${removedId.replace(/[^A-Za-z0-9_]/g, "_")}`;
+                  if (credentials) await credentials.unset(credentialRef(orphanRef));
+                } catch (error) {
+                  log("warn", `providersApply: 清除已删除提供商 ${removedId} 的孤儿凭据失败`, error instanceof Error ? error.message : String(error));
+                }
+              }
               const parseTokens = (v) => {
                 if (typeof v === "number") return Number.isFinite(v) && v > 0 ? Math.round(v) : undefined;
                 const m = String(v ?? "").trim().match(/^(\d+(?:\.\d+)?)\s*([KkMm]?)$/);
@@ -4379,7 +4651,10 @@ let pendingPlanMode = null;
                 if (!p || !p.id) continue;
                 // deepseek-official 是 llm-deepseek 的官方路由（双注册会冲突），不写入 llm-pi-ai；
                 // 其余提供商（含 deepseek——pi-ai 目录的 OpenAI 兼容知名条目）统一走 llm-pi-ai。
-                if (p.id === "deepseek-official") continue;
+                // deepseek-official 走 llm-deepseek 官方路由；deepseek-account 是 0.2.x 新增的
+                // 账号认证路由（llm-deepseek-account）。二者都由内核独占注册，写进 llm-pi-ai
+                // 会形成**双注册冲突**（同一 provider id 被两个适配器争抢）。
+                if (p.id === "deepseek-official" || p.id === "deepseek-account") continue;
                 // credentials ref 必须匹配 /^[A-Za-z_][A-Za-z0-9_]*$/（连字符/冒号非法），
                 // 且 provider id 可能含 "-"（zai-free、amazon-bedrock），统一清洗。
                 const ref = `dshVscode_${p.id.replace(/[^A-Za-z0-9_]/g, "_")}`;
@@ -4403,22 +4678,44 @@ let pendingPlanMode = null;
                         if (ctxWin !== undefined) out.contextWindow = ctxWin;
                         const maxTok = parseTokens(m.maxOutput);
                         if (maxTok !== undefined) out.maxTokens = maxTok;
+                        // 模态：内核 model profile 的字段名是 **input**（pi-ai 以
+                        // model.input.includes("image") 决定是否接受图片），前端下发用的
+                        // 是 inputModalities。不透传的话，勾了"文本+图片"也只是对话框放行，
+                        // 发送时图片仍会被静默剔除（[tool/image omitted]）。
+                        if (Array.isArray(m.inputModalities) && m.inputModalities.length > 0) {
+                          const mods = m.inputModalities.filter((x) => typeof x === "string" && x !== "");
+                          if (mods.length > 0) out.input = mods;
+                        }
                       }
                       return out;
                     })
                     .filter(Boolean);
                 }
+                // 三态区分，绝不把"本次未携带密钥"当成"清除密钥"：
+                //   · 非空字符串 = 本次带了密钥 → 写 apiKeyEnv 并落库；
+                //   · 空字符串   = 显式清除     → 落库删除，且不写 apiKeyEnv（回落 pi-ai 官方环境发现）；
+                //   · undefined  = 本次未携带   → 凭据与 apiKeyEnv 一律保持原样。
+                // 旧实现把 undefined 与 "" 一并 unset，于是每次宿主就绪重同步都会抹掉
+                // 面板刚保存的密钥，且不写 apiKeyEnv，表现为所有自定义提供商必然
+                // "PI_AI_ERROR: No API key for provider: <id>"。
                 if (typeof p.apiKey === "string" && p.apiKey !== "") {
                   profile.apiKeyEnv = ref;
                   if (credentials) await credentials.set(credentialRef(ref), p.apiKey);
+                } else if (p.apiKey === "") {
+                  if (credentials) await credentials.unset(credentialRef(ref));
                 } else if (credentials) {
-                  await credentials.unset(credentialRef(ref));
+                  // 仅当该 ref 确实存有凭据时才写上 apiKeyEnv：否则会屏蔽 pi-ai 自身的
+                  // 环境变量发现，并让内核抛 MISSING_CREDENTIAL（比"未配置"更难排查）。
+                  const existing = await credentials.resolve(credentialRef(ref));
+                  if (existing && existing.value) profile.apiKeyEnv = ref;
                 }
                 section.providers[p.id] = profile;
               }
-              if (settings && typeof settings.replace === "function") {
-                await settings.replace("llm-pi-ai", section, undefined);
-              }
+              await applyPiAiProviders(ctx, section.providers);
+              // 官方路由（deepseek-official）不进 llm-pi-ai：写它自己的 llm-deepseek 行
+              // （凭据 ref + 端点都来自同一份面板 profile，见 applyOfficialDeepSeekRoute）。
+              const official = list.find((p) => p && p.id === "deepseek-official");
+              if (official !== undefined) await applyOfficialDeepSeekRoute(ctx, official);
               // 配置变更：模型能力可能变化，清空思考级别适配缓存（下次请求重新查询/适配）
               effortCapabilityCache.clear();
               effortAdaptedCache.clear();

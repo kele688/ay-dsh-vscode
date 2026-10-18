@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.6.0] - 2026-10-18
+
+- Upgrade bundled DSH kernel to 0.2.1-rc.2
+- fix provider credential chain, default reasoning effort, and unified provider config loading
+- add MCP server support
+- fix: 修复提供商凭据链路与多模态配置丢失
+- fix: native exec bits, release-note rendering, plan mode in new sessions, step-budget hardening
+
 ## [0.5.7] - 2026-09-25
 
 - Restore exec bits of packaged native tools on demand (fixes sandbox, search and terminal on remote Linux and macOS)

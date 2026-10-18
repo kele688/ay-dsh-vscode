@@ -35,6 +35,15 @@ const hostOptions = {
   format: "esm",
   platform: "node",
   target: "node20",
+  // **必须保持 external**：内核插件（dsh-settings / dsh-jobs / dsh-base …）由 loader 从
+  // node_modules 加载，它们 import 的是 node_modules 里的 @deepseek-ai/cordis。若把 cordis
+  // 一并打进 bundle，进程内就会出现**两个 Context 实现**：
+  //   hostCtx.provide('profileContext', …) 落在 bundle 的那个实例上，
+  //   而内核插件用另一个实例执行 ctx.get('profileContext') → 永远 undefined。
+  // 症状（0.2.x 才暴露）：settings 行门控不解除 → ctx.get('settings') 为 undefined →
+  // providersApply 的 settings.replace **静默失效**，配置面板改的 provider 全部不可路由。
+  // 0.1.5 因不需要 profileContext 而掩盖了该缺陷；bundle 与源文件行为不一致即是证据。
+  external: ["@deepseek-ai/*", "@earendil-works/*"],
   // 资源类（cordis.patch.yml 等）不在 bundle 内，运行时经 import.meta.resolve 解析
   loader: { ".yml": "empty" },
   sourcemap: false,

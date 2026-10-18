@@ -1348,7 +1348,15 @@
     }
     if (approveLabel !== "") {
       const btnApprove = el("button", "btn allow", t("questionApprove"));
-      btnApprove.addEventListener("click", () => postAnswers(id, [{ id: q.id, selected: [approveLabel] }]));
+      // 批准时**必须**带上意见框文本（此前只发 selected，导致"批准+补充指令"被静默丢弃）。
+      // 内核语义（plan-mode：item.custom !== undefined 即走"继续规划"分支）：
+      //   · 留空批准  → 退出 plan 模式，模型按下一条消息开始执行；
+      //   · 批准+意见 → 不退出，模型收到"用户选择继续规划；反馈：<文本>"并据以修订计划。
+      // 两者都是内核既有约定，这里只是把用户输入如实传下去。
+      btnApprove.addEventListener("click", () => {
+        const custom = feedback.value.trim();
+        postAnswers(id, [{ id: q.id, selected: [approveLabel], ...(custom ? { custom } : {}) }]);
+      });
       actions.appendChild(btnApprove);
     }
     questionBodyEl.appendChild(actions);

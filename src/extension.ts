@@ -14,6 +14,7 @@ import * as fs from "node:fs";
 import { AgentHost, getOutputChannel, resolveNode, hostLoaderArgs } from "./host";
 import { ChatViewProvider } from "./webviewPanel";
 import { openConfigPanel, type ProviderInfo } from "./configPanel";
+import { PROVIDERS_KEY, collectProviderApplyItems, loadStoredProviders } from "./providerKeys";
 import { bundledDshVersion, startDshUpdateChecker, LAST_CHECK_KEY } from "./dshUpdater";
 import { DshRuntimeManager } from "./dshRuntime";
 import { UpgradeCenter } from "./upgradeCenter";
@@ -100,7 +101,10 @@ let lastConfigRestartAt = 0;
 
 const SECRET_KEY = "dshVscode.apiKey";
 const CONFIG_NS = "dshVscode";
-const DEFAULT_MODEL = "deepseek-v4-flash";
+// 代码侧兜底默认模型。必须与 package.json 的 `dshVscode.model` 默认值**及内核
+// official 目录**保持一致：0.2.1-rc.2 内核只有 deepseek-flash / deepseek-v4-pro，
+// 旧的 `deepseek-v4-flash` 已移除（若仍用它，配置被清空时会落到一个无法路由的模型）。
+const DEFAULT_MODEL = "deepseek-flash";
 
 let workspaceMigrated = false;
 
@@ -194,7 +198,6 @@ async function ensureWorkspaceChoice(): Promise<void> {
 
 function readConfig(): {
   apiKey: string | undefined;
-  baseUrl: string | undefined;
   model: string;
   permissionMode: string;
   nodePath: string;
@@ -212,14 +215,20 @@ function readConfig(): {
   enableAutoLearn: boolean;
   enableReiteration: boolean;
   autoApproveRules: { match: string; action: string; commands?: string[] }[];
+  /** 默认思考级别（新会话初始值；写入内核 agent-default-model.reasoningEffort）。 */
+  reasoningEffort: string;
 } {
   const cfg = vscode.workspace.getConfiguration(CONFIG_NS);
   const apiKeySetting = cfg.get<string>("apiKey");
   const apiKey =
     (apiKeySetting && apiKeySetting.trim() !== "" ? apiKeySetting : undefined) ??
     process.env.DEEPSEEK_API_KEY;
-  const baseUrl = cfg.get<string>("baseUrl") || undefined;
   const model = cfg.get<string>("model") || DEFAULT_MODEL;
+  // 思考级别：0.2.x 起内核不再从 settings.yaml 读 agent-default-model（settings 已迁到
+  // profile 补丁层，且宿主绕开 settings 写入），故必须由插件显式注入；非法值回退 high
+  // （与历史 settings.yaml 的默认一致）。
+  const effortRaw = cfg.get<string>("reasoningEffort");
+  const reasoningEffort = ["off", "low", "medium", "high"].includes(effortRaw ?? "") ? (effortRaw as string) : "high";
   // 安全敏感项：仅接受白名单枚举，非法值一律回退默认（配置已 scope:"machine"、
   // 工作区不可覆盖；此处兜底防用户手改 settings.json 引入非法/未知值）。
   const permissionModeRaw = cfg.get<string>("permissionMode");
@@ -266,7 +275,7 @@ function readConfig(): {
         })
         .filter((r): r is { match: string; action: string; commands?: string[] } => Boolean(r && r.match))
     : [];
-  return { apiKey, baseUrl, model, permissionMode, nodePath, maxSteps, subagentMaxDepth, maxParallelSubagents, autoCompaction, compactionThresholdRatio, compactionMaxTokens, rotateBytes, rotateSummary, rotateFallbackMsgs, enableCustom, enableLearning, enableAutoLearn, enableReiteration, autoApproveRules };
+  return { apiKey, model, reasoningEffort, permissionMode, nodePath, maxSteps, subagentMaxDepth, maxParallelSubagents, autoCompaction, compactionThresholdRatio, compactionMaxTokens, rotateBytes, rotateSummary, rotateFallbackMsgs, enableCustom, enableLearning, enableAutoLearn, enableReiteration, autoApproveRules };
 }
 
 /** deepseek-official 专属密钥库键（与 configPanel.ts 的 providerSecretKey("deepseek-official") 一致）。 */
@@ -285,7 +294,6 @@ async function resolveApiKey(context: vscode.ExtensionContext, cfg: { apiKey?: s
 async function getConfigSummary(context: vscode.ExtensionContext): Promise<{
   keyConfigured: boolean;
   model: string;
-  baseUrl: string;
   permissionMode: string;
   cwd: string;
 }> {
@@ -294,7 +302,6 @@ async function getConfigSummary(context: vscode.ExtensionContext): Promise<{
   return {
     keyConfigured,
     model: c.model,
-    baseUrl: c.baseUrl ?? "",
     permissionMode: c.permissionMode,
     cwd: workspaceRoot(),
   };
@@ -382,16 +389,17 @@ async function createHost(context: vscode.ExtensionContext): Promise<AgentHost> 
   }
   await ensureWorkspaceChoice();
   const cfg = readConfig();
-  // deepseek-official（llm-deepseek 插件路由）密钥：配置面板统一界面保存于密钥库，
-  // 此处注入宿主 DEEPSEEK_API_KEY 环境变量（llm-deepseek 默认凭据引用）。优先级见 resolveApiKey。
+  // deepseek-official（llm-deepseek 插件路由）的密钥走两条路：面板保存的 per-provider 密钥
+  // 由宿主写进 credentials（llm-deepseek 行的 apiKeyEnv，热生效）；这里注入的
+  // DEEPSEEK_API_KEY 只作为**环境回退**（面板未配密钥时 credentials 服务会按 ref 查环境）。
   const apiKey = await resolveApiKey(context, cfg);
   const h = new AgentHost(
     {
       extensionPath: context.extensionUri.fsPath,
       workspaceRoot: workspaceRoot(),
       apiKey,
-      baseUrl: cfg.baseUrl,
       model: cfg.model,
+      reasoningEffort: cfg.reasoningEffort,
       permissionMode: cfg.permissionMode,
       nodePath: cfg.nodePath,
       maxSteps: cfg.maxSteps,
@@ -513,22 +521,23 @@ function openSettings(context: vscode.ExtensionContext): void {
       }
       return list;
     },
-    // 把配置面板保存的提供商配置同步进 DSH（llm-pi-ai settings + credentials，热生效）。
-    // deepseek-official 是 llm-deepseek 插件注册路由，配置在 llm-deepseek 命名空间
-    // （apiKey 走 DEEPSEEK_API_KEY 环境变量），不写入 llm-pi-ai.providers——过滤掉，
-    // 避免无效写入与路由干扰；其余提供商原样同步。
+    // 把配置面板保存的提供商配置同步进 DSH（全部热生效）。
+    // 面板对所有 provider 是同一套字段与同一个密钥库键；宿主按 id 分派到各自的内核行：
+    //   · 其余提供商 → `llm-pi-ai.providers.<id>`（baseURL/api/models/apiKeyEnv + credentials）；
+    //   · deepseek-official → `llm-deepseek` 行（apiKeyEnv + baseURL，同一套 credentials ref）。
     // 宿主不可用时静默失败（返回错误信息，不影响面板本身）。
-    applyProviders: async (providers): Promise<string | undefined> => {
+    applyProviders: async (providers, removedIds): Promise<string | undefined> => {
       // 全量下发 dshProviders（配置真源，**含**官方路由 deepseek-official）：宿主需要
-      // 完整配置作为"对话面板可选项"的真源；是否写入 llm-pi-ai 由宿主内部决定
-      // （官方路由是 llm-deepseek 路由，跳过 pi-ai 写入）。
+      // 完整配置作为"对话面板可选项"的真源，并按 id 决定写到哪个内核行。
       const list = providers ?? [];
       const officialKey = list.find((p) => p.id === "deepseek-official")?.apiKey ?? "";
       try {
         const h = await ensureHost(context);
         if (h) {
-          const err = await h.applyProviders(list);
-          // 只有"官方路由 API Key **实际变化**"才需要重启宿主（该密钥以进程环境变量注入）；
+          const err = await h.applyProviders(list, removedIds);
+          // 官方路由密钥现在也经 credentials 热生效，但**清空**密钥时仍需重启：
+          // 宿主进程里还留着启动时注入的环境回退值（DEEPSEEK_API_KEY），
+          // 只有重启才能让它按新的解析结果（可能已无密钥）重新注入。
           // 其余同步一律热生效。此前以"列表含 deepseek-official"为条件（恒真），
           // 导致每次配置同步都重启宿主（缓存反复清空、思考级别反复查询——已修）。
           if (!err && officialKey !== lastOfficialKey) {
@@ -552,11 +561,15 @@ function openSettings(context: vscode.ExtensionContext): void {
       // `deepseek-flash`——唯一默认声明 `systemPromptUpdate: in-history` 的条目（提示词
       // 变更追加到缓存历史之后，长会话 KV cache 前缀可复用）。宿主不可用/查询失败时
       // 回退下面的兜底清单（保持与内核目录同序，含 deepseek-flash）。
+      // 兜底清单（**仅**宿主不可用 / 查询失败时使用）。必须与内核 official 目录同步：
+      //   0.1.5-rc.2 内核有 4 个（deepseek-flash / deepseek-v4-flash / deepseek-v4-pro /
+      //   deepseek-v4-flash-vision-exp）；0.2.1-rc.2 只保留 deepseek-flash 与 deepseek-v4-pro。
+      // 若这里给出内核没有的模型，用户在配置页勾选后会写进配置真源（dshProviders），
+      // 而对话面板只认配置真源 ⇒ 下拉里出现内核无法路由的模型。
+      // **内核升级时必须与本清单一起核对**（与 provider id / 协议同为升级检查项）。
       const OFFICIAL_FALLBACK = [
         { id: "deepseek-flash", name: "DeepSeek-Flash", contextWindow: 1000000, maxTokens: 384000, inputModalities: ["text", "image"] },
-        { id: "deepseek-v4-flash", name: "DeepSeek-V4-Flash", contextWindow: 1000000, maxTokens: 384000, inputModalities: ["text"] },
         { id: "deepseek-v4-pro", name: "DeepSeek-V4-Pro", contextWindow: 1000000, maxTokens: 384000, inputModalities: ["text"] },
-        { id: "deepseek-v4-flash-vision-exp", name: "DeepSeek-V4-Flash-Vision-Exp", contextWindow: 1000000, maxTokens: 384000, inputModalities: ["text", "image"] },
       ];
       if (opts.provider === "deepseek-official") {
         try {
@@ -687,11 +700,31 @@ function restoreNativeExecBits(extensionPath: string): void {
   }
 }
 
+/** 官方路由（deepseek-official）端点的**一次性语义迁移**。
+ *
+ *  0.1.5 的官方适配器说 OpenAI 兼容协议，端点根是 `https://api.deepseek.com`；
+ *  0.2.x 换成 Messages 协议（`@deepseek-ai/dsh-llm-deepseek-api-key`），端点根是
+ *  `https://api.deepseek.com/anthropic`（内核默认值）。旧值会让请求打到
+ *  `https://api.deepseek.com/v1/messages` 而 404。
+ *
+ *  只迁移"官方路由 + 旧 OpenAI 根"这一确定情形；其它地址（自建/中转网关）原样保留，
+ *  因为它们的协议由用户自己决定。
+ *  @param baseUrl 已持久化的 baseUrl。
+ *  @returns 迁移后的 baseUrl（非旧值原样返回）。
+ */
+function migrateOfficialBaseUrl(baseUrl: string): string {
+  const trimmed = baseUrl.trim().replace(/\/+$/, "");
+  return trimmed === "https://api.deepseek.com" || trimmed === "https://api.deepseek.com/v1"
+    ? "https://api.deepseek.com/anthropic"
+    : baseUrl;
+}
+
 /** dshProviders 形式对齐（幂等迁移，**只补字段、绝不删内容**）。
  *  历史数据的元素可能缺字段（如 type / models），而修正后的读取与下发逻辑要求统一形状；
  *  这里补齐 name/type/baseUrl/models，并保留每个模型的全部已有参数
  *  （displayName / contextWindow / maxOutput / inputModalities）——用户既有配置
- *  （提供商 + 已选模型 + 参数）原样继续生效，不会被清空或重置。 */
+ *  （提供商 + 已选模型 + 参数）原样继续生效，不会被清空或重置。
+ *  唯一的语义修正：官方路由的旧 OpenAI 兼容根 → Messages 根（见 migrateOfficialBaseUrl）。 */
 function normalizeDshProviders(context: vscode.ExtensionContext): void {
   const KEY = "dshProviders";
   const raw = context.globalState.get<unknown>(KEY);
@@ -710,11 +743,12 @@ function normalizeDshProviders(context: vscode.ExtensionContext): void {
                 Boolean(m) && typeof m === "object" && typeof (m as { id?: unknown }).id === "string" && (m as { id: string }).id !== ""
             )
         : [];
+      const baseUrl = typeof src.baseUrl === "string" ? src.baseUrl : "";
       return {
         id: src.id,
         name: typeof src.name === "string" && src.name !== "" ? src.name : src.id,
         type: typeof src.type === "string" && src.type !== "" ? src.type : "known",
-        baseUrl: typeof src.baseUrl === "string" ? src.baseUrl : "",
+        baseUrl: src.id === "deepseek-official" ? migrateOfficialBaseUrl(baseUrl) : baseUrl,
         ...(typeof src.protocol === "string" && src.protocol !== "" ? { protocol: src.protocol } : {}),
         models,
       };
@@ -781,10 +815,21 @@ export function activate(context: vscode.ExtensionContext): void {
         syncedProviderHost = readyHost;
         void (async () => {
           try {
-            const list = context.globalState.get<Parameters<typeof readyHost.applyProviders>[0]>("dshProviders") ?? [];
-            await readyHost.applyProviders(list);
-          } catch {
-            /* 同步失败不影响宿主使用；下次保存配置时会再次同步 */
+            // 必须**带密钥**下发：globalState 只存"是否已配置密钥"的结果，密钥本体在
+            // SecretStorage。原样下发会让宿主收到 apiKey === undefined，从而既不写
+            // llm-pi-ai.providers.<id>.apiKeyEnv、又反过来删除已存凭据 —— 这正是
+            // "面板已配好密钥却始终 No API key for provider" 的根因。
+            // 必须走与配置面板**相同**的读取路径（含 workspaceState → globalState 迁移）：
+            // 新机器 / Remote-SSH 上 globalState 可能还是空的（历史配置在 workspaceState），
+            // 直接读 globalState 会拿到空列表 → 宿主 dshProviders 为空 →
+            // 对话面板走"回退到内核路由"分支（表现为只剩 DeepSeek Official / Account 两项）。
+            const stored = loadStoredProviders(context);
+            const list = await collectProviderApplyItems(context, () => stored);
+            const err = await readyHost.applyProviders(list);
+            if (err) console.warn(`[ay-dsh] 宿主就绪后同步提供商配置失败：${err}`);
+          } catch (error) {
+            // 失败不影响宿主使用（下次保存配置会再次同步），但必须留痕，不再静默。
+            console.warn(`[ay-dsh] 宿主就绪后同步提供商配置异常：${error instanceof Error ? error.message : String(error)}`);
           }
         })();
       }
