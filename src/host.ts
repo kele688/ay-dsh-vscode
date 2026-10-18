@@ -59,8 +59,9 @@ export interface AgentHostOptions {
   extensionPath: string;
   workspaceRoot: string;
   apiKey?: string;
-  baseUrl?: string;
   model: string;
+  /** 默认思考级别（经 DSH_REASONING_EFFORT 注入宿主的 agent-default-model 行）。 */
+  reasoningEffort?: string;
   permissionMode: string;
   nodePath?: string;
   /** 单次任务最大思考轮次（0 = 不限制；宿主在 step/start 计数超限时自动取消）。 */
@@ -314,6 +315,9 @@ export class AgentHost {
       ...process.env,
       DSH_HOME: this.options.dshHome,
       DSH_VSCODE_MODEL: this.options.model,
+      // 0.2.x：settings 迁移后内核不再从 settings.yaml 读 agent-default-model，
+      // 默认思考级别必须由宿主经 overlay 写入（见 agent-host.mjs 的 composePatches）。
+      DSH_REASONING_EFFORT: this.options.reasoningEffort ?? "",
       DSH_PERMISSION_MODE: this.options.permissionMode,
       DSH_MAX_STEPS: String(this.options.maxSteps ?? 100),
       DSH_LOCALE: vscode.env.language.startsWith("zh") ? "zh" : "en",
@@ -345,7 +349,10 @@ export class AgentHost {
     if (this.options.runtimeNodeModulesPath) env.DSH_RUNTIME_NODE_MODULES = this.options.runtimeNodeModulesPath;
     if (useElectronNode) env.ELECTRON_RUN_AS_NODE = "1";
     if (this.options.apiKey) env.DEEPSEEK_API_KEY = this.options.apiKey;
-    if (this.options.baseUrl) env.DEEPSEEK_BASE_URL = this.options.baseUrl;
+    // 不再注入 DEEPSEEK_BASE_URL：官方路由（deepseek-official）的端点已回到 per-provider
+    // 字段（配置面板 → 宿主写 llm-deepseek 行的 baseURL），留空即内核默认
+    // https://api.deepseek.com/anthropic（Messages 协议）。旧的全局 baseUrl 是 0.1.5 时代
+    // 的 OpenAI 兼容语义，在 0.2.x 会把请求打到 /v1/messages 而 404。
 
     // 运行时升级（机制 A，见决策文档 1.4.3）：把 DSH 依赖集解析到用户采纳的闭包目录。
     // 加载参数统一由 hostLoaderArgs 决策（Node ≥22.12 用 -r CJS preload 规避 Node 24

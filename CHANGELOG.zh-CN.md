@@ -1,5 +1,13 @@
 # 更新日志
 
+## [0.6.0] - 2026-10-18
+
+- 内核升级至 0.2.1-rc.2
+- 修复提供商密钥链路、补全默认思考级别、统一配置真源读取
+- 新增 MCP 服务器支持
+- fix: 修复提供商凭据链路与多模态配置丢失
+- fix: native exec bits, release-note rendering, plan mode in new sessions, step-budget hardening
+
 ## [0.5.7] - 2026-09-25
 
 - 按需恢复打包原生程序的执行位（修复远端 Linux/macOS 的沙箱、搜索、终端）

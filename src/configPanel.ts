@@ -35,7 +35,7 @@ import * as vscode from "vscode";
 import { existsSync, readFileSync, writeFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import type { ProviderApplyItem } from "./protocol";
-import { PROVIDERS_KEY, collectProviderApplyItems, providerSecretKey } from "./providerKeys";
+import { PROVIDERS_KEY, collectProviderApplyItems, loadStoredProviders, providerSecretKey } from "./providerKeys";
 import type { UpgradeVersionInfo } from "./upgradeCenter";
 
 /** 配置命名空间（与 extension.ts 的 CONFIG_NS 一致）。 */
@@ -69,14 +69,16 @@ export interface ProviderInfo {
 }
 
 /** 首次打开时的**种子配置**（写进配置真源 dshProviders 的默认结果）。
- *  只预置两个默认已配置的提供商：DeepSeek (Official)（llm-deepseek 官方路由，其 API Key
- *  走环境变量 DEEPSEEK_API_KEY；不写入 llm-pi-ai.providers，是否写入由宿主侧决定）与
- *  Ollama（本地）。二者的 models 一律为空——厂家支持哪些模型必须靠「获取模型」实时
- *  查询、再由用户勾选（Official 还须先配好 API Key）。
+ *  只预置两个默认已配置的提供商：DeepSeek (Official)（llm-deepseek 官方路由：密钥与其他
+ *  提供商同样存 per-provider 密钥库，由宿主写进 credentials 并指向该行的 apiKeyEnv；
+ *  端点走 Messages 协议，默认 `https://api.deepseek.com/anthropic`）与 Ollama（本地）。
+ *  baseUrl 与其它 provider 完全同构：留空 = 用该 provider 的默认端点。
+ *  二者的 models 一律为空——厂家支持哪些模型必须靠"获取模型"实时查询、再由用户勾选
+ *  （Official 还须先配好 API Key）。
  *  此后一切以 dshProviders（globalState 同名键）为准：对话面板的提供商与模型全部来自它。
  *  这两个种子项因"已接入"不出现在候选目录里，被删除后才回到候选。 */
 const DEFAULT_PROVIDERS: ProviderInfo[] = [
-  { id: "deepseek-official", name: "DeepSeek (Official)", type: "deepseek-official", baseUrl: "https://api.deepseek.com", models: [] },
+  { id: "deepseek-official", name: "DeepSeek (Official)", type: "deepseek-official", baseUrl: "https://api.deepseek.com/anthropic", models: [] },
   { id: "ollama", name: "Ollama (local)", type: "ollama", baseUrl: "http://localhost:11434/v1", models: [] },
 ];
 /* PROVIDERS_KEY 与 providerSecretKey 已上移到 providerKeys.ts：
@@ -87,7 +89,6 @@ export interface ConfigPanelDeps {
   /** 读取当前生效配置（API Key 不含密钥库，面板侧自行合并判断）。 */
   readConfig: () => {
     apiKey?: string;
-    baseUrl?: string;
     model: string;
     permissionMode: string;
     nodePath: string;
@@ -215,15 +216,16 @@ export function openConfigPanel(context: vscode.ExtensionContext, deps: ConfigPa
   panel.webview.html = renderHtml(panel.webview, scriptUri, styleUri, zh);
 
   /** 读取已接入提供商（globalState 跨工作区持久化；首次自动初始化预置列表）。
-   *  兼容迁移：重构前存于 workspaceState（per-workspace），读到则迁入 globalState。 */
+   *
+   *  **必须复用 `loadStoredProviders`**：它包含 `workspaceState → globalState` 的迁移。
+   *  此前面板与本文件各写一份迁移逻辑，而扩展侧 `onHostReady` 直接读 globalState、
+   *  没有迁移 ⇒ 在 Remote-SSH / 新机器上（globalState 尚空、历史值在 workspaceState）
+   *  宿主收到空列表，对话面板回退成"内核默认路由"（只剩 DeepSeek Official / Account）。
+   *  两处共用同一实现后，这类漂移不会再发生。 */
   const loadProviders = (): ProviderInfo[] => {
-    const saved = context.globalState.get<ProviderInfo[]>(PROVIDERS_KEY);
-    if (Array.isArray(saved) && saved.length > 0) return saved;
-    const legacy = context.workspaceState.get<ProviderInfo[]>(PROVIDERS_KEY);
-    if (Array.isArray(legacy) && legacy.length > 0) {
-      void context.globalState.update(PROVIDERS_KEY, legacy);
-      return legacy;
-    }
+    const stored = loadStoredProviders(context) as ProviderInfo[];
+    if (stored.length > 0) return stored;
+    // 差异：面板首次打开需要播种默认提供商列表（宿主侧不播种，避免误初始化）。
     const init = DEFAULT_PROVIDERS;
     void context.globalState.update(PROVIDERS_KEY, init);
     return init;

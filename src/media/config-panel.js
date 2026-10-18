@@ -491,10 +491,12 @@
 
   const cwdEl = $("cfgCwd");
 
-  /** 知名供应商的公开 API 地址（选择供应商/「默认」按钮使用；DSH 目录不提供 baseUrl）。 */
+  /** 知名供应商的公开 API 地址（选择供应商/「默认」按钮使用；DSH 目录不提供 baseUrl）。
+   *  注意 `deepseek-official` 走的是内核 llm-deepseek 的 **Messages** 协议端点
+   *  （`https://api.deepseek.com/anthropic`），与 OpenAI 兼容的 `deepseek` 条目不是同一个地址。 */
   const PROVIDER_DEFAULT_BASEURL = {
     deepseek: "https://api.deepseek.com",
-    "deepseek-official": "https://api.deepseek.com",
+    "deepseek-official": "https://api.deepseek.com/anthropic",
     ollama: "http://localhost:11434/v1",
     openai: "https://api.openai.com/v1",
     anthropic: "https://api.anthropic.com",

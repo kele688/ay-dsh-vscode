@@ -228,7 +228,6 @@ export type ExtensionToWebview =
       t: "config";
       keyConfigured: boolean;
       model: string;
-      baseUrl: string;
       permissionMode: string;
       cwd: string;
     }

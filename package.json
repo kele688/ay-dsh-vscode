@@ -2,7 +2,7 @@
   "name": "ay-dsh-vscode",
   "displayName": "ay-dsh-vscode",
   "description": "AI coding agent powered by DeepSeek Harness (DSH): multi-agent orchestration, long-running goal tasks, transparent tool usage, sandboxed approvals — in a Kilo Code style chat.",
-  "version": "0.5.7",
+  "version": "0.6.0",
   "publisher": "kele688",
   "license": "MIT",
   "icon": "media/icon.png",
@@ -175,10 +175,16 @@
           "default": "deepseek-flash",
           "markdownDescription": "默认模型 id（DeepSeek 官方路由）。默认 `deepseek-flash`（V41 Flash）：内核声明 `systemPromptUpdate: in-history`，每轮变化的提示词会追加到已缓存历史之后，而不是改写开头的 system 消息，长会话的 KV cache 前缀因此得以复用。也可填 `deepseek-v4-flash`、`deepseek-v4-pro`、`deepseek-v4-flash-vision-exp`（支持图片）。"
         },
-        "dshVscode.baseUrl": {
+        "dshVscode.reasoningEffort": {
           "type": "string",
-          "scope": "machine",
-          "markdownDescription": "可选：自定义 OpenAI 兼容 Base URL（等价于环境变量 `DEEPSEEK_BASE_URL`）。留空使用官方 API。"
+          "default": "high",
+          "enum": [
+            "off",
+            "low",
+            "medium",
+            "high"
+          ],
+          "markdownDescription": "默认思考级别（新会话初始值）。0.2.x 起内核不再从 `settings.yaml` 读取 `agent-default-model`，改由本插件经 `DSH_REASONING_EFFORT` 写入 overlay 的 `agent-default-model` 行；会话内切换会覆盖该默认值并记入会话 meta。"
         },
         "dshVscode.permissionMode": {
           "type": "string",
@@ -318,22 +324,23 @@
     "package": "node scripts/package.mjs",
     "deploy": "powershell -ExecutionPolicy Bypass -File scripts/deploy.ps1",
     "verify:i18n": "node scripts/verify-i18n.mjs",
+    "verify:kernel-rows": "node scripts/verify-kernel-rows.mjs",
     "bump": "node scripts/bump-version.mjs",
     "release": "node scripts/release.mjs"
   },
   "dependencies": {
-    "@deepseek-ai/cordis": "^4.0.2",
-    "@deepseek-ai/cordis-plugin-loader": "^1.0.3",
-    "@deepseek-ai/dsh-agent": "^0.1.5-rc.2",
-    "@deepseek-ai/dsh-agent-default-model": "^0.1.5-rc.2",
-    "@deepseek-ai/dsh-app-boot": "^0.1.5-rc.2",
-    "@deepseek-ai/dsh-base": "^0.1.5-rc.2",
-    "@deepseek-ai/dsh-headless": "^0.1.5-rc.2",
-    "@deepseek-ai/dsh-home-paths": "^0.1.5-rc.2",
-    "@deepseek-ai/dsh-invariants": "^0.1.5-rc.2",
-    "@deepseek-ai/dsh-launch-environment": "^0.1.5-rc.2",
-    "@deepseek-ai/dsh-llm": "^0.1.5-rc.2",
-    "@deepseek-ai/dsh-session": "^0.1.5-rc.2",
+    "@deepseek-ai/cordis": "^4.0.5",
+    "@deepseek-ai/cordis-plugin-loader": "^1.0.6",
+    "@deepseek-ai/dsh-agent": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-agent-default-model": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-app-boot": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-base": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-headless": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-home-paths": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-launch-environment": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-llm": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-mcp-client": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-session": "0.2.1-rc.2",
     "@img/sharp-wasm32": "^0.35.3"
   },
   "devDependencies": {

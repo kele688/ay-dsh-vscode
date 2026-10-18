@@ -38,6 +38,31 @@ export interface ProviderSyncSource {
 }
 
 /**
+ * 读取配置真源（提供商列表）——**与配置面板共用同一路径**。
+ *
+ * 为什么不能直接 `globalState.get(PROVIDERS_KEY)`：历史版本把该键存在
+ * `workspaceState`，而 `globalState` 在首次运行/新机器/Remote-SSH 上可能为空。
+ * 配置面板的 `loadProviders()` 会做一次 `workspaceState → globalState` 迁移；
+ * `onHostReady` 若绕过它直接读 `globalState`，就会拿到**空列表** ⇒ 宿主
+ * `dshProviders` 为空 ⇒ 对话面板走"回退到内核已注册路由"分支（表现为只剩
+ * DeepSeek Official / Account 两项，而配置页仍显示完整列表）。
+ *
+ * @param context - 扩展上下文（两级 Memento 来源）。
+ * @returns 配置真源列表；两处都没有时返回空数组（是否播种默认项由调用方决定）。
+ */
+export function loadStoredProviders(context: vscode.ExtensionContext): ProviderSyncSource[] {
+  const saved = context.globalState.get<ProviderSyncSource[]>(PROVIDERS_KEY);
+  if (Array.isArray(saved) && saved.length > 0) return saved;
+  const legacy = context.workspaceState.get<ProviderSyncSource[]>(PROVIDERS_KEY);
+  if (Array.isArray(legacy) && legacy.length > 0) {
+    // 一次性迁移（幂等）：此后读写都以 globalState 为准。
+    void context.globalState.update(PROVIDERS_KEY, legacy);
+    return legacy;
+  }
+  return [];
+}
+
+/**
  * 读取提供商列表并补齐密钥，得到可下发给宿主 `providersApply` 的同步项。
  *
  * 读取失败**不再静默降级**为"无密钥"（此前那个空 catch 让本故障多隐藏了数周），
