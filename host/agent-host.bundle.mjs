@@ -5,7 +5,7 @@ import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir as osHomedir } from "node:os";
 import { fileURLToPath } from "node:url";
-import { join, dirname } from "node:path";
+import { join, dirname, isAbsolute } from "node:path";
 import { createInterface } from "node:readline";
 import { boot, loadLayeredEnv, loadOverlayPatches } from "@deepseek-ai/dsh-app-boot";
 import { resolveDshHome, dshHomePath } from "@deepseek-ai/dsh-home-paths";
@@ -219,6 +219,16 @@ function composePatches(env) {
   } catch (error) {
     log("warn", "mcp-servers.json ignored", error instanceof Error ? error.message : String(error));
   }
+  overlay.push({
+    id: "session-query-sqlite",
+    config: { path: ":memory:", openAt: "first-search" }
+  });
+  overlay.push({
+    insert: [
+      { id: "workspace-changes", name: "@deepseek-ai/dsh-workspace-changes", config: { maxFiles: 200 } },
+      { id: "session-stats", name: "@deepseek-ai/dsh-session-stats" }
+    ]
+  });
   return [...base, ...filteredHeadless, ...overlay];
 }
 async function currentSessionTitle(ctx, agent) {
@@ -529,6 +539,83 @@ function stepLimitWrapUpMessage(limit, steps, tools, elapsedSec) {
   }
   return `[Limit warning] This turn's step limit is reached: ${steps}/${limit} steps used, ${tools} tool calls issued, ${elapsedSec}s elapsed \u2014 the thinking budget is exhausted and all tool calls are now disabled. The per-turn step limit keeps each request bounded and prevents runaway tool loops, so continuing further work is not permitted. Stop further reasoning and deliver your final answer in this reply, opening with a first line in this exact format: \`\u23F1 Stats this turn: STEPS_USED steps / TOOLS_USED tool calls / ELAPSED_SECs elapsed\` (STEPS_USED=${steps}, TOOLS_USED=${tools}, ELAPSED_SEC=${elapsedSec}; count any NEW tool calls and time used in this reply too), then the summary body (accomplished / unfinished / next command). Please strictly comply with this rule! Stop working immediately after deliver this response!`;
 }
+function projectionStatsOf(ctx, session) {
+  try {
+    const projections = ctx.get("sessionProjections");
+    if (projections === void 0 || session === void 0 || typeof projections.snapshot !== "function") return void 0;
+    const view = projections.snapshot(session)?.values?.sessionStats;
+    if (view === void 0 || view === null || typeof view !== "object") return void 0;
+    const num = (value) => typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : void 0;
+    const turns = num(view.turns);
+    const steps = num(view.steps);
+    const llmMs = num(view.llmMs);
+    const toolMs = num(view.toolMs);
+    const ttftMs = num(view.ttftMs);
+    const ttftSteps = num(view.ttftSteps);
+    return {
+      ...turns === void 0 ? {} : { turns },
+      ...steps === void 0 ? {} : { steps },
+      ...llmMs === void 0 ? {} : { llmMs },
+      ...toolMs === void 0 ? {} : { toolMs },
+      ...ttftMs === void 0 ? {} : { ttftMs },
+      ...ttftSteps === void 0 ? {} : { ttftSteps }
+    };
+  } catch (error) {
+    log("warn", "sessionStats projection read failed", error instanceof Error ? error.message : String(error));
+    return void 0;
+  }
+}
+function mergeProjectionStats(stats, projected) {
+  if (projected === void 0 || projected === null) return stats;
+  const merged = { ...stats };
+  for (const key of ["turns", "steps", "llmMs", "toolMs", "ttftMs", "ttftSteps"]) {
+    if (projected[key] !== void 0) merged[key] = projected[key];
+  }
+  return merged;
+}
+function postWorkspaceChanges(ctx, session, event) {
+  const seq = event.seq;
+  const attempt = (retried) => {
+    let summary;
+    try {
+      summary = ctx.get("workspaceChanges")?.summary?.(session.id, seq);
+    } catch (error) {
+      log("warn", "workspaceChanges summary failed", error instanceof Error ? error.message : String(error));
+      return;
+    }
+    if (summary === void 0 || summary === null) {
+      if (!retried) {
+        setTimeout(() => attempt(true), 120);
+        return;
+      }
+      log("warn", `workspace/changes seq=${seq}: summary unavailable (host restarted, or recorder skipped this turn)`);
+      return;
+    }
+    const cwd = typeof summary.cwd === "string" ? summary.cwd : "";
+    const files = (Array.isArray(summary.files) ? summary.files : []).map((file) => ({
+      // openFile 帧只接受**绝对**路径：工作区内相对 path 按 summary.cwd 拼接；
+      // 工作区外的内核已给绝对路径，isAbsolute 时原样保留。
+      path: cwd !== "" && !isAbsolute(file.path) ? join(cwd, file.path) : file.path,
+      display: typeof file.display === "string" && file.display !== "" ? file.display : file.path,
+      added: Number.isFinite(file.added) ? file.added : 0,
+      deleted: Number.isFinite(file.deleted) ? file.deleted : 0,
+      ...file.binary === true ? { binary: true } : {},
+      ...file.oversized === true ? { oversized: true } : {}
+    }));
+    post({
+      t: "workspaceChanges",
+      sessionId: String(session.id),
+      seq,
+      turn: Number.isFinite(summary.turn) ? summary.turn : 0,
+      cwd,
+      files,
+      total: Number.isFinite(summary.total) ? summary.total : files.length,
+      added: Number.isFinite(summary.added) ? summary.added : 0,
+      deleted: Number.isFinite(summary.deleted) ? summary.deleted : 0
+    });
+  };
+  attempt(false);
+}
 function attachAgent(ctx, handle, pump) {
   const agent = handle.agent;
   pump.sizeProvider = () => agent === void 0 || agent.session === void 0 ? void 0 : sessionFileSize(String(agent.session.id));
@@ -611,7 +698,7 @@ function attachAgent(ctx, handle, pump) {
         (e) => e.type !== "assistant/chunk" && e.type !== "session/end-seed"
       );
       const stats = delta.length === 0 && base !== void 0 ? base : computeSessionStats(delta, base);
-      post({ t: "stats", stats });
+      post({ t: "stats", stats: mergeProjectionStats(stats, projectionStatsOf(ctx, agent.session)) });
       if (DEBUG_ADAPT) log("info", `turn ${turn} stopped; final stats pushed (lastSeq=${stats.lastSeq ?? 0})`);
     } catch (error) {
       log("warn", "turn-stopping handling failed", error instanceof Error ? error.message : String(error));
@@ -639,6 +726,13 @@ function attachAgent(ctx, handle, pump) {
         post({ t: "sessionTitleSynced", id: agent.session.id, title });
       } catch (error) {
         log("warn", "session title sync to meta failed", error instanceof Error ? error.message : String(error));
+      }
+    }
+    if (event.type === "workspace/changes") {
+      try {
+        postWorkspaceChanges(ctx, agent.session, event);
+      } catch (error) {
+        log("warn", "workspace/changes bridge failed", error instanceof Error ? error.message : String(error));
       }
     }
     pump.push(event);
@@ -2453,6 +2547,49 @@ ${meta.seedSummary}` }],
           }
           break;
         }
+        case "searchSessions": {
+          try {
+            const query = typeof msg.query === "string" ? msg.query.trim() : "";
+            if (query === "") {
+              post({ t: "sessionSearch", id: msg.id, hits: [] });
+              break;
+            }
+            const sessionQuery = ctx.get("sessionQuery");
+            if (sessionQuery === void 0 || typeof sessionQuery.searchSessions !== "function") {
+              post({ t: "sessionSearch", id: msg.id, hits: [], error: "session search unavailable" });
+              break;
+            }
+            const limit = Number.isInteger(msg.limit) && msg.limit > 0 ? Math.min(msg.limit, 50) : 20;
+            const page = await sessionQuery.searchSessions({ query, limit: Math.max(limit * 4, 40) }, {});
+            const currentProject = projectKey(process.cwd());
+            const sameProject = process.platform === "win32" ? (a, b) => a.toLowerCase() === b.toLowerCase() : (a, b) => a === b;
+            const meta = loadSessionMeta();
+            const hits = [];
+            for (const item of page?.items ?? []) {
+              const header = item?.header;
+              if (header === void 0) continue;
+              const cwd = typeof header.cwd === "string" ? header.cwd : "";
+              if (cwd === "" || !sameProject(projectKey(cwd), currentProject)) continue;
+              const id = String(header.id);
+              const saved = meta[id] ?? {};
+              hits.push({
+                id,
+                title: typeof saved.title === "string" && saved.title !== "" ? saved.title : id,
+                cwd,
+                createdAt: Number.isFinite(header.createdAt) ? header.createdAt : 0,
+                snippet: typeof item.bestMatch?.snippet === "string" ? item.bestMatch.snippet : "",
+                seq: Number.isFinite(item.bestMatch?.seq) ? item.bestMatch.seq : 0
+              });
+              if (hits.length >= limit) break;
+            }
+            post({ t: "sessionSearch", id: msg.id, hits });
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            log("error", "searchSessions failed", message);
+            post({ t: "sessionSearch", id: msg.id, hits: [], error: message });
+          }
+          break;
+        }
         case "restorePreview": {
           if (typeof msg.id !== "string" || msg.id.trim() === "") break;
           try {
@@ -3160,7 +3297,7 @@ ${meta.seedSummary}` }],
                   if (Number.isFinite(adjusted.lastRequestInput) && adjusted.lastRequestInput > 0 && result.shadowedTokenCount > 0) {
                     adjusted.lastRequestInput = Math.max(0, adjusted.lastRequestInput - result.shadowedTokenCount);
                   }
-                  post({ t: "stats", stats: adjusted });
+                  post({ t: "stats", stats: mergeProjectionStats(adjusted, projectionStatsOf(ctx, agent.session)) });
                 }
               } catch (error) {
                 log("warn", "compact stats refresh failed", error instanceof Error ? error.message : String(error));

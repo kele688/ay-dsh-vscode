@@ -18,6 +18,7 @@ import type {
   ProviderApplyItem,
   QuestionAnswerItem,
   SessionEvent,
+  SessionSearchHit,
   SessionStats,
   SessionSummary,
   ViewEvent,
@@ -236,6 +237,9 @@ export class AgentHost {
   private pendingProviderApply = new Map<number, { resolve: (err: string | undefined) => void }>();
   /** 模型发现（discoverModels → discoveredModels）。 */
   private pendingDiscoverModels = new Map<number, { resolve: (r: { models: { id: string; name?: string; contextWindow?: number; maxTokens?: number }[]; error?: string }) => void }>();
+  /** 会话全文检索（searchSessions → sessionSearch）。 */
+  private searchSeq = 0;
+  private pendingSessionSearch = new Map<number, { resolve: (r: { hits: SessionSearchHit[]; error?: string }) => void; timer: NodeJS.Timeout }>();
   /** 工具清单请求（toolCatalog → toolCatalog）。 */
   private pendingToolCatalog = new Map<number, { resolve: (r: { name: string; description?: string; fields?: string[] }[]) => void }>();
   /** 按 turn 聚合的渲染状态（chunk → 增量 ViewEvent）。 */
@@ -527,6 +531,32 @@ export class AgentHost {
       }
       case "sessions": {
         this.emit({ type: "sessions", list: frame.list, error: frame.error });
+        break;
+      }
+      case "sessionSearch": {
+        const pending = this.pendingSessionSearch.get(frame.id);
+        if (pending) {
+          clearTimeout(pending.timer);
+          this.pendingSessionSearch.delete(frame.id);
+          pending.resolve({ hits: frame.hits ?? [], error: frame.error });
+        }
+        break;
+      }
+      case "workspaceChanges": {
+        // 本轮改动文件（A1）：宿主已把摘要展开成绝对路径，这里只做视图模型转换。
+        // 历史重放时不会出现这类帧（摘要只活在宿主进程内），因此旧会话不显示卡片。
+        this.emit({
+          type: "view",
+          event: {
+            kind: "changes",
+            turn: frame.turn,
+            files: frame.files ?? [],
+            total: frame.total,
+            added: frame.added,
+            deleted: frame.deleted,
+            ts: Date.now(),
+          },
+        });
         break;
       }
       case "history": {
@@ -1097,6 +1127,28 @@ export class AgentHost {
       setTimeout(() => {
         if (this.pendingLlmProviders.delete(id)) resolve([]);
       }, 8000);
+    });
+  }
+
+  /**
+   * 会话全文检索（内核 sessionQuery 的 FTS5 排行，已按当前项目过滤）。
+   * 宿主未就绪/超时 → 返回空列表与错误信息（UI 侧据此提示"检索不可用"，
+   * 不阻塞会话列表本身的展示）。
+   * @param query 用户输入的关键词（内核按字面短语匹配，不做 FTS 语法解析）。
+   * @returns 命中列表（最多 20 条）与可选错误。
+   */
+  searchSessions(query: string): Promise<{ hits: SessionSearchHit[]; error?: string }> {
+    return new Promise((resolve) => {
+      if (!this.child) {
+        resolve({ hits: [], error: "host is not running" });
+        return;
+      }
+      const id = ++this.searchSeq;
+      const timer = setTimeout(() => {
+        if (this.pendingSessionSearch.delete(id)) resolve({ hits: [], error: "search timed out" });
+      }, 15000);
+      this.pendingSessionSearch.set(id, { resolve, timer });
+      this.send({ t: "searchSessions", id, query, limit: 20 });
     });
   }
 

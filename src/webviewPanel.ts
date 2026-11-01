@@ -283,6 +283,31 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         case "loadMoreHistory":
           this.host?.loadMoreHistory(msg.beforeSeq, msg.sessionId);
           break;
+        case "searchSessions": {
+          // 会话全文检索（A2）：查询串交给宿主（内核 FTS5 排行 + 项目过滤），
+          // 结果单向下发；宿主未就绪/超时由 searchSessions 自带错误返回，
+          // 这里只负责转成 webview 消息，绝不阻塞会话列表本身。
+          const query = typeof msg.query === "string" ? msg.query.trim() : "";
+          if (query === "") {
+            this.push({ t: "sessionSearch", hits: [] });
+            break;
+          }
+          void (async () => {
+            try {
+              await this.deps.ensureHost();
+              const result = this.host ? await this.host.searchSessions(query) : { hits: [], error: "host unavailable" };
+              this.push({ t: "sessionSearch", query, hits: result.hits, error: result.error });
+            } catch (error) {
+              this.push({
+                t: "sessionSearch",
+                query,
+                hits: [],
+                error: error instanceof Error ? error.message : String(error),
+              });
+            }
+          })();
+          break;
+        }
         case "deleteSession":
           this.host?.deleteSession(msg.id);
           break;
@@ -932,6 +957,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       jobsTitle: zh ? "后台作业" : "Background Jobs",
       jobsRefresh: zh ? "刷新" : "Refresh",
       jobsClose: zh ? "关闭" : "Close",
+      searchPlaceholder: zh ? "搜索会话内容（全文）" : "Search session content (full text)",
     };
     const csp = [
       "default-src 'none'",
@@ -984,6 +1010,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       <span class="spacer"></span>
       <button id="btnHistoryRefresh" class="icon-btn small" title="${L.refresh}">⟳</button>
       <button id="btnHistoryClose" class="icon-btn small" title="${L.close}">✕</button>
+    </div>
+    <!-- A2：会话全文检索（内核 SQLite FTS5）。输入即防抖检索，清空恢复列表。 -->
+    <div class="history-search-row">
+      <input id="historySearch" class="history-search" type="text" placeholder="${L.searchPlaceholder}" spellcheck="false" autocomplete="off">
     </div>
     <div id="historyList" class="history-list"></div>
   </section>
