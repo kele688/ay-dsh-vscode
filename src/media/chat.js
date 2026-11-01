@@ -221,6 +221,23 @@
       jobsOutputLoading: "正在读取输出…",
       jobsOutputTitle: "作业输出",
       jobsKillHint: "已请求取消该作业",
+      // A3：轮次/耗时（内核 sessionStats 投影）
+      turnsLabel: "轮",
+      llmTimeTitle: (sec) => `累计模型耗时 ${sec}s`,
+      toolTimeTitle: (sec) => `累计工具耗时 ${sec}s`,
+      ttftTitle: (ms) => `平均首 token 延迟 ${ms}ms`,
+      turnRailTitle: (n, preview) => `第 ${n} 轮${preview ? `：${preview}` : ""}`,
+      // A1：每轮改动文件
+      changesTitle: "本轮改动",
+      changesFiles: (n, added, deleted) => `${n} 个文件 · +${added} −${deleted}`,
+      changesMore: (n) => `还有 ${n} 个文件未列出`,
+      changesBinary: "二进制",
+      changesOversized: "文件过大",
+      changesOpenTitle: "在编辑器中打开该文件",
+      // A2：会话检索
+      searchPlaceholder: "搜索会话内容（全文）",
+      searchNoResults: "没有匹配的会话",
+      searchUnavailable: (e) => `会话检索不可用：${e}`,
     },
     en: {
       goalRoundChip: (n, m) => `↻ Goal auto-continuation (round ${n}/${m}, system directive)`,
@@ -350,6 +367,23 @@
       jobsOutputLoading: "Reading output…",
       jobsOutputTitle: "Job output",
       jobsKillHint: "Cancellation requested",
+      // A3: turns/elapsed (kernel sessionStats projection)
+      turnsLabel: "turns",
+      llmTimeTitle: (sec) => `Accumulated model time: ${sec}s`,
+      toolTimeTitle: (sec) => `Accumulated tool time: ${sec}s`,
+      ttftTitle: (ms) => `Average first-token latency: ${ms}ms`,
+      turnRailTitle: (n, preview) => `Turn ${n}${preview ? `: ${preview}` : ""}`,
+      // A1: per-turn changed files
+      changesTitle: "Changed this turn",
+      changesFiles: (n, added, deleted) => `${n} file(s) · +${added} −${deleted}`,
+      changesMore: (n) => `+${n} more file(s) not listed`,
+      changesBinary: "binary",
+      changesOversized: "too large",
+      changesOpenTitle: "Open this file in the editor",
+      // A2: session search
+      searchPlaceholder: "Search session content (full text)",
+      searchNoResults: "No matching sessions",
+      searchUnavailable: (e) => `Session search unavailable: ${e}`,
     },
   };
 
@@ -594,8 +628,23 @@
     const hasTokens = stats.inputTokens > 0 || stats.cacheReadTokens > 0 || stats.outputTokens > 0 || (stats.steps ?? 0) > 0;
     topbarEl.classList.toggle("has-tokens", hasTokens);
     // API 调用次数（step，对应 dsh web）：显示在输入 token 前面
-    stepsEl.textContent = `🔄 ${fmtNum(stats.steps ?? 0)}`;
-    stepsEl.title = t("stepsTitle");
+    // A3：轮次与耗时以内核 sessionStats 投影为权威（活会话才有），
+    // 缺失时退回"只显示步数"的老形态，不显示 0 造成误读。
+    const turnsSuffix = Number.isFinite(stats.turns) ? ` · ${t("turnsLabel")} ${fmtNum(stats.turns)}` : "";
+    stepsEl.textContent = `🔄 ${fmtNum(stats.steps ?? 0)}${turnsSuffix}`;
+    const llmSec = Number.isFinite(stats.llmMs) ? Math.round(stats.llmMs / 1000) : undefined;
+    const toolSec = Number.isFinite(stats.toolMs) ? Math.round(stats.toolMs / 1000) : undefined;
+    // 均值分母只能是"有首 token 的步数"（内核投影 ttftSteps），用总步数会低估延迟。
+    const ttftSteps = Number.isFinite(stats.ttftSteps) && stats.ttftSteps > 0 ? stats.ttftSteps : undefined;
+    const ttftAvg = Number.isFinite(stats.ttftMs) && (ttftSteps ?? 0) > 0 ? Math.round(stats.ttftMs / ttftSteps) : undefined;
+    stepsEl.title = [
+      t("stepsTitle"),
+      llmSec === undefined ? "" : t("llmTimeTitle", String(llmSec)),
+      toolSec === undefined ? "" : t("toolTimeTitle", String(toolSec)),
+      ttftAvg === undefined ? "" : t("ttftTitle", String(ttftAvg)),
+    ]
+      .filter((line) => line !== "")
+      .join("\n");
     tokensInEl.textContent = `↗ ${fmtNum(stats.inputTokens)}`;
     tokensInEl.title = t("tokensInTitle");
     // 缓存命中率 = 缓存读取 / (未命中输入 + 缓存读取)，括号内百分比显示
@@ -1002,6 +1051,10 @@
     }
     wrap.appendChild(body);
     messagesEl.appendChild(wrap);
+    // A3：每条用户消息就是一轮的锚点 —— 右缘轮次条据此生成（与官方 turn outline
+    // 同一语义：turn 的首条人类提示 + seq）。历史重放同样会走到这里，所以
+    // 旧会话也能导航，不依赖宿主进程内的投影。
+    registerTurnAnchor(wrap, text);
     updateEmptyState();
     scrollToBottom();
   }
@@ -1014,6 +1067,103 @@
     messagesEl.appendChild(wrap);
     updateEmptyState();
     scrollToBottom();
+  }
+
+  /* ---------------- A1：每轮改动文件卡 ---------------- */
+
+  /**
+   * 渲染"本轮改动"卡（内核 `workspace/changes` 摘要）。
+   *
+   * 折叠态只显示"文件数 · +A −D"，展开后逐文件列出（点击在编辑器中打开）。
+   * 二进制/超大文件没有行数，用标记说明；摘要被 `maxFiles` 截断时补一行"还有 N 个"。
+   * @param {{turn:number,files:Array,added:number,deleted:number,total:number}} e 视图事件。
+   */
+  function addChangesCard(e) {
+    const files = Array.isArray(e.files) ? e.files : [];
+    if (files.length === 0) return;
+    const wrap = el("div", "msg changes");
+    const details = el("details", "changes-card");
+    const summary = el("summary", "changes-head");
+    const title = el("span", "changes-title", t("changesTitle"));
+    const stats = el("span", "changes-stats", t("changesFiles", files.length, e.added ?? 0, e.deleted ?? 0));
+    summary.appendChild(title);
+    summary.appendChild(stats);
+    details.appendChild(summary);
+    const list = el("div", "changes-list");
+    for (const file of files) {
+      const row = el("div", "changes-row");
+      row.title = t("changesOpenTitle");
+      row.appendChild(el("span", "changes-path", file.display || file.path || ""));
+      const delta = el("span", "changes-delta");
+      if (file.binary === true) {
+        delta.textContent = t("changesBinary");
+      } else if (file.oversized === true) {
+        delta.textContent = t("changesOversized");
+      } else {
+        const added = el("span", "changes-added", `+${file.added ?? 0}`);
+        const deleted = el("span", "changes-deleted", `−${file.deleted ?? 0}`);
+        delta.appendChild(added);
+        delta.appendChild(deleted);
+      }
+      row.appendChild(delta);
+      if (typeof file.path === "string" && file.path !== "") {
+        row.addEventListener("click", () => vscode.postMessage({ t: "openFile", path: file.path }));
+      }
+      list.appendChild(row);
+    }
+    if (Number.isFinite(e.total) && e.total > files.length) {
+      list.appendChild(el("div", "changes-more", t("changesMore", e.total - files.length)));
+    }
+    details.appendChild(list);
+    wrap.appendChild(details);
+    messagesEl.appendChild(wrap);
+    updateEmptyState();
+    scrollToBottom();
+  }
+
+  /* ---------------- A3：轮次导航（右缘圆点条） ---------------- */
+
+  /** 轮次锚点：{el, preview}（每条用户消息一个）。 */
+  const turnAnchors = [];
+  let turnRailEl = null;
+
+  function ensureTurnRail() {
+    if (turnRailEl !== null) return turnRailEl;
+    turnRailEl = el("div", "turn-rail hidden");
+    document.body.appendChild(turnRailEl);
+    return turnRailEl;
+  }
+
+  /** 登记一轮锚点并重绘右缘条（少于 2 轮时不显示，避免单轮会话出现噪音）。 */
+  function registerTurnAnchor(anchorEl, previewText) {
+    turnAnchors.push({ el: anchorEl, preview: String(previewText || "").replace(/\s+/g, " ").slice(0, 80) });
+    renderTurnRail();
+  }
+
+  /** 清空轮次导航（切换/重开会话时调用）。 */
+  function resetTurnRail() {
+    turnAnchors.length = 0;
+    renderTurnRail();
+  }
+
+  function renderTurnRail() {
+    const rail = ensureTurnRail();
+    rail.innerHTML = "";
+    if (turnAnchors.length < 2) {
+      rail.classList.add("hidden");
+      return;
+    }
+    rail.classList.remove("hidden");
+    turnAnchors.forEach((entry, index) => {
+      const dot = el("button", "turn-dot");
+      dot.title = t("turnRailTitle", String(index + 1), entry.preview);
+      dot.addEventListener("click", () => {
+        entry.el.scrollIntoView({ block: "start", behavior: "smooth" });
+        dot.classList.add("active");
+        setTimeout(() => dot.classList.remove("active"), 800);
+      });
+      rail.appendChild(dot);
+    });
   }
 
   /**
@@ -1616,6 +1766,47 @@
   let confirmDeleteId = null;
 
   /** 渲染一个会话行（主/子代理共用；仅行内容不同，操作一致）。 */
+  /**
+   * 切到某个会话（历史行与检索命中共用）：立即清空旧消息区建立"切换"观感，
+   * 锁定发送直到 history 帧渲染完成，再让宿主恢复/浏览该会话。
+   * @param {string} id 会话 id。
+   * @param {boolean} isSub 子代理会话（只读浏览）还是主代理会话（继续对话）。
+   */
+  function switchToSession(id, isSub) {
+    // 切换会话：点击瞬间立即清空旧会话消息区（不等 history 帧到达），
+    // 建立明确的"切换会话"观感；history 帧到达后再渲染选定会话的历史。
+    // （history 帧处理里还会幂等地再清一次，双保险）
+    flushStreamRender();
+    messagesEl.innerHTML = "";
+    resetTurnRail();
+    state.currentAssistant = null;
+    state.streamText = "";
+    state.discardPending = false;
+    state.historyMore = null;
+    state.historyLoadingMore = false;
+    // 恢复期间锁定发送：history 帧到达（渲染完成）前，若用户发送消息，
+    // 本地渲染的用户消息会被 history 帧的 messagesEl.innerHTML = "" 清空，
+    // 造成"用户消息消失、应答在前"的错乱。锁定后等历史渲染完成再解锁。
+    state.resuming = true;
+    updateButtons();
+    // 兜底：宿主异常（history 帧迟迟不到）时 15 秒后自动解锁，防止发送被永久禁用
+    clearTimeout(resumeTimer);
+    resumeTimer = setTimeout(() => {
+      if (state.resuming) {
+        state.resuming = false;
+        updateButtons();
+      }
+    }, 15000);
+    if (isSub) {
+      vscode.postMessage({ t: "viewSession", id });
+    } else {
+      vscode.postMessage({ t: "resumeSession", id });
+    }
+    historyPanel.classList.add("hidden");
+    setHint(t("restoring"));
+    updateEmptyState();
+  }
+
   function renderSessionRow(s) {
     const row = el("div", "history-item");
     const main = el("div", "history-main");
@@ -1638,39 +1829,7 @@
     const isSub = s.kind === "sub";
     const btnResume = el("button", "hbtn resume", isSub ? t("view") : t("resume"));
     btnResume.title = isSub ? t("viewTitle") : t("resumeTitle");
-    btnResume.addEventListener("click", () => {
-      // 切换会话：点击瞬间立即清空旧会话消息区（不等 history 帧到达），
-      // 建立明确的"切换会话"观感；history 帧到达后再渲染选定会话的历史。
-      // （history 帧处理里还会幂等地再清一次，双保险）
-      flushStreamRender();
-      messagesEl.innerHTML = "";
-      state.currentAssistant = null;
-      state.streamText = "";
-      state.discardPending = false;
-      state.historyMore = null;
-      state.historyLoadingMore = false;
-      // 恢复期间锁定发送：history 帧到达（渲染完成）前，若用户发送消息，
-      // 本地渲染的用户消息会被 history 帧的 messagesEl.innerHTML = "" 清空，
-      // 造成"用户消息消失、应答在前"的错乱。锁定后等历史渲染完成再解锁。
-      state.resuming = true;
-      updateButtons();
-      // 兜底：宿主异常（history 帧迟迟不到）时 15 秒后自动解锁，防止发送被永久禁用
-      clearTimeout(resumeTimer);
-      resumeTimer = setTimeout(() => {
-        if (state.resuming) {
-          state.resuming = false;
-          updateButtons();
-        }
-      }, 15000);
-      if (isSub) {
-        vscode.postMessage({ t: "viewSession", id: s.id });
-      } else {
-        vscode.postMessage({ t: "resumeSession", id: s.id });
-      }
-      historyPanel.classList.add("hidden");
-      setHint(t("restoring"));
-      updateEmptyState();
-    });
+    btnResume.addEventListener("click", () => switchToSession(s.id, isSub));
     const btnRename = el("button", "hbtn rename", t("rename"));
     btnRename.title = t("renameTitle");
     btnRename.addEventListener("click", () => {
@@ -1713,6 +1872,7 @@
    * 更新时间排序（新的在上），同方式管理（继续/重命名/删除）。
    */
   function renderHistory(list) {
+    lastSessions = Array.isArray(list) ? list : [];
     historyList.innerHTML = "";
     if (!list || list.length === 0) {
       historyList.appendChild(el("div", "history-empty", t("emptyHistory")));
@@ -1735,6 +1895,74 @@
     appendGroup(t("historySubGroup"), subSessions);
   }
 
+  /* ---------------- A2：会话全文检索（历史面板内） ---------------- */
+
+  /** 最近一次会话列表快照：清空搜索框时用它原地恢复列表，避免多打一次请求。 */
+  let lastSessions = [];
+  let sessionSearchTimer = null;
+  /** 只在"当前查询"与输入框一致时才渲染，避免慢响应覆盖新输入。 */
+  let sessionSearchSeq = 0;
+
+  /**
+   * 渲染检索结果。命中行点击即切换会话（与历史行"继续/查看"同一路径）。
+   * @param {Array} hits 宿主返回的命中项（已按项目过滤、FTS 排行）。
+   * @param {string|undefined} error 宿主侧错误（服务不可用/超时）。
+   */
+  function renderSearchResults(hits, error) {
+    historyList.innerHTML = "";
+    if (error) {
+      historyList.appendChild(el("div", "history-empty", t("searchUnavailable", error)));
+      return;
+    }
+    if (!Array.isArray(hits) || hits.length === 0) {
+      historyList.appendChild(el("div", "history-empty", t("searchNoResults")));
+      return;
+    }
+    for (const hit of hits) {
+      const row = el("div", "history-item search-hit");
+      const main = el("div", "history-main");
+      const title = el("div", "history-title", hit.title || hit.id);
+      title.title = hit.title || hit.id;
+      const snippet = el("div", "search-snippet", hit.snippet || "");
+      const meta = el("div", "history-meta");
+      const when = hit.createdAt ? new Date(hit.createdAt).toLocaleString() : "";
+      const cwdShort = hit.cwd ? hit.cwd.replace(/\\/g, "/").split("/").slice(-2).join("/") : "";
+      meta.textContent = `${when}${cwdShort ? " · " + cwdShort : ""}`;
+      main.appendChild(title);
+      if (hit.snippet) main.appendChild(snippet);
+      main.appendChild(meta);
+      const actions = el("div", "history-actions");
+      const btnResume = el("button", "hbtn resume", t("resume"));
+      btnResume.title = t("resumeTitle");
+      btnResume.addEventListener("click", () => switchToSession(hit.id, false));
+      actions.appendChild(btnResume);
+      row.appendChild(main);
+      row.appendChild(actions);
+      // 整行可点：检索结果的主动作就是"打开这一轮上下文继续"
+      row.addEventListener("click", (ev) => {
+        if (ev.target === btnResume || btnResume.contains(ev.target)) return;
+        switchToSession(hit.id, false);
+      });
+      historyList.appendChild(row);
+    }
+  }
+
+  /** 检索框输入：防抖 300ms 后请求宿主；清空则原地恢复会话列表。 */
+  function onHistorySearchInput() {
+    const input = $("historySearch");
+    const query = input ? String(input.value || "").trim() : "";
+    clearTimeout(sessionSearchTimer);
+    if (query === "") {
+      renderHistory(lastSessions);
+      return;
+    }
+    const seq = ++sessionSearchSeq;
+    sessionSearchTimer = setTimeout(() => {
+      if (seq !== sessionSearchSeq) return;
+      vscode.postMessage({ t: "searchSessions", query });
+    }, 300);
+  }
+
   let historyLoadTimer = null;
   let historyRetryTimer = null;
 
@@ -1744,6 +1972,11 @@
     // 作业面板同为空覆盖层：互斥关闭（见 toggleJobs 的同款理由）
     toggleJobs(false);
     historyPanel.classList.remove("hidden");
+    // 检索态复位：每次打开历史都是"完整列表 + 空检索框"，避免上次查询残留
+    const searchInput = $("historySearch");
+    if (searchInput) searchInput.value = "";
+    clearTimeout(sessionSearchTimer);
+    sessionSearchSeq++;
     historyList.innerHTML = "";
     historyList.appendChild(el("div", "history-empty", t("loading")));
     // 注意：必须发 historyRefresh（扩展侧只处理该消息；旧 history 消息已废弃
@@ -1851,6 +2084,11 @@
           state.discardPending = false;
         }
         break;
+      case "changes":
+        // 每轮改动文件卡（A1）：只在本轮确实有改动时出现；历史重放没有该事件
+        // （摘要只活在宿主进程内），所以旧会话不会出现卡片。
+        addChangesCard(e);
+        break;
     }
   }
 
@@ -1877,6 +2115,7 @@
           state.historyMore = null;
           state.historyLoadingMore = false;
           messagesEl.innerHTML = "";
+          resetTurnRail();
           state.stats = null;
           sessionTitleEl.textContent = "";
           stepsEl.textContent = "🔄 0"; // 新会话清零 AI 调用计数（此前漏重置）
@@ -1991,10 +2230,21 @@
         renderHistory(msg.list);
         break;
       }
+      case "sessionSearch": {
+        // A2：检索结果只在检索框仍有内容、且与本次响应的查询一致时渲染
+        // （清空后到达的迟到响应、以及乱序返回的旧查询结果一律丢弃）
+        const searchInput = $("historySearch");
+        if (!searchInput || String(searchInput.value || "").trim() === "") break;
+        if (typeof msg.query === "string" && msg.query !== String(searchInput.value || "").trim()) break;
+        clearTimeout(historyLoadTimer);
+        renderSearchResults(msg.hits, msg.error);
+        break;
+      }
       case "history": {
         // 恢复会话：清空当前消息区，重放最近一段历史（思考默认折叠）。
         // 分页：hasMore 时向上滚动加载更早消息。
         messagesEl.innerHTML = "";
+        resetTurnRail();
         state.currentAssistant = null;
         state.streamText = "";
         state.discardPending = false; // 历史重放不继承"停止丢弃"状态
@@ -2564,9 +2814,106 @@
       return false;
     }
   }
+
+  // ── 复制兜底：让面板内的选区真正进入系统剪贴板 ─────────────────────────
+  // 症状：选中消息文本 → 右键"复制" → 粘贴出来的却是编辑器里之前复制的内容。
+  // 原因：VS Code webview 的内置 Copy 依赖 DOM 的 copy 事件；未注册处理器时，
+  // 部分环境下 webview 选区不会被写入系统剪贴板。这里按 Web 标准显式写入
+  // clipboardData，并给右键提供一个"只复制选中文本"的菜单（无选区时放行
+  // VS Code 原生菜单，粘贴/全选等仍有意义）。
+  const isEditableTarget = (el) =>
+    !!el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable);
+
+  /** 把文本写入系统剪贴板（Clipboard API 优先，webview 受限时回退 textarea）。 */
+  const copyText = (text) => {
+    if (navigator.clipboard?.writeText) {
+      navigator.clipboard.writeText(text).catch(() => fallbackCopy(text));
+    } else {
+      fallbackCopy(text);
+    }
+  };
+
+  document.addEventListener("copy", (ev) => {
+    if (isEditableTarget(document.activeElement)) return; // 输入框内复制交给浏览器默认
+    const sel = window.getSelection();
+    const text = sel ? sel.toString() : "";
+    if (text === "") return;
+    if (ev.clipboardData) {
+      ev.clipboardData.setData("text/plain", text);
+      ev.preventDefault();
+    }
+  });
+
+  // Ctrl/Cmd+C：必须在 webview 内主动处理。
+  // 该快捷键先走 VS Code 的 keybinding 通道，而焦点位于 webview 的非可编辑区域时
+  // 该通道不生效（表现为"能选中文字，但 Ctrl+C 毫无反应"）。这里直接读选区写剪贴板；
+  // 输入框内的复制仍交给浏览器默认，不破坏正常输入体验。
+  document.addEventListener("keydown", (ev) => {
+    if (!(ev.ctrlKey || ev.metaKey) || ev.altKey || ev.shiftKey) return;
+    if (typeof ev.key !== "string" || ev.key.toLowerCase() !== "c") return;
+    if (isEditableTarget(document.activeElement)) return;
+    const text = window.getSelection()?.toString() ?? "";
+    if (text === "") return;
+    ev.preventDefault();
+    copyText(text);
+  });
+
+  let copyMenuEl;
+  const closeCopyMenu = () => {
+    if (copyMenuEl) {
+      copyMenuEl.remove();
+      copyMenuEl = undefined;
+    }
+  };
+  document.addEventListener("contextmenu", (ev) => {
+    closeCopyMenu();
+    const sel = window.getSelection();
+    const text = sel ? sel.toString() : "";
+    // 无选区 / 位于输入框内：放行 VS Code 原生右键菜单
+    if (text === "" || isEditableTarget(ev.target)) return;
+    ev.preventDefault();
+    const menu = document.createElement("div");
+    menu.textContent = t("copyLabel") || "Copy";
+    menu.style.cssText = [
+      "position:fixed",
+      `left:${ev.clientX}px`,
+      `top:${ev.clientY}px`,
+      "z-index:9999",
+      "padding:4px 14px",
+      "font-size:13px",
+      "line-height:1.8",
+      "cursor:pointer",
+      "border-radius:4px",
+      "background:var(--bg,#1e1e1e)",
+      "color:var(--fg,#ddd)",
+      "border:1px solid var(--border,#444)",
+      "box-shadow:0 2px 8px rgba(0,0,0,.35)",
+      "user-select:none",
+    ].join(";");
+    // 用 mousedown 而非 click：click 触发前焦点/选区可能已被清除
+    menu.addEventListener("mousedown", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const picked = window.getSelection()?.toString() || text;
+      copyText(picked);
+      closeCopyMenu();
+    });
+    document.body.appendChild(menu);
+    copyMenuEl = menu;
+  });
+  document.addEventListener("mousedown", (ev) => {
+    if (copyMenuEl && ev.target !== copyMenuEl) closeCopyMenu();
+  });
+  document.addEventListener("keydown", (ev) => {
+    if (ev.key === "Escape") closeCopyMenu();
+  });
+  messagesEl.addEventListener("scroll", closeCopyMenu, { passive: true });
+
   $("btnConfig").addEventListener("click", () => vscode.postMessage({ t: "configure" }));
   $("btnWorkspace").addEventListener("click", () => vscode.postMessage({ t: "openWorkspace" }));
   $("btnHistory").addEventListener("click", openHistory);
+  // A2：历史面板内的会话全文检索框（防抖后请求内核 FTS，清空即恢复列表）
+  $("historySearch")?.addEventListener("input", onHistorySearchInput);
   $("btnHistoryRefresh").addEventListener("click", () => vscode.postMessage({ t: "historyRefresh" }));
   $("btnHistoryClose").addEventListener("click", closeHistory);
   // 导出当前会话完整记录（面板顶部图标；无会话内容时为灰色无效；

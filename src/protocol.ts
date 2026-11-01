@@ -29,7 +29,8 @@ export interface SessionSummary {
   workMode?: "single" | "multi";
 }
 
-/** 会话统计（host 侧随事件流累计，推送给 UI 渲染顶部信息栏）。 */export interface SessionStats {
+/** 会话统计（host 侧随事件流累计，推送给 UI 渲染顶部信息栏）。 */
+export interface SessionStats {
   /** 会话标题（来自 session/title 事件）。 */
   title?: string;
   /** 累计输入 token（未命中缓存）。 */
@@ -46,6 +47,44 @@ export interface SessionSummary {
   lastRequestInput?: number;
   /** 当前模型（展示用）。 */
   model?: string;
+  /** 整会话轮次数（内核 `sessionStats` 投影；活会话才有）。 */
+  turns?: number;
+  /** 累计模型耗时 ms（内核投影；跨分页/压缩不漂）。 */
+  llmMs?: number;
+  /** 累计工具耗时 ms（内核投影）。 */
+  toolMs?: number;
+  /** 累计首 token 延迟 ms（内核投影）。 */
+  ttftMs?: number;
+  /** 有首 token 的步数（首 token 均值分母；内核投影）。 */
+  ttftSteps?: number;
+}
+
+/** 一轮内被改动的文件（内核 `workspace/changes` 摘要的投影）。 */
+export interface ChangedFile {
+  /** 绝对路径（供 `openFile` 帧直接打开）。 */
+  path: string;
+  /** 展示用路径（工作区内相对路径 / 工作区外 `../`、`~` 或绝对路径）。 */
+  display: string;
+  /** 新增行数（binary / oversized 时为 0）。 */
+  added: number;
+  /** 删除行数（binary / oversized 时为 0）。 */
+  deleted: number;
+  /** git 报告为二进制，或抓取侧含 NUL 字节。 */
+  binary?: boolean;
+  /** 抓取侧超过 `maxFileBytes`：列出但不带行数与对比。 */
+  oversized?: boolean;
+}
+
+/** 会话全文检索的一条命中（内核 `sessionQuery.searchSessions` 的分组结果）。 */
+export interface SessionSearchHit {
+  id: string;
+  title: string;
+  cwd: string;
+  createdAt: number;
+  /** 最佳命中事件周围的纯文本片段。 */
+  snippet: string;
+  /** 最佳命中事件的 seq（跳转到该轮时使用）。 */
+  seq: number;
 }
 
 /** 一个待用户回答的问题（内核 `user-questions/request` 的可序列化投影）。
@@ -92,6 +131,18 @@ export type HostFrame =
   | { t: "attachmentResult"; id: number; ok: boolean; mediaType?: string; data?: string }
   | { t: "stopAck"; id: number }
   | { t: "sessions"; list: SessionSummary[]; error?: string }
+  | { t: "sessionSearch"; id: number; hits: SessionSearchHit[]; error?: string }
+  | {
+      t: "workspaceChanges";
+      sessionId: string;
+      seq: number;
+      turn: number;
+      cwd: string;
+      files: ChangedFile[];
+      total: number;
+      added: number;
+      deleted: number;
+    }
   | { t: "history"; sessionId: string; events: SessionEvent[]; hasMore?: boolean; nextSeq?: number; stats?: SessionStats; sessionBytes?: number }
   | { t: "historyMore"; sessionId: string; events: SessionEvent[]; hasMore?: boolean; nextSeq?: number; sessionBytes?: number }
   | { t: "sessionResumed"; id: string; ok: boolean; error?: string }
@@ -133,6 +184,7 @@ export type ExtensionFrame =
   | { t: "approval:resolve"; id: number; approve: boolean }
   | { t: "newSession"; model?: string }
   | { t: "listSessions" }
+  | { t: "searchSessions"; id: number; query: string; limit?: number }
   | { t: "resumeSession"; id: string; model?: string; limit?: number }
   | { t: "restorePreview"; id: string; limit?: number }
   | { t: "viewSession"; id: string; limit?: number }
@@ -185,7 +237,16 @@ export type ViewEvent =
   | { kind: "tool-result"; callId: string; ok: boolean; text: string; ts: number }
   | { kind: "todo"; todos: { content: string; status: "pending" | "in_progress" | "completed" }[]; ts: number }
   | { kind: "turn"; status: "start" | "end"; reason?: string; ts: number }
-  | { kind: "compaction"; phase: "start" | "summary" | "end"; ok?: boolean; error?: string; tokens?: number; ts: number };
+  | { kind: "compaction"; phase: "start" | "summary" | "end"; ok?: boolean; error?: string; tokens?: number; ts: number }
+  | {
+      kind: "changes";
+      turn: number;
+      files: ChangedFile[];
+      total: number;
+      added: number;
+      deleted: number;
+      ts: number;
+    };
 
 /** Webview -> Extension 的消息。 */
 export type WebviewMessage =
@@ -203,6 +264,7 @@ export type WebviewMessage =
   | { t: "viewSession"; id: string }
   | { t: "renameSession"; id: string; title: string }
   | { t: "loadMoreHistory"; beforeSeq: number; sessionId?: string }
+  | { t: "searchSessions"; query: string }
   | { t: "deleteSession"; id: string }
   | { t: "exportSession"; id: string }
   | { t: "setModel"; provider?: string; model?: string; reasoningEffort?: string }
@@ -245,6 +307,7 @@ export type ExtensionToWebview =
   | { t: "workModeChanged"; mode: "single" | "multi" }
   | { t: "compactDone"; ok: boolean; text?: string; error?: string }
   | { t: "sessions"; list: SessionSummary[]; error?: string }
+  | { t: "sessionSearch"; hits: SessionSearchHit[]; error?: string; query?: string }
   | { t: "attachmentResult"; id: number; ok: boolean; mediaType?: string; data?: string }
   | { t: "restarting" }
   | { t: "dshUpdate"; latest?: string; upgrading?: boolean }

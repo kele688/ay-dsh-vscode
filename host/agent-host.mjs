@@ -15,7 +15,7 @@ import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir as osHomedir } from "node:os";
 import { fileURLToPath } from "node:url";
-import { join, dirname } from "node:path";
+import { join, dirname, isAbsolute } from "node:path";
 import { createInterface } from "node:readline";
 import { boot, loadLayeredEnv, loadOverlayPatches } from "@deepseek-ai/dsh-app-boot";
 import { resolveDshHome, dshHomePath } from "@deepseek-ai/dsh-home-paths";
@@ -41,7 +41,7 @@ function envFlag(name) {
 }
 
 const NAME = "dsh-vscode-host";
-const CORE_VERSION = "0.6.0";
+const CORE_VERSION = "0.6.1";
 /** 插件会话 id 前缀（也是会话隔离的标识）。 */
 const SESSION_PREFIX = "dsh-vscode-";
 
@@ -384,6 +384,33 @@ function composePatches(env) {
   } catch (error) {
     log("warn", "mcp-servers.json ignored", error instanceof Error ? error.message : String(error));
   }
+
+  // ── 会话检索（A2）：把 base 的 `openAt: never` 改成**首次搜索才加载** ─────
+  // base 的默认配置是 `{ path: ':memory:', openAt: 'never' }`（全文检索关闭）。
+  // 改成 `first-search`：服务照常激活，但 `node:sqlite` 的导入与索引打开推迟到
+  // 第一次真正搜索，启动期无额外开销与实验性告警。
+  // path 保持 `:memory:`：DSH_HOME 在多个 VS Code 窗口间共享，而派生索引
+  // "一个路径只能有一个进程属主"——落盘文件会在多窗口下冲突；内存索引按进程
+  // 各建一份，代价是每次进程首次搜索要重建。检索接口在 openAt=never 或 Node
+  // 无 node:sqlite 时返回 SEARCH_DISABLED 类错误，由主机侧转成 UI 提示。
+  overlay.push({
+    id: "session-query-sqlite",
+    config: { path: ":memory:", openAt: "first-search" },
+  });
+
+  // ── A1 / A3 新增行：改动文件记录 + 整会话统计投影 ──────────────────────
+  // 两者都不在 base 补丁里（官方 Web bundle 才装），必须用 insert 补丁**新增行**；
+  // 直接写 {id} 的 patch 对不存在的行只会 warn + 跳过。
+  //   · workspace-changes：需要 subprocess + fs（base 已挂），按轮用 git 快照 +
+  //     文件工具整文件抓取，落 `workspace/changes {turn}` 事件；摘要只活在宿主进程内。
+  //   · session-stats：注册 client-visible 投影 `sessionStats`（整会话轮次/步数/耗时），
+  //     需要 base 的 session-projection 行。
+  overlay.push({
+    insert: [
+      { id: "workspace-changes", name: "@deepseek-ai/dsh-workspace-changes", config: { maxFiles: 200 } },
+      { id: "session-stats", name: "@deepseek-ai/dsh-session-stats" },
+    ],
+  });
 
   return [...base, ...filteredHeadless, ...overlay];
 }
@@ -1089,6 +1116,110 @@ function stepLimitWrapUpMessage(limit, steps, tools, elapsedSec) {
  *   - 达到上限时向上层通报一次 stepLimit（UI 提示用户任务已到上限，可继续
  *     输入指令推进；会话与历史不受影响）。
  */
+/**
+ * 内核 `sessionStats` 投影的当前值：整会话的轮次/步数/耗时。
+ *
+ * 为什么用投影而不是宿主自己再算：这些数字要求"整日志、跨分页与压缩都不漂"，
+ * 内核已把它固化成 client-visible 投影（与官方 Web 顶部统计同源）。这里用
+ * **非弃用**的 `snapshot(session)` 读 wire 视图；投影未注册（旧内核 / 行被禁）
+ * 或会话非活跃时返回 undefined，调用方原样忽略即可。
+ * @param ctx 根上下文。
+ * @param session 活跃会话对象（历史只读预览没有它，故那些路径不取投影）。
+ * @returns `{turns, steps, llmMs, toolMs, ttftMs, ttftSteps}`（字段缺失时不出现）。
+ */
+function projectionStatsOf(ctx, session) {
+  try {
+    const projections = ctx.get("sessionProjections");
+    if (projections === undefined || session === undefined || typeof projections.snapshot !== "function") return undefined;
+    const view = projections.snapshot(session)?.values?.sessionStats;
+    if (view === undefined || view === null || typeof view !== "object") return undefined;
+    const num = (value) => (typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined);
+    const turns = num(view.turns);
+    const steps = num(view.steps);
+    const llmMs = num(view.llmMs);
+    const toolMs = num(view.toolMs);
+    const ttftMs = num(view.ttftMs);
+    const ttftSteps = num(view.ttftSteps);
+    return {
+      ...(turns === undefined ? {} : { turns }),
+      ...(steps === undefined ? {} : { steps }),
+      ...(llmMs === undefined ? {} : { llmMs }),
+      ...(toolMs === undefined ? {} : { toolMs }),
+      ...(ttftMs === undefined ? {} : { ttftMs }),
+      ...(ttftSteps === undefined ? {} : { ttftSteps }),
+    };
+  } catch (error) {
+    log("warn", "sessionStats projection read failed", error instanceof Error ? error.message : String(error));
+    return undefined;
+  }
+}
+
+/** 把投影字段并入已算好的统计帧（缺失字段保持原值；stats 只增不改语义）。 */
+function mergeProjectionStats(stats, projected) {
+  if (projected === undefined || projected === null) return stats;
+  const merged = { ...stats };
+  for (const key of ["turns", "steps", "llmMs", "toolMs", "ttftMs", "ttftSteps"]) {
+    if (projected[key] !== undefined) merged[key] = projected[key];
+  }
+  return merged;
+}
+
+/**
+ * 把 `workspace/changes` 会话事件展开成 UI 可渲染的改动清单并下发。
+ *
+ * 摘要只活在**宿主进程内**（内核按事件 seq 保存在 `workspaceChanges` 服务里），
+ * 所以必须在事件到达时立刻取；宿主重启后重开旧会话就没有摘要了（内核不落盘），
+ * 那种情况下不发帧、UI 也不显示卡片。
+ * 事件与摘要在同一条记录流程里写入，理论上存在"事件先到、摘要后写"的极小窗口，
+ * 故给一次延迟重试；仍取不到只记日志，绝不影响对话。
+ * @param ctx 根上下文。
+ * @param session 当前会话。
+ * @param event `workspace/changes` 会话事件。
+ */
+function postWorkspaceChanges(ctx, session, event) {
+  const seq = event.seq;
+  const attempt = (retried) => {
+    let summary;
+    try {
+      summary = ctx.get("workspaceChanges")?.summary?.(session.id, seq);
+    } catch (error) {
+      log("warn", "workspaceChanges summary failed", error instanceof Error ? error.message : String(error));
+      return;
+    }
+    if (summary === undefined || summary === null) {
+      if (!retried) {
+        setTimeout(() => attempt(true), 120);
+        return;
+      }
+      log("warn", `workspace/changes seq=${seq}: summary unavailable (host restarted, or recorder skipped this turn)`);
+      return;
+    }
+    const cwd = typeof summary.cwd === "string" ? summary.cwd : "";
+    const files = (Array.isArray(summary.files) ? summary.files : []).map((file) => ({
+      // openFile 帧只接受**绝对**路径：工作区内相对 path 按 summary.cwd 拼接；
+      // 工作区外的内核已给绝对路径，isAbsolute 时原样保留。
+      path: cwd !== "" && !isAbsolute(file.path) ? join(cwd, file.path) : file.path,
+      display: typeof file.display === "string" && file.display !== "" ? file.display : file.path,
+      added: Number.isFinite(file.added) ? file.added : 0,
+      deleted: Number.isFinite(file.deleted) ? file.deleted : 0,
+      ...(file.binary === true ? { binary: true } : {}),
+      ...(file.oversized === true ? { oversized: true } : {}),
+    }));
+    post({
+      t: "workspaceChanges",
+      sessionId: String(session.id),
+      seq,
+      turn: Number.isFinite(summary.turn) ? summary.turn : 0,
+      cwd,
+      files,
+      total: Number.isFinite(summary.total) ? summary.total : files.length,
+      added: Number.isFinite(summary.added) ? summary.added : 0,
+      deleted: Number.isFinite(summary.deleted) ? summary.deleted : 0,
+    });
+  };
+  attempt(false);
+}
+
 function attachAgent(ctx, handle, pump) {
   const agent = handle.agent;
 
@@ -1252,7 +1383,9 @@ function attachAgent(ctx, handle, pump) {
         (e) => e.type !== "assistant/chunk" && e.type !== "session/end-seed"
       );
       const stats = delta.length === 0 && base !== undefined ? base : computeSessionStats(delta, base);
-      post({ t: "stats", stats });
+      // 轮次/步数/耗时以内核投影为权威（A3）：它们要求"整日志、压缩与分页后不漂"，
+      // 宿主的增量累加只负责 token 三项；投影缺失时保持原样。
+      post({ t: "stats", stats: mergeProjectionStats(stats, projectionStatsOf(ctx, agent.session)) });
       if (DEBUG_ADAPT) log("info", `turn ${turn} stopped; final stats pushed (lastSeq=${stats.lastSeq ?? 0})`);
     } catch (error) {
       log("warn", "turn-stopping handling failed", error instanceof Error ? error.message : String(error));
@@ -1298,6 +1431,15 @@ function attachAgent(ctx, handle, pump) {
         post({ t: "sessionTitleSynced", id: agent.session.id, title });
       } catch (error) {
         log("warn", "session title sync to meta failed", error instanceof Error ? error.message : String(error));
+      }
+    }
+    // 每轮改动文件（A1）：事件本身只带 turn，摘要要去 `workspaceChanges` 服务取，
+    // 且只在本进程有效——必须在事件到达时就展开（见 postWorkspaceChanges 注释）。
+    if (event.type === "workspace/changes") {
+      try {
+        postWorkspaceChanges(ctx, agent.session, event);
+      } catch (error) {
+        log("warn", "workspace/changes bridge failed", error instanceof Error ? error.message : String(error));
       }
     }
     pump.push(event);
@@ -3865,6 +4007,55 @@ let pendingPlanMode = null;
             }
             break;
           }
+          case "searchSessions": {
+            // 会话全文检索（A2）：内核 sessionQuery 的 FTS5 排行（跨会话、按最佳命中事件分组）。
+            // 只在本项目内呈现（与 listSessions 同一隔离口径：projectKey(header.cwd)）；
+            // 内核负责排行与截断，宿主做项目过滤后再取前 N 条。
+            try {
+              const query = typeof msg.query === "string" ? msg.query.trim() : "";
+              if (query === "") {
+                post({ t: "sessionSearch", id: msg.id, hits: [] });
+                break;
+              }
+              const sessionQuery = ctx.get("sessionQuery");
+              if (sessionQuery === undefined || typeof sessionQuery.searchSessions !== "function") {
+                post({ t: "sessionSearch", id: msg.id, hits: [], error: "session search unavailable" });
+                break;
+              }
+              const limit = Number.isInteger(msg.limit) && msg.limit > 0 ? Math.min(msg.limit, 50) : 20;
+              const page = await sessionQuery.searchSessions({ query, limit: Math.max(limit * 4, 40) }, {});
+              const currentProject = projectKey(process.cwd());
+              const sameProject =
+                process.platform === "win32"
+                  ? (a, b) => a.toLowerCase() === b.toLowerCase()
+                  : (a, b) => a === b;
+              const meta = loadSessionMeta();
+              const hits = [];
+              for (const item of page?.items ?? []) {
+                const header = item?.header;
+                if (header === undefined) continue;
+                const cwd = typeof header.cwd === "string" ? header.cwd : "";
+                if (cwd === "" || !sameProject(projectKey(cwd), currentProject)) continue;
+                const id = String(header.id);
+                const saved = meta[id] ?? {};
+                hits.push({
+                  id,
+                  title: typeof saved.title === "string" && saved.title !== "" ? saved.title : id,
+                  cwd,
+                  createdAt: Number.isFinite(header.createdAt) ? header.createdAt : 0,
+                  snippet: typeof item.bestMatch?.snippet === "string" ? item.bestMatch.snippet : "",
+                  seq: Number.isFinite(item.bestMatch?.seq) ? item.bestMatch.seq : 0,
+                });
+                if (hits.length >= limit) break;
+              }
+              post({ t: "sessionSearch", id: msg.id, hits });
+            } catch (error) {
+              const message = error instanceof Error ? error.message : String(error);
+              log("error", "searchSessions failed", message);
+              post({ t: "sessionSearch", id: msg.id, hits: [], error: message });
+            }
+            break;
+          }
           case "restorePreview": {
             // 恢复预览（Reload 自动恢复，owner 方案）：**① 只读分页秒显历史 →
             // ② 立即继续 resumeAgent**（不等用户发消息）。
@@ -4761,7 +4952,7 @@ let pendingPlanMode = null;
                     if (Number.isFinite(adjusted.lastRequestInput) && adjusted.lastRequestInput > 0 && result.shadowedTokenCount > 0) {
                       adjusted.lastRequestInput = Math.max(0, adjusted.lastRequestInput - result.shadowedTokenCount);
                     }
-                    post({ t: "stats", stats: adjusted });
+                    post({ t: "stats", stats: mergeProjectionStats(adjusted, projectionStatsOf(ctx, agent.session)) });
                   }
                 } catch (error) {
                   log("warn", "compact stats refresh failed", error instanceof Error ? error.message : String(error));

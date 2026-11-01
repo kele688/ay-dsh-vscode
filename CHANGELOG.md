@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.6.1] - 2026-11-01
+
+- Add per-turn changed-files card, project-scoped full-text session search, whole-session stats projection (turns/steps/model time/tool time/first-token latency) with a turn rail, and clipboard copy for selected transcript text.
+
 ## [0.6.0] - 2026-10-18
 
 - Upgrade bundled DSH kernel to 0.2.1-rc.2
